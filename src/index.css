@@ -1,0 +1,20 @@
+:root {
+  --jm: #6b7aff;
+  --jm-dark: #5563e8;
+  --jm-soft: #6b7aff;
+  --sky-page: #f0f9ff;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  background: var(--sky-page);
+  color: #0c4a6e;
+}

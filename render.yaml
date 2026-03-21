@@ -1,0 +1,14 @@
+# Render Blueprint — Static Site (Vite + React)
+# New → Blueprint → connect this repo (render.yaml in root).
+# Env: add VITE_ANTHROPIC_API_KEY in the service Environment tab if you use AI chat.
+
+services:
+  - type: web
+    name: hisaabkitaab
+    runtime: static
+    buildCommand: npm install && npm run build
+    staticPublishPath: dist
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html

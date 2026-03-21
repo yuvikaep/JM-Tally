@@ -1,0 +1,2 @@
+# SPA fallback (used by some static hosts; Vite copies public/ → dist/)
+/*    /index.html   200
