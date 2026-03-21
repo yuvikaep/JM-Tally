@@ -410,20 +410,8 @@ const IS = {
 const LB = { fontSize: 10, fontWeight: 700, color: SKY.muted, display: "block", marginBottom: 4, textTransform: "uppercase", letterSpacing: ".5px" }
 function F({label, children}) { return <div style={{marginBottom:12}}><label style={LB}>{label}</label>{children}</div> }
 
-/** User-supplied keys (this browser only) when the host has no server proxy. */
-const ANTHROPIC_KEY_LS = "jm_tally_anthropic_key"
+/** User-supplied OpenAI key (this browser only) when the host has no server proxy. */
 const OPENAI_KEY_LS = "jm_tally_openai_key"
-const CHAT_PROVIDER_LS = "jm_tally_chat_provider"
-
-function readAnthropicKeyFromLS() {
-  try {
-    if (typeof localStorage === "undefined") return ""
-    const v = localStorage.getItem(ANTHROPIC_KEY_LS)
-    return v != null ? String(v).trim() : ""
-  } catch {
-    return ""
-  }
-}
 
 function readOpenAIKeyFromLS() {
   try {
@@ -436,17 +424,6 @@ function readOpenAIKeyFromLS() {
 }
 
 /** Order: local override → runtime injection (server.mjs) → Vite build-time env */
-function getAnthropicApiKey() {
-  const ls = readAnthropicKeyFromLS()
-  if (ls) return ls
-  if (typeof window !== "undefined" && window.__JM_TALLY_CONFIG__?.anthropicApiKey != null) {
-    const k = String(window.__JM_TALLY_CONFIG__.anthropicApiKey).trim()
-    if (k) return k
-  }
-  const v = import.meta.env.VITE_ANTHROPIC_API_KEY
-  return typeof v === "string" ? v.trim() : ""
-}
-
 function getOpenAIApiKey() {
   const ls = readOpenAIKeyFromLS()
   if (ls) return ls
@@ -463,10 +440,6 @@ function apiPathPrefix() {
   return base === "/" ? "" : base.replace(/\/$/, "")
 }
 
-function anthropicProxyUrl() {
-  return `${apiPathPrefix()}/api/anthropic/v1/messages`
-}
-
 function openaiProxyUrl() {
   return `${apiPathPrefix()}/api/openai/v1/chat/completions`
 }
@@ -474,27 +447,6 @@ function openaiProxyUrl() {
 function openaiChatModel() {
   const m = import.meta.env.VITE_OPENAI_CHAT_MODEL
   return typeof m === "string" && m.trim() ? m.trim() : "gpt-4o-mini"
-}
-
-/** `openai` | `anthropic` — localStorage wins, then server-injected / Vite CHAT_PROVIDER, then keys; default OpenAI. */
-function resolveChatProvider() {
-  try {
-    const ls = localStorage.getItem(CHAT_PROVIDER_LS)
-    if (ls === "openai" || ls === "anthropic") return ls
-  } catch {
-    /* ignore */
-  }
-  if (typeof window !== "undefined" && window.__JM_TALLY_CONFIG__?.chatProvider != null) {
-    const p = String(window.__JM_TALLY_CONFIG__.chatProvider).trim().toLowerCase()
-    if (p === "openai" || p === "anthropic") return p
-  }
-  const envP = String(import.meta.env.VITE_CHAT_PROVIDER || "").trim().toLowerCase()
-  if (envP === "openai" || envP === "anthropic") return envP
-  const hasO = !!getOpenAIApiKey()
-  const hasA = !!getAnthropicApiKey()
-  if (hasO && !hasA) return "openai"
-  if (hasA && !hasO) return "anthropic"
-  return "openai"
 }
 
 function toOpenAIChatMessages(system, messages) {
@@ -543,95 +495,8 @@ async function fetchOpenAIChatMessages({ system, messages, max_tokens = 800 }) {
   return { content: [{ text }], _provider: "openai" }
 }
 
-function anthropicErrMessage(raw) {
-  try {
-    const d = JSON.parse(raw)
-    return String(d.error?.message || d.message || "")
-  } catch {
-    return ""
-  }
-}
-
-function throwIfAnthropicAuthRejected(raw, status) {
-  const em = anthropicErrMessage(raw)
-  if (/invalid x-api-key|invalid api key|authentication_error/i.test(raw) || /invalid x-api-key|authentication/i.test(em))
-    throw new Error("bad_anthropic_key")
-  if (em) throw new Error(em)
-  throw new Error(`API ${status}`)
-}
-
-/** Prefer same-origin proxy; fall back to direct Anthropic (requires browser opt-in header). */
-async function fetchAnthropicChatMessages({ system, messages, max_tokens = 800 }) {
-  const payload = {
-    model: "claude-sonnet-4-20250514",
-    max_tokens,
-    system: system || "",
-    messages,
-  }
-  const headers = { "Content-Type": "application/json", "anthropic-version": "2023-06-01" }
-  const bodyStr = JSON.stringify(payload)
-
-  const callDirect = async () => {
-    const key = getAnthropicApiKey()
-    if (!key) throw new Error("no_key")
-    const r = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        ...headers,
-        "x-api-key": key,
-        "anthropic-dangerous-direct-browser-access": "true",
-      },
-      body: bodyStr,
-    })
-    const raw = await r.text()
-    if (r.ok) {
-      try {
-        return JSON.parse(raw)
-      } catch {
-        throw new Error("Anthropic returned non-JSON")
-      }
-    }
-    throwIfAnthropicAuthRejected(raw, r.status)
-  }
-
-  let res = await fetch(anthropicProxyUrl(), {
-    method: "POST",
-    headers,
-    body: bodyStr,
-  })
-  const raw = await res.text()
-  if (res.ok) {
-    try {
-      return JSON.parse(raw)
-    } catch {
-      // Vercel/SPA often returns 200 HTML for /api/* if functions missing — try direct
-      return callDirect()
-    }
-  }
-
-  const key = getAnthropicApiKey()
-  const proxyUnavailable =
-    res.status === 404 ||
-    res.status === 405 ||
-    res.status === 501 ||
-    res.status === 401 ||
-    res.status === 403 ||
-    res.status === 502 ||
-    res.status === 503
-  if (key && proxyUnavailable) return callDirect()
-
-  if (!key && (res.status === 404 || res.status === 503 || res.status === 405)) throw new Error("no_key")
-  throwIfAnthropicAuthRejected(raw, res.status)
-}
-
-async function fetchAIChatMessages(args) {
-  const p = resolveChatProvider()
-  if (p === "openai") return fetchOpenAIChatMessages(args)
-  return fetchAnthropicChatMessages(args)
-}
-
-function hasAnyLlmKeyHint() {
-  return !!(getAnthropicApiKey() || getOpenAIApiKey())
+function hasOpenAiKeyHint() {
+  return !!getOpenAIApiKey()
 }
 
 function buildChatSystemPrompt(co, snap) {
@@ -930,9 +795,7 @@ function Chat({ onAddBatch, acctRole, snap, systemPrompt, welcomeName }) {
   ])
   const [input, setInput] = useState("")
   const [busy, setBusy] = useState(false)
-  const [showKeyPanel, setShowKeyPanel] = useState(() => !hasAnyLlmKeyHint())
-  const [providerUi, setProviderUi] = useState(() => resolveChatProvider())
-  const [keyDraft, setKeyDraft] = useState("")
+  const [showKeyPanel, setShowKeyPanel] = useState(() => !hasOpenAiKeyHint())
   const [openaiDraft, setOpenaiDraft] = useState("")
   const [keyBanner, setKeyBanner] = useState("")
   const ref = useRef(null)
@@ -950,7 +813,7 @@ function Chat({ onAddBatch, acctRole, snap, systemPrompt, welcomeName }) {
     setBusy(true)
     setMsgs(p=>[...p,{role:"ai",text:"...",loading:true}])
     try {
-      const d = await fetchAIChatMessages({
+      const d = await fetchOpenAIChatMessages({
         system: systemPrompt || "",
         messages: hist.current.slice(-10),
         max_tokens: 800,
@@ -978,12 +841,10 @@ function Chat({ onAddBatch, acctRole, snap, systemPrompt, welcomeName }) {
     } catch (e) {
       const hint =
         e?.message === "no_key"
-          ? "⚠️ **No API key for chat.** Add **OPENAI_API_KEY** from **https://platform.openai.com/api-keys** on **Render** or **Vercel** (server env — avoid VITE_* for secrets), or paste a key under **API keys & provider** below. For Claude only, set **CHAT_PROVIDER=anthropic**."
+          ? "⚠️ **No API key for chat.** Add **OPENAI_API_KEY** from **https://platform.openai.com/api-keys** on **Render** (Web Service + **npm start**) or **Vercel** (server env — do not rely on **VITE_**-prefixed vars for production secrets), or paste a key under **OpenAI API key** below."
           : e?.message === "bad_openai_key"
-            ? "⚠️ **OpenAI rejected this API key.** Create a new secret key at **https://platform.openai.com/api-keys**. On Vercel/Render set **OPENAI_API_KEY** and remove any wrong **VITE_OPENAI_API_KEY**, then redeploy."
-            : e?.message === "bad_anthropic_key"
-              ? "⚠️ **Anthropic rejected this API key** (`invalid x-api-key`). Create a **new key** at [console.anthropic.com](https://console.anthropic.com) and either: paste it under **API keys & provider**, **or** on **Vercel** set **`ANTHROPIC_API_KEY`** (recommended — server-only) and **remove** any wrong **`VITE_ANTHROPIC_API_KEY`** so an old key is not baked into the JS bundle, then **redeploy**."
-              : `⚠️ **API issue:** ${String(e?.message || e).slice(0, 220)}`
+            ? "⚠️ **OpenAI rejected this API key.** Create a new secret key at **https://platform.openai.com/api-keys**. Set **OPENAI_API_KEY** on Render/Vercel and remove any wrong **VITE_OPENAI_API_KEY**, then redeploy."
+            : `⚠️ **API issue:** ${String(e?.message || e).slice(0, 220)}`
       setMsgs(p=>p.slice(0,-1).concat([{role:"ai",text:hint}]))
     }
     setBusy(false)
@@ -998,7 +859,7 @@ function Chat({ onAddBatch, acctRole, snap, systemPrompt, welcomeName }) {
         <div style={{padding:"13px 16px",borderBottom:"1px solid #bae6fd"}}>
           <div style={{fontSize:13,fontWeight:700,color:"#0c4a6e",display:"flex",alignItems:"center",gap:8}}>
             ✦ AI Accounting Assistant
-            <span style={{background:JM.r(0.15),color:JM.p,border:`1px solid ${JM.r(0.3)}`,padding:"1px 8px",borderRadius:20,fontSize:9.5,fontWeight:700}}>{providerUi === "openai" ? "OpenAI" : "Claude"}</span>
+            <span style={{background:JM.r(0.15),color:JM.p,border:`1px solid ${JM.r(0.3)}`,padding:"1px 8px",borderRadius:20,fontSize:9.5,fontWeight:700}}>OpenAI</span>
           </div>
           <div style={{fontSize:11,color:"#64748b",marginTop:2}}>Uses your live ledger in this browser · Describe a payment or receipt to draft an entry — you confirm before anything is saved</div>
           <div style={{ marginTop: 10 }}>
@@ -1019,7 +880,7 @@ function Chat({ onAddBatch, acctRole, snap, systemPrompt, welcomeName }) {
                 textDecoration: "underline",
               }}
             >
-              {showKeyPanel ? "Hide" : "API keys & provider"}
+              {showKeyPanel ? "Hide" : "OpenAI API key"}
             </button>
             {showKeyPanel && (
               <div
@@ -1031,37 +892,17 @@ function Chat({ onAddBatch, acctRole, snap, systemPrompt, welcomeName }) {
                   borderRadius: 8,
                 }}
               >
-                <div style={{ marginBottom: 10 }}>
-                  <label style={LB}>Active provider</label>
-                  <select
-                    style={IS}
-                    value={providerUi}
-                    onChange={e => {
-                      const v = e.target.value === "openai" ? "openai" : "anthropic"
-                      try {
-                        localStorage.setItem(CHAT_PROVIDER_LS, v)
-                      } catch {
-                        /* ignore */
-                      }
-                      setProviderUi(v)
-                      setKeyBanner(`Using ${v === "openai" ? "OpenAI" : "Claude (Anthropic)"}.`)
-                    }}
-                  >
-                    <option value="openai">OpenAI (platform.openai.com/api-keys)</option>
-                    <option value="anthropic">Claude (Anthropic)</option>
-                  </select>
-                </div>
                 <div style={{ fontSize: 10, color: SKY.muted, lineHeight: 1.5, marginBottom: 8 }}>
-                  Keys are saved in <strong>localStorage</strong> on this device. Recommended: set{" "}
-                  <code style={{ fontSize: 9 }}>OPENAI_API_KEY</code> from{" "}
+                  Prefer <code style={{ fontSize: 9 }}>OPENAI_API_KEY</code> on{" "}
+                  <strong>Render</strong> (<code style={{ fontSize: 9 }}>npm start</code>) or{" "}
+                  <strong>Vercel</strong> — keys from{" "}
                   <a href="https://platform.openai.com/api-keys" target="_blank" rel="noreferrer" style={{ color: JM.p }}>
                     platform.openai.com/api-keys
-                  </a>{" "}
-                  on Render (<code style={{ fontSize: 9 }}>npm start</code>) or Vercel. Use{" "}
-                  <code style={{ fontSize: 9 }}>CHAT_PROVIDER=anthropic</code> only for Claude.
+                  </a>
+                  . Below saves only in this browser (<strong>localStorage</strong>).
                 </div>
                 <div style={{ marginBottom: 10 }}>
-                  <label style={LB}>OpenAI (platform.openai.com)</label>
+                  <label style={LB}>Paste key (optional)</label>
                   <input
                     type="password"
                     autoComplete="off"
@@ -1082,7 +923,7 @@ function Chat({ onAddBatch, acctRole, snap, systemPrompt, welcomeName }) {
                         try {
                           localStorage.setItem(OPENAI_KEY_LS, t)
                           setOpenaiDraft("")
-                          setKeyBanner("OpenAI key saved. Choose OpenAI in “Active provider” if needed, then send a message.")
+                          setKeyBanner("Saved. Send a message to try chat.")
                         } catch {
                           setKeyBanner("Could not save (private mode?).")
                         }
@@ -1121,72 +962,7 @@ function Chat({ onAddBatch, acctRole, snap, systemPrompt, welcomeName }) {
                         cursor: "pointer",
                       }}
                     >
-                      Clear OpenAI
-                    </button>
-                  </div>
-                </div>
-                <div style={{ marginBottom: 4 }}>
-                  <label style={LB}>Anthropic / Claude (console.anthropic.com)</label>
-                  <input
-                    type="password"
-                    autoComplete="off"
-                    placeholder="sk-ant-api03-…"
-                    value={keyDraft}
-                    onChange={e => setKeyDraft(e.target.value)}
-                    style={{ ...IS, marginBottom: 6 }}
-                  />
-                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        const t = keyDraft.trim()
-                        if (!t) {
-                          setKeyBanner("Paste an Anthropic key first.")
-                          return
-                        }
-                        try {
-                          localStorage.setItem(ANTHROPIC_KEY_LS, t)
-                          setKeyDraft("")
-                          setKeyBanner("Anthropic key saved. Choose Claude in “Active provider” if needed, then send a message.")
-                        } catch {
-                          setKeyBanner("Could not save (private mode?).")
-                        }
-                      }}
-                      style={{
-                        background: JM.p,
-                        border: "none",
-                        borderRadius: 7,
-                        padding: "5px 12px",
-                        fontSize: 11,
-                        fontWeight: 700,
-                        color: "#fff",
-                        cursor: "pointer",
-                      }}
-                    >
-                      Save Anthropic key
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        try {
-                          localStorage.removeItem(ANTHROPIC_KEY_LS)
-                          setKeyBanner("Anthropic key removed from this browser.")
-                        } catch {
-                          setKeyBanner("Could not clear.")
-                        }
-                      }}
-                      style={{
-                        background: "transparent",
-                        border: `1px solid ${SKY.border}`,
-                        borderRadius: 7,
-                        padding: "5px 12px",
-                        fontSize: 11,
-                        fontWeight: 600,
-                        color: SKY.muted,
-                        cursor: "pointer",
-                      }}
-                    >
-                      Clear Anthropic
+                      Clear saved key
                     </button>
                   </div>
                 </div>
