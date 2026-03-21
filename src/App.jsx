@@ -436,10 +436,16 @@ async function fetchAnthropicChatMessages({ system, messages, max_tokens = 800 }
   })
   if (res.ok) return res.json()
   const key = getAnthropicApiKey()
-  if (
-    key &&
-    (res.status === 404 || res.status === 401 || res.status === 403 || res.status === 502 || res.status === 503)
-  ) {
+  // 405 = static host or vite preview without proxy — try direct if we have a browser/server-injected key
+  const proxyUnavailable =
+    res.status === 404 ||
+    res.status === 405 ||
+    res.status === 501 ||
+    res.status === 401 ||
+    res.status === 403 ||
+    res.status === 502 ||
+    res.status === 503
+  if (key && proxyUnavailable) {
     res = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: { ...headers, "x-api-key": key },
@@ -447,7 +453,8 @@ async function fetchAnthropicChatMessages({ system, messages, max_tokens = 800 }
     })
     if (res.ok) return res.json()
   }
-  if (!key && (res.status === 404 || res.status === 503)) throw new Error("no_key")
+  if (!key && (res.status === 404 || res.status === 503 || res.status === 405))
+    throw new Error("no_key")
   const d = await res.json().catch(() => ({}))
   throw new Error(d.error?.message || `API ${res.status}`)
 }
@@ -791,7 +798,7 @@ function Chat({ onAddBatch, acctRole, snap, systemPrompt, welcomeName }) {
     } catch (e) {
       const hint =
         e?.message === "no_key"
-          ? "⚠️ **No API key for chat.** Chat calls `/api/anthropic/v1/messages` first (key stays on the server). **Production:** set `ANTHROPIC_API_KEY` or `VITE_ANTHROPIC_API_KEY` on Render and use `npm start`. **Local dev:** add the same to `.env` so the Vite dev proxy can forward, **or** set `VITE_ANTHROPIC_API_KEY` for a direct browser fallback. Restart after changing env."
+          ? "⚠️ **No API key for chat.** Use **`npm start`** (Render) or **`npm run dev`** / **`npm run preview`** with `ANTHROPIC_API_KEY` or `VITE_ANTHROPIC_API_KEY` in `.env` for the `/api` proxy, **or** inject `VITE_ANTHROPIC_API_KEY` at build/runtime for direct Anthropic fallback when the proxy returns 404/405/503."
           : `⚠️ **API issue:** ${String(e?.message || e).slice(0, 220)}`
       setMsgs(p=>p.slice(0,-1).concat([{role:"ai",text:hint}]))
     }
