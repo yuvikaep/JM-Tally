@@ -32,7 +32,8 @@ function injectRuntimeConfig(html) {
   const key = String(process.env.VITE_ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY || "").trim()
   const payload = JSON.stringify({ anthropicApiKey: key })
   const tag = `<script>window.__JM_TALLY_CONFIG__=${payload}</script>`
-  if (html.includes("</head>")) return html.replace("</head>", `${tag}</head>`)
+  if (/<\/head>/i.test(html)) return html.replace(/<\/head>/i, `${tag}</head>`)
+  if (/<\/body>/i.test(html)) return html.replace(/<\/body>/i, `${tag}</body>`)
   return tag + html
 }
 
@@ -127,4 +128,8 @@ const server = http.createServer((req, res) => {
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`JM Tally listening on 0.0.0.0:${PORT}`)
+  if (!getAnthropicKey())
+    console.warn(
+      "[jm-tally] ANTHROPIC_API_KEY / VITE_ANTHROPIC_API_KEY not set — AI chat /api proxy returns 503 until you add it (Render → Environment)."
+    )
 })

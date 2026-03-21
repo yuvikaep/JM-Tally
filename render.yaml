@@ -3,7 +3,8 @@
 # Dashboard: New → Blueprint → connect repo, or New → Web Service (Node):
 #   Build:  npm install && npm run build
 #   Start:  npm start
-# Set VITE_ANTHROPIC_API_KEY in Environment (build-time) if you use AI chat.
+# AI chat: set ANTHROPIC_API_KEY or VITE_ANTHROPIC_API_KEY for runtime (npm start injects + /api proxy).
+# Use a Web Service with `npm start` — Static Site will not run server.mjs and chat will need a browser key.
 
 services:
   - type: web

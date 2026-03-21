@@ -410,8 +410,23 @@ const IS = {
 const LB = { fontSize: 10, fontWeight: 700, color: SKY.muted, display: "block", marginBottom: 4, textTransform: "uppercase", letterSpacing: ".5px" }
 function F({label, children}) { return <div style={{marginBottom:12}}><label style={LB}>{label}</label>{children}</div> }
 
-/** Anthropic key: build-time (Vite .env) or runtime (server.mjs injects `window.__JM_TALLY_CONFIG__` on Render). */
+/** User-supplied key (this browser only). Use when the host has no server proxy/key. */
+const ANTHROPIC_KEY_LS = "jm_tally_anthropic_key"
+
+function readAnthropicKeyFromLS() {
+  try {
+    if (typeof localStorage === "undefined") return ""
+    const v = localStorage.getItem(ANTHROPIC_KEY_LS)
+    return v != null ? String(v).trim() : ""
+  } catch {
+    return ""
+  }
+}
+
+/** Order: local override → runtime injection (server.mjs) → Vite build-time env */
 function getAnthropicApiKey() {
+  const ls = readAnthropicKeyFromLS()
+  if (ls) return ls
   if (typeof window !== "undefined" && window.__JM_TALLY_CONFIG__?.anthropicApiKey != null) {
     const k = String(window.__JM_TALLY_CONFIG__.anthropicApiKey).trim()
     if (k) return k
@@ -420,7 +435,13 @@ function getAnthropicApiKey() {
   return typeof v === "string" ? v.trim() : ""
 }
 
-/** Prefer same-origin proxy (key on server / Vite dev); fall back to browser key if needed. */
+function anthropicProxyUrl() {
+  const base = import.meta.env.BASE_URL || "/"
+  const prefix = base === "/" ? "" : base.replace(/\/$/, "")
+  return `${prefix}/api/anthropic/v1/messages`
+}
+
+/** Prefer same-origin proxy; fall back to direct Anthropic (requires browser opt-in header). */
 async function fetchAnthropicChatMessages({ system, messages, max_tokens = 800 }) {
   const payload = {
     model: "claude-sonnet-4-20250514",
@@ -429,14 +450,13 @@ async function fetchAnthropicChatMessages({ system, messages, max_tokens = 800 }
     messages,
   }
   const headers = { "Content-Type": "application/json", "anthropic-version": "2023-06-01" }
-  let res = await fetch("/api/anthropic/v1/messages", {
+  let res = await fetch(anthropicProxyUrl(), {
     method: "POST",
     headers,
     body: JSON.stringify(payload),
   })
   if (res.ok) return res.json()
   const key = getAnthropicApiKey()
-  // 405 = static host or vite preview without proxy — try direct if we have a browser/server-injected key
   const proxyUnavailable =
     res.status === 404 ||
     res.status === 405 ||
@@ -448,7 +468,11 @@ async function fetchAnthropicChatMessages({ system, messages, max_tokens = 800 }
   if (key && proxyUnavailable) {
     res = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
-      headers: { ...headers, "x-api-key": key },
+      headers: {
+        ...headers,
+        "x-api-key": key,
+        "anthropic-dangerous-direct-browser-access": "true",
+      },
       body: JSON.stringify(payload),
     })
     if (res.ok) return res.json()
@@ -755,6 +779,9 @@ function Chat({ onAddBatch, acctRole, snap, systemPrompt, welcomeName }) {
   ])
   const [input, setInput] = useState("")
   const [busy, setBusy] = useState(false)
+  const [showKeyPanel, setShowKeyPanel] = useState(() => !getAnthropicApiKey())
+  const [keyDraft, setKeyDraft] = useState("")
+  const [keyBanner, setKeyBanner] = useState("")
   const ref = useRef(null)
   const hist = useRef([])
 
@@ -798,7 +825,7 @@ function Chat({ onAddBatch, acctRole, snap, systemPrompt, welcomeName }) {
     } catch (e) {
       const hint =
         e?.message === "no_key"
-          ? "⚠️ **No API key for chat.** Use **`npm start`** (Render) or **`npm run dev`** / **`npm run preview`** with `ANTHROPIC_API_KEY` or `VITE_ANTHROPIC_API_KEY` in `.env` for the `/api` proxy, **or** inject `VITE_ANTHROPIC_API_KEY` at build/runtime for direct Anthropic fallback when the proxy returns 404/405/503."
+          ? "⚠️ **No API key for chat.** Open **“Anthropic API key”** below and paste your key (stored only in this browser), **or** on **Render** use a **Web Service** with Start **`npm start`** (not Static Site) and set **`ANTHROPIC_API_KEY`** or **`VITE_ANTHROPIC_API_KEY`** in Environment, then redeploy."
           : `⚠️ **API issue:** ${String(e?.message || e).slice(0, 220)}`
       setMsgs(p=>p.slice(0,-1).concat([{role:"ai",text:hint}]))
     }
@@ -817,6 +844,109 @@ function Chat({ onAddBatch, acctRole, snap, systemPrompt, welcomeName }) {
             <span style={{background:JM.r(0.15),color:JM.p,border:`1px solid ${JM.r(0.3)}`,padding:"1px 8px",borderRadius:20,fontSize:9.5,fontWeight:700}}>Claude</span>
           </div>
           <div style={{fontSize:11,color:"#64748b",marginTop:2}}>Uses your live ledger in this browser · Describe a payment or receipt to draft an entry — you confirm before anything is saved</div>
+          <div style={{ marginTop: 10 }}>
+            <button
+              type="button"
+              onClick={() => {
+                setShowKeyPanel(p => !p)
+                setKeyBanner("")
+              }}
+              style={{
+                background: "transparent",
+                border: "none",
+                padding: 0,
+                fontSize: 10,
+                fontWeight: 700,
+                color: JM.p,
+                cursor: "pointer",
+                textDecoration: "underline",
+              }}
+            >
+              {showKeyPanel ? "Hide" : "Anthropic API key (this browser)"}
+            </button>
+            {showKeyPanel && (
+              <div
+                style={{
+                  marginTop: 8,
+                  padding: 10,
+                  background: "#f8fafc",
+                  border: `1px solid ${SKY.border}`,
+                  borderRadius: 8,
+                }}
+              >
+                <div style={{ fontSize: 10, color: SKY.muted, lineHeight: 1.5, marginBottom: 8 }}>
+                  Paste an API key from console.anthropic.com — saved only in <strong>localStorage</strong> on this device.
+                  Prefer hosting with <code style={{ fontSize: 9 }}>npm start</code> + server env key so the key never lives in the browser.
+                </div>
+                <input
+                  type="password"
+                  autoComplete="off"
+                  placeholder="sk-ant-api03-…"
+                  value={keyDraft}
+                  onChange={e => setKeyDraft(e.target.value)}
+                  style={{ ...IS, marginBottom: 8 }}
+                />
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const t = keyDraft.trim()
+                      if (!t) {
+                        setKeyBanner("Paste a key first.")
+                        return
+                      }
+                      try {
+                        localStorage.setItem(ANTHROPIC_KEY_LS, t)
+                        setKeyDraft("")
+                        setKeyBanner("Saved. Try sending a message again.")
+                        setShowKeyPanel(false)
+                      } catch {
+                        setKeyBanner("Could not save (private mode?).")
+                      }
+                    }}
+                    style={{
+                      background: JM.p,
+                      border: "none",
+                      borderRadius: 7,
+                      padding: "5px 12px",
+                      fontSize: 11,
+                      fontWeight: 700,
+                      color: "#fff",
+                      cursor: "pointer",
+                    }}
+                  >
+                    Save key
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      try {
+                        localStorage.removeItem(ANTHROPIC_KEY_LS)
+                        setKeyBanner("Removed saved key.")
+                      } catch {
+                        setKeyBanner("Could not clear.")
+                      }
+                    }}
+                    style={{
+                      background: "transparent",
+                      border: `1px solid ${SKY.border}`,
+                      borderRadius: 7,
+                      padding: "5px 12px",
+                      fontSize: 11,
+                      fontWeight: 600,
+                      color: SKY.muted,
+                      cursor: "pointer",
+                    }}
+                  >
+                    Clear saved key
+                  </button>
+                </div>
+                {keyBanner ? (
+                  <div style={{ fontSize: 10, color: "#0f766e", marginTop: 8, fontWeight: 600 }}>{keyBanner}</div>
+                ) : null}
+              </div>
+            )}
+          </div>
         </div>
         <div ref={ref} style={{flex:1,overflowY:"auto",padding:14,display:"flex",flexDirection:"column",gap:9}}>
           {msgs.map((m,i)=>{
