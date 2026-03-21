@@ -27,14 +27,21 @@ npm run build
 npm start
 ```
 
-`npm start` runs **`server.mjs`**: serves `dist/` and injects the Anthropic key into each HTML response from **`process.env`** (so **Render** can use `VITE_ANTHROPIC_API_KEY` without redeploying a new build when you rotate the key — restart the service). **Vercel** / **Netlify** static deploys only get the key if it was baked in at `vite build` time, unless you add similar runtime config.
+`npm start` runs **`server.mjs`**: serves `dist/` and injects LLM keys from **`process.env`** into HTML (restart to rotate keys; no rebuild). **Vercel** / **Netlify** static deploys only get keys if baked at `vite build` time, unless you add similar runtime config.
 
 ## Environment
 
-Optional: **`ANTHROPIC_API_KEY`** or **`VITE_ANTHROPIC_API_KEY`** for live AI chat (same value; pick one).
+**AI chat — pick one or both providers:**
 
-- **Local dev:** `.env` with either name + `npm run dev` (Vite proxy reads both). For `npm run build && npm start` locally, `server.mjs` reads **`process.env`** at runtime.
-- **Render Option A:** set **`ANTHROPIC_API_KEY`** or **`VITE_ANTHROPIC_API_KEY`** on the **Web Service** → **Environment**, then **Save** and **Manual Deploy** (or push). Rotating the key only needs a **restart** — no rebuild.
+| Provider | Env vars (any one name) | Default model |
+| -------- | ------------------------ | ------------- |
+| **Claude (Anthropic)** | `ANTHROPIC_API_KEY` or `VITE_ANTHROPIC_API_KEY` | `claude-sonnet-4-20250514` (in app) |
+| **OpenAI** | `OPENAI_API_KEY` or `VITE_OPENAI_API_KEY` | `gpt-4o-mini` (override with `OPENAI_CHAT_MODEL` / `VITE_OPENAI_CHAT_MODEL`) |
+
+**Which provider runs:** set **`VITE_CHAT_PROVIDER`** or **`CHAT_PROVIDER`** to `openai` or `anthropic` on the server (injected into the page), or **`VITE_CHAT_PROVIDER`** at build time, or choose in the app under **API keys & provider**. If only one key is configured, that provider is used automatically.
+
+- **Local dev:** `.env` + `npm run dev` (Vite proxies `/api/anthropic/...` and `/api/openai/...`). You can also paste keys in the app (sent as `Authorization: Bearer` to the proxy).
+- **Render Option A:** set the keys you need on the **Web Service** → **Environment**, then **restart** after changes.
 
 ## Deploy (Render) — Option A (recommended for AI chat)
 
@@ -42,9 +49,9 @@ Use a **Web Service** (Node), **not** a **Static Site**.
 
 1. **New** → **Web Service** (or **Blueprint** from this repo’s `render.yaml`).
 2. **Build command:** `npm install && npm run build`
-3. **Start command:** `npm start` (runs `server.mjs` on `0.0.0.0:$PORT`, serves `dist/`, proxies `/api/anthropic/v1/messages`, injects the key into HTML).
-4. **Environment:** add **`ANTHROPIC_API_KEY`** *or* **`VITE_ANTHROPIC_API_KEY`** (your Anthropic secret from [console.anthropic.com](https://console.anthropic.com)).
-5. Deploy, then open **Logs**: you should **not** see `[jm-tally] ... not set` if the variable is wired to this service.
+3. **Start command:** `npm start` (runs `server.mjs` on `0.0.0.0:$PORT`, serves `dist/`, proxies Anthropic + OpenAI chat APIs, injects config into HTML).
+4. **Environment:** add **`OPENAI_API_KEY`** and/or **`ANTHROPIC_API_KEY`** (or the `VITE_*` names). Optional: **`VITE_CHAT_PROVIDER`** = `openai` | `anthropic` to set the default model.
+5. Deploy, then open **Logs**: warnings appear only for providers whose keys are missing (both are optional if you paste a key in the browser).
 
 **Blueprint:** connect the repo; `render.yaml` defines the Web Service above.
 

@@ -1,7 +1,7 @@
 /**
  * Production static server for Render (and similar).
- * Injects Anthropic API key from process.env into index.html at request time
- * so VITE_ANTHROPIC_API_KEY works without rebuilding after you add/change it.
+ * Injects LLM API keys from process.env into index.html at request time
+ * and proxies /api/anthropic/* and /api/openai/* so keys can stay off the client when possible.
  */
 import fs from "node:fs"
 import http from "node:http"
@@ -29,8 +29,10 @@ const MIME = {
 }
 
 function injectRuntimeConfig(html) {
-  const key = String(process.env.VITE_ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY || "").trim()
-  const payload = JSON.stringify({ anthropicApiKey: key })
+  const anthropicApiKey = String(process.env.VITE_ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY || "").trim()
+  const openaiApiKey = String(process.env.VITE_OPENAI_API_KEY || process.env.OPENAI_API_KEY || "").trim()
+  const chatProvider = String(process.env.VITE_CHAT_PROVIDER || process.env.CHAT_PROVIDER || "").trim()
+  const payload = JSON.stringify({ anthropicApiKey, openaiApiKey, chatProvider })
   const tag = `<script>window.__JM_TALLY_CONFIG__=${payload}</script>`
   if (/<\/head>/i.test(html)) return html.replace(/<\/head>/i, `${tag}</head>`)
   if (/<\/body>/i.test(html)) return html.replace(/<\/body>/i, `${tag}</body>`)
@@ -39,9 +41,18 @@ function injectRuntimeConfig(html) {
 
 const rootResolved = path.resolve(root)
 const ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
+const OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
 
 function getAnthropicKey() {
   return String(process.env.VITE_ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY || "").trim()
+}
+
+function getOpenAIKey() {
+  return String(process.env.VITE_OPENAI_API_KEY || process.env.OPENAI_API_KEY || "").trim()
+}
+
+function getOpenAIChatModel() {
+  return String(process.env.OPENAI_CHAT_MODEL || process.env.VITE_OPENAI_CHAT_MODEL || "gpt-4o-mini").trim()
 }
 
 /** POST /api/anthropic/v1/messages — forward JSON body to Anthropic (key stays on server). */
@@ -77,6 +88,55 @@ function handleAnthropicProxy(req, res) {
   })
 }
 
+/** POST /api/openai/v1/chat/completions — Bearer from client request or server env. */
+function handleOpenAIProxy(req, res) {
+  const auth = String(req.headers.authorization || "")
+  const fromClient = auth.startsWith("Bearer ") ? auth.slice(7).trim() : ""
+  const key = fromClient || getOpenAIKey()
+  if (!key) {
+    res.writeHead(503, { "Content-Type": "application/json; charset=utf-8" })
+    res.end(
+      JSON.stringify({
+        error: {
+          message:
+            "No OpenAI key: send Authorization: Bearer sk-… from the app, or set OPENAI_API_KEY / VITE_OPENAI_API_KEY on the server.",
+        },
+      })
+    )
+    return
+  }
+  const chunks = []
+  req.on("data", c => chunks.push(c))
+  req.on("end", async () => {
+    try {
+      let body = chunks.length ? Buffer.concat(chunks).toString("utf8") : "{}"
+      let parsed
+      try {
+        parsed = JSON.parse(body)
+      } catch {
+        parsed = {}
+      }
+      if (!parsed.model) parsed.model = getOpenAIChatModel()
+      body = JSON.stringify(parsed)
+      const r = await fetch(OPENAI_CHAT_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${key}`,
+        },
+        body,
+      })
+      const txt = await r.text()
+      const ct = r.headers.get("content-type") || "application/json; charset=utf-8"
+      res.writeHead(r.status, { "Content-Type": ct })
+      res.end(txt)
+    } catch (e) {
+      res.writeHead(502, { "Content-Type": "application/json; charset=utf-8" })
+      res.end(JSON.stringify({ error: { message: String(e?.message || e) } }))
+    }
+  })
+}
+
 function safeFileFromUrlPath(urlPath) {
   const clean = String(urlPath || "").replace(/^\/+/, "")
   const parts = clean.split("/").filter(p => p && p !== "." && p !== "..")
@@ -94,6 +154,10 @@ const server = http.createServer((req, res) => {
     let pathname = decodeURIComponent(url.pathname)
     if (pathname === "/api/anthropic/v1/messages" && req.method === "POST") {
       handleAnthropicProxy(req, res)
+      return
+    }
+    if (pathname === "/api/openai/v1/chat/completions" && req.method === "POST") {
+      handleOpenAIProxy(req, res)
       return
     }
     const filePath = pathname === "/" ? path.join(rootResolved, "index.html") : safeFileFromUrlPath(pathname)
@@ -130,6 +194,10 @@ server.listen(PORT, "0.0.0.0", () => {
   console.log(`JM Tally listening on 0.0.0.0:${PORT}`)
   if (!getAnthropicKey())
     console.warn(
-      "[jm-tally] ANTHROPIC_API_KEY / VITE_ANTHROPIC_API_KEY not set — AI chat /api proxy returns 503 until you add it (Render → Environment)."
+      "[jm-tally] ANTHROPIC_API_KEY / VITE_ANTHROPIC_API_KEY not set — Claude /api proxy returns 503 until you add it."
+    )
+  if (!getOpenAIKey())
+    console.warn(
+      "[jm-tally] OPENAI_API_KEY / VITE_OPENAI_API_KEY not set — OpenAI /api proxy returns 503 until you add it (optional)."
     )
 })
