@@ -37,6 +37,44 @@ function injectRuntimeConfig(html) {
 }
 
 const rootResolved = path.resolve(root)
+const ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
+
+function getAnthropicKey() {
+  return String(process.env.VITE_ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY || "").trim()
+}
+
+/** POST /api/anthropic/v1/messages — forward JSON body to Anthropic (key stays on server). */
+function handleAnthropicProxy(req, res) {
+  const key = getAnthropicKey()
+  if (!key) {
+    res.writeHead(503, { "Content-Type": "application/json; charset=utf-8" })
+    res.end(JSON.stringify({ error: { message: "ANTHROPIC_API_KEY / VITE_ANTHROPIC_API_KEY not set on server" } }))
+    return
+  }
+  const chunks = []
+  req.on("data", c => chunks.push(c))
+  req.on("end", async () => {
+    try {
+      const body = chunks.length ? Buffer.concat(chunks).toString("utf8") : "{}"
+      const r = await fetch(ANTHROPIC_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": key,
+          "anthropic-version": "2023-06-01",
+        },
+        body,
+      })
+      const txt = await r.text()
+      const ct = r.headers.get("content-type") || "application/json; charset=utf-8"
+      res.writeHead(r.status, { "Content-Type": ct })
+      res.end(txt)
+    } catch (e) {
+      res.writeHead(502, { "Content-Type": "application/json; charset=utf-8" })
+      res.end(JSON.stringify({ error: { message: String(e?.message || e) } }))
+    }
+  })
+}
 
 function safeFileFromUrlPath(urlPath) {
   const clean = String(urlPath || "").replace(/^\/+/, "")
@@ -53,6 +91,10 @@ const server = http.createServer((req, res) => {
     const host = req.headers.host || "localhost"
     const url = new URL(req.url || "/", `http://${host}`)
     let pathname = decodeURIComponent(url.pathname)
+    if (pathname === "/api/anthropic/v1/messages" && req.method === "POST") {
+      handleAnthropicProxy(req, res)
+      return
+    }
     const filePath = pathname === "/" ? path.join(rootResolved, "index.html") : safeFileFromUrlPath(pathname)
     if (filePath && fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
       if (path.extname(filePath) === ".html") {
