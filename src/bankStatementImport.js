@@ -30,6 +30,24 @@ const B2B_CREDIT_RES = [
 ]
 const REVENUE_B2B = "Revenue - B2B Services"
 
+/** Narration + remarks (and similar) combined for regex-based category hints. */
+export function combineNarrationAndRemarks(narration, remarks) {
+  const a = String(narration || "").replace(/\s+/g, " ").trim()
+  const b = String(remarks || "").replace(/\s+/g, " ").trim()
+  if (a && b) return `${a} ${b}`
+  return a || b || ""
+}
+
+/** Human-readable particulars when bank sends separate Remarks column. */
+export function formatImportParticulars(narration, remarks) {
+  const a = String(narration || "").replace(/\s+/g, " ").trim()
+  const b = String(remarks || "").replace(/\s+/g, " ").trim()
+  if (a && b) return `${a} · Remarks: ${b}`
+  if (a) return a
+  if (b) return b
+  return ""
+}
+
 function guessCategory(particulars, drCr) {
   const n = String(particulars || "")
   if (drCr === "CR") {
@@ -305,7 +323,6 @@ function mapColumns(headers) {
     "description",
     "particulars",
     "transaction details",
-    "remarks",
     "details",
     "payee name",
     "counterparty",
@@ -317,9 +334,29 @@ function mapColumns(headers) {
   let date = findCol(H, dateKeys)
   if (date < 0) date = H.findIndex(h => /^date\b/.test(h) || (h.includes("date") && !h.includes("update")))
 
+  const narration = findCol(H, narrKeys)
+  const remarkKeys = [
+    "transaction remarks",
+    "txn remarks",
+    "remarks",
+    "remark",
+    "customer remark",
+    "bank remark",
+    "payee remark",
+    "beneficiary remarks",
+    "additional remarks",
+    "payment remarks",
+    "spl instr",
+    "special instruction",
+    "value date remarks",
+  ]
+  let remarks = findCol(H, remarkKeys)
+  if (remarks >= 0 && remarks === narration) remarks = -1
+
   return {
     date,
-    narration: findCol(H, narrKeys),
+    narration,
+    remarks,
     debit: findDebitAmountCol(H),
     credit: findCreditAmountCol(H),
     balance: findCol(H, balanceKeys),
@@ -398,7 +435,9 @@ export function importBankStatementFromMatrix(matrix, ctx) {
     }
   }
 
-  const idxs = [m.date, m.narration, m.debit, m.credit, m.balance, m.amount, m.drCr, m.category].filter(i => i >= 0)
+  const idxs = [m.date, m.narration, m.remarks, m.debit, m.credit, m.balance, m.amount, m.drCr, m.category].filter(
+    i => i >= 0
+  )
   const maxCol = idxs.length ? Math.max(...idxs) : 0
 
   const drafts = []
@@ -410,17 +449,25 @@ export function importBankStatementFromMatrix(matrix, ctx) {
     const date = parseCellAsStatementDate(row[m.date])
     if (!date) continue
 
-    const narr =
+    const narrRaw =
       m.narration >= 0
         ? String(row[m.narration] ?? "").replace(/\s+/g, " ").trim()
-        : String(row.find((c, i) => i !== m.date && String(c).trim()) ?? "").trim()
+        : ""
+    const remRaw = m.remarks >= 0 ? String(row[m.remarks] ?? "").replace(/\s+/g, " ").trim() : ""
+    const narrFallback =
+      narrRaw ||
+      String(row.find((c, i) => i !== m.date && i !== m.remarks && String(c).trim()) ?? "").trim()
+    const narr = narrRaw || (m.remarks < 0 ? narrFallback : "")
+    const forCategory = combineNarrationAndRemarks(narr || narrFallback, remRaw)
+    const particulars =
+      formatImportParticulars(narr || narrFallback, remRaw) || narrFallback || "(no narration)"
 
     const flow = rowDrCrAmount(row, m)
     if (!flow || !flow.amount || flow.amount <= 0) continue
 
     let category =
       m.category >= 0 ? String(row[m.category] ?? "").trim() : ""
-    if (!category) category = guessCategory(narr, flow.drCr)
+    if (!category) category = guessCategory(forCategory || particulars, flow.drCr)
 
     let balance = null
     if (m.balance >= 0) {
@@ -428,7 +475,15 @@ export function importBankStatementFromMatrix(matrix, ctx) {
       if (b != null && Number.isFinite(b)) balance = Math.abs(b) * (b < 0 ? -1 : 1)
     }
 
-    drafts.push({ date, particulars: narr || "(no narration)", amount: flow.amount, drCr: flow.drCr, category, balance })
+    drafts.push({
+      date,
+      particulars,
+      bankRemark: remRaw || undefined,
+      amount: flow.amount,
+      drCr: flow.drCr,
+      category,
+      balance,
+    })
   }
 
   if (!drafts.length) {
@@ -480,6 +535,7 @@ export function importBankStatementFromMatrix(matrix, ctx) {
         ref: `import:${fileName || "statement"}`,
       },
     }
+    if (d.bankRemark) t.bankRemark = d.bankRemark
     if (d.balance != null && Number.isFinite(d.balance)) t.balance = d.balance
     newTxns.push(t)
     active.push(t)

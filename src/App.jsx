@@ -410,13 +410,29 @@ const IS = {
 const LB = { fontSize: 10, fontWeight: 700, color: SKY.muted, display: "block", marginBottom: 4, textTransform: "uppercase", letterSpacing: ".5px" }
 function F({label, children}) { return <div style={{marginBottom:12}}><label style={LB}>{label}</label>{children}</div> }
 
+/** Anthropic key: build-time (Vite .env) or runtime (server.mjs injects `window.__JM_TALLY_CONFIG__` on Render). */
+function getAnthropicApiKey() {
+  if (typeof window !== "undefined" && window.__JM_TALLY_CONFIG__?.anthropicApiKey != null) {
+    const k = String(window.__JM_TALLY_CONFIG__.anthropicApiKey).trim()
+    if (k) return k
+  }
+  const v = import.meta.env.VITE_ANTHROPIC_API_KEY
+  return typeof v === "string" ? v.trim() : ""
+}
+
 function buildChatSystemPrompt(co, snap) {
   const org = String(co?.legalName || co?.name || "your company").replace(/</g, "")
   const bank = String(co?.bankAccountLabel || "operating bank — set label in Companies").replace(/</g, "")
   const s = snap || {}
+  const recent = String(s.recentLines || "").trim()
+  const recentBlock =
+    recent.length > 3200 ? `${recent.slice(0, 3200)}…` : recent || "—"
   return `You are the AI accounting assistant inside JM Tally for ${org} (${bank}).
 
 REAL FINANCIALS (live ledger in this browser): Approx. bank balance ₹${inr0(s.balance ?? 0)} | ${s.count ?? 0} transactions | Top revenue line: ${String(s.topRevName || "—").slice(0, 80)} · ₹${inr0(s.topRevAmt ?? 0)} | Salary (DR): ₹${inr0(s.salaryDr ?? 0)} | Output GST (est.): ₹${inr0(s.gstEst ?? 0)} | IT refund (CR): ₹${inr0(s.itRefund ?? 0)}
+
+RECENT LEDGER LINES (newest last; each line is date · Dr/Cr · amount · category · particulars). **Particulars** may include **Remarks:** when the bank statement had a separate Remarks column — use that text the same as narration for meaning (UTR, invoice #, payee, purpose). Suggest reclassification only when substance clearly differs from current category.
+${recentBlock}
 
 CLASSIFICATION: Bank debits to job / hiring portals (Naukri, Apna, WorkIndia, JobHai, LinkedIn, Indeed, Shine, Monster, Foundit, etc.) are **Recruitment - Job Portals**, not Director Payment—unless the narration is clearly director remuneration.
 
@@ -490,7 +506,7 @@ function Chat({ onAdd, acctRole, snap, systemPrompt, welcomeName }) {
     setBusy(true)
     setMsgs(p=>[...p,{role:"ai",text:"...",loading:true}])
     try {
-      const apiKey = import.meta.env.VITE_ANTHROPIC_API_KEY
+      const apiKey = getAnthropicApiKey()
       if (!apiKey) throw new Error("no_key")
       const res = await fetch("https://api.anthropic.com/v1/messages",{
         method:"POST",
@@ -506,9 +522,10 @@ function Chat({ onAdd, acctRole, snap, systemPrompt, welcomeName }) {
       hist.current.push({role:"assistant",content:text})
       setMsgs(p=>p.slice(0,-1).concat([{role:"ai",text}]))
     } catch (e) {
-      const hint = e?.message === "no_key"
-        ? "⚠️ Add **VITE_ANTHROPIC_API_KEY** in `.env` for live Claude replies. I can still answer from built-in knowledge about your accounts."
-        : "⚠️ API unavailable. Check your internet connection. I can still answer from built-in knowledge about your accounts."
+      const hint =
+        e?.message === "no_key"
+          ? "⚠️ **No API key configured.** **Local:** add `VITE_ANTHROPIC_API_KEY` to `.env` and restart `npm run dev`. **Production (Render):** set `VITE_ANTHROPIC_API_KEY` in Environment, then **restart the service** (or redeploy). The server injects it at runtime — no rebuild required after the first deploy with `server.mjs`. I can still answer from built-in knowledge."
+          : "⚠️ API unavailable. Check your internet connection. I can still answer from built-in knowledge about your accounts."
       setMsgs(p=>p.slice(0,-1).concat([{role:"ai",text:hint}]))
     }
     setBusy(false)
@@ -627,6 +644,9 @@ export default function App() {
   const [invPayId, setInvPayId] = useState(null)
   const [invPayAmt, setInvPayAmt] = useState("")
   const [invPayTds, setInvPayTds] = useState("")
+  const [dangerFlow, setDangerFlow] = useState(null)
+  const [dangerRemark, setDangerRemark] = useState("")
+  const [dangerAck, setDangerAck] = useState(false)
   const [companies, setCompanies] = useState([])
   const [activeCompanyId, setActiveCompanyId] = useState("")
   const skipPersistRef = useRef(false)
@@ -748,6 +768,21 @@ export default function App() {
   )
   const chatSnap = useMemo(() => {
     const tr = chatRevenueCats[0]
+    const recentLines = [...ledger]
+      .filter(t => !t.void)
+      .slice(-28)
+      .map(t => {
+        const p = String(t.particulars || "")
+          .replace(/\s+/g, " ")
+          .trim()
+          .slice(0, 130)
+        const extra =
+          t.bankRemark && !p.toLowerCase().includes("remarks:")
+            ? ` | Remark: ${String(t.bankRemark).replace(/\s+/g, " ").trim().slice(0, 70)}`
+            : ""
+        return `${t.date} · ${t.drCr} · ₹${inr0(t.amount)} · ${t.category} · ${p}${extra}`
+      })
+      .join("\n")
     return {
       balance: stats.balance,
       topRevName: tr ? String(tr[0]).replace(/^Revenue -\s*/, "") : "—",
@@ -756,6 +791,7 @@ export default function App() {
       gstEst: outputGstFullBook,
       itRefund: ledger.filter(t => !t.void && t.drCr === "CR" && t.category === "Income Tax Refund").reduce((s, t) => s + (Number(t.amount) || 0), 0),
       count: stats.count,
+      recentLines,
     }
   }, [ledger, stats.balance, stats.count, chatRevenueCats, outputGstFullBook])
 
@@ -1015,19 +1051,91 @@ export default function App() {
     [txns, acctRole, periodLockIso, appendAudit]
   )
 
-  const voidTxn = id => {
-    if (acctRole==="Viewer"){toast_("Viewer role — cannot void","#f43f5e");return}
-    if (!confirm("Void this entry? (No hard delete — audit trail kept; excluded from balances)")) return
-    setTxns(p=>{
-      const victim = p.find(x=>x.id===id)
-      if (!victim) return p
-      const marked = p.map(x=>x.id===id?{...x,void:true,voidedAt:new Date().toISOString(),voidedBy:acctRole,balance:null}:x)
-      const stripped = stripBalancesAfter(marked, victim.date, victim.id)
-      return withRecalculatedBalances(stripped)
-    })
-    appendAudit({action:"VOID",txnId:id,by:acctRole})
-    toast_("Entry voided","#f59e0b")
-  }
+  const closeDangerModal = useCallback(() => {
+    setDangerFlow(null)
+    setDangerRemark("")
+    setDangerAck(false)
+  }, [])
+
+  const openVoidConfirm = useCallback(
+    id => {
+      if (acctRole === "Viewer") {
+        toast_("Viewer role — cannot void", "#f43f5e")
+        return
+      }
+      setDangerFlow({ kind: "void", id })
+      setDangerRemark("")
+      setDangerAck(false)
+    },
+    [acctRole]
+  )
+
+  const openInvoiceDeleteConfirm = useCallback(
+    id => {
+      if (acctRole === "Viewer") return
+      setDangerFlow({ kind: "invoice", id })
+      setDangerRemark("")
+      setDangerAck(false)
+    },
+    [acctRole]
+  )
+
+  const confirmDangerAction = useCallback(() => {
+    if (acctRole === "Viewer" || !dangerFlow) return
+    const remark = dangerRemark.trim()
+    if (remark.length < 3) {
+      toast_("Enter a remark (at least 3 characters)", "#f43f5e")
+      return
+    }
+    if (!dangerAck) {
+      toast_("Tick the box to confirm", "#f43f5e")
+      return
+    }
+    if (dangerFlow.kind === "void") {
+      const id = dangerFlow.id
+      const victim = txns?.find(x => x.id === id)
+      if (!victim) {
+        toast_("Entry not found", "#f43f5e")
+        closeDangerModal()
+        return
+      }
+      setTxns(p => {
+        const marked = p.map(x =>
+          x.id === id
+            ? {
+                ...x,
+                void: true,
+                voidedAt: new Date().toISOString(),
+                voidedBy: acctRole,
+                voidReason: remark,
+                balance: null,
+              }
+            : x
+        )
+        const stripped = stripBalancesAfter(marked, victim.date, victim.id)
+        return withRecalculatedBalances(stripped)
+      })
+      appendAudit({ action: "VOID", txnId: id, by: acctRole, remark })
+      toast_("Entry voided", "#f59e0b")
+    } else {
+      const id = dangerFlow.id
+      const inv = invoices.find(i => i.id === id)
+      if (!inv) {
+        toast_("Invoice not found", "#f43f5e")
+        closeDangerModal()
+        return
+      }
+      setInvoices(list => list.filter(i => i.id !== id))
+      appendAudit({
+        action: "INVOICE_DELETE",
+        invoiceId: id,
+        num: inv.num,
+        remark,
+      })
+      toast_("Invoice removed", "#f59e0b")
+    }
+    closeDangerModal()
+  }, [acctRole, dangerFlow, dangerRemark, dangerAck, invoices, txns, appendAudit, closeDangerModal])
 
   const openCreateInvoiceModal = () => {
     if (acctRole === "Viewer") {
@@ -1161,14 +1269,6 @@ export default function App() {
     [invoices, txns, acctRole, periodLockIso, appendAudit]
   )
 
-  const deleteInvoice = id => {
-    if (acctRole === "Viewer") return
-    if (!confirm("Remove this invoice from the register?")) return
-    setInvoices(list => list.filter(i => i.id !== id))
-    appendAudit({ action: "INVOICE_DELETE", invoiceId: id })
-    toast_("Invoice removed", "#f59e0b")
-  }
-
   const exportInvoicesCsv = () => {
     const header =
       "Invoice #,Date,Due Date,Client,GSTIN,SAC,Taxable,GST%,CGST,SGST,IGST,Total,Paid_settlement,Bank_received,TDS_deducted,Balance,Status,Category,Description\n"
@@ -1290,7 +1390,17 @@ export default function App() {
   const filtered = useMemo(()=>{
     if(!txns) return []
     let f = showVoid ? txns : txns.filter(t=>!t.void)
-    if(search) f = f.filter(t=>t.particulars.toLowerCase().includes(search.toLowerCase())||t.category.toLowerCase().includes(search.toLowerCase()))
+    if (search) {
+      const q = search.toLowerCase()
+      f = f.filter(
+        t =>
+          t.particulars.toLowerCase().includes(q) ||
+          t.category.toLowerCase().includes(q) ||
+          String(t.bankRemark || "")
+            .toLowerCase()
+            .includes(q)
+      )
+    }
     if(fCat) f = f.filter(t=>t.category===fCat)
     if(fDC) f = f.filter(t=>t.drCr===fDC)
     if(repFy) f = f.filter(t=>t.fy===repFy)
@@ -1556,14 +1666,14 @@ export default function App() {
         <Tbl cols={[
           {h:"#",k:"id",cell:r=><span style={{color:"#475569",fontSize:11}}>{r.id}</span>},
           {h:"Date",k:"date"},
-          {h:"Particulars",cell:r=><span style={{fontSize:11}} title={r.particulars}>{r.particulars.substring(0,46)}</span>},
+          {h:"Particulars",cell:r=><span style={{fontSize:11,opacity:r.void?0.55:1}} title={r.void?(r.voidReason?`${r.particulars}\n\nVoid reason: ${r.voidReason}`:r.particulars):r.particulars}>{r.particulars.substring(0,46)}{r.void?" (void)":""}</span>},
           {h:"Category",cell:r=><Chip cat={r.category}/>},
           {h:"Type",cell:r=><span style={{...pillStyle(r.drCr==="CR"?"Revenue":"Director Payment",r.drCr),fontSize:9.5}}>{r.drCr}</span>},
           {h:"Amount",r:true,cell:r=><span style={{color:r.drCr==="CR"?"#10b981":"#f43f5e",fontFamily:"monospace",fontWeight:700}}>{r.drCr==="CR"?"+":"-"}₹{inr(r.amount)}</span>},
           {h:"Balance",r:true,cell:r=><span style={{color:"#6B7AFF",fontFamily:"monospace"}}>₹{inr(r.balance)}</span>},
           {h:"FY",cell:r=><Chip cat="Bank Charges" label={r.fy}/>},
           {h:"JE",cell:r=><span style={{fontSize:10,color:r.journalLines?"#10b981":"#64748b"}} title={r.journalLines?r.journalLines.map(l=>`${l.account} Dr ${l.debit||""} Cr ${l.credit||""}`).join(" · "):""}>{r.journalLines?r.journalLines.length+"L ✓":"—"}</span>},
-          {h:"",cell:r=><button title="Void (no hard delete)" disabled={acctRole==="Viewer"||r.void} onClick={()=>voidTxn(r.id)} style={{background:"none",border:"none",cursor:r.void||acctRole==="Viewer"?"default":"pointer",color:r.void?"#475569":"#f59e0b",fontSize:12,padding:"2px 5px"}}>{r.void?"✕":"⊘"}</button>},
+          {h:"",cell:r=><button title="Void (no hard delete)" disabled={acctRole==="Viewer"||r.void} onClick={()=>openVoidConfirm(r.id)} style={{background:"none",border:"none",cursor:r.void||acctRole==="Viewer"?"default":"pointer",color:r.void?"#475569":"#f59e0b",fontSize:12,padding:"2px 5px"}}>{r.void?"✕":"⊘"}</button>},
         ]} rows={filtered} empty="No transactions match filters"/>
       </div>
     )
@@ -1668,7 +1778,7 @@ export default function App() {
             <button
               type="button"
               disabled={acctRole === "Viewer"}
-              onClick={() => deleteInvoice(r.id)}
+              onClick={() => openInvoiceDeleteConfirm(r.id)}
               title="Remove from register"
               style={{ background: "none", border: "none", fontSize: 10, color: "#f43f5e", cursor: acctRole === "Viewer" ? "default" : "pointer" }}
             >
@@ -2379,7 +2489,7 @@ export default function App() {
               <div style={{fontSize:12,fontWeight:700}}>📋 Import History</div>
               <div style={{display:"flex",gap:7}}>
                 {importHistory.length>0&&<button type="button" onClick={()=>{if(confirm("Clear import history list?"))setImportHistory([])}} style={{...S.btnO,fontSize:11,color:"#f43f5e",borderColor:"rgba(244,63,94,.35)"}}>Clear list</button>}
-                <button type="button" onClick={()=>{const h="Date,Narration,Amount,DR/CR,Balance,Category\n24/01/2025,NEFT from ACME Pvt Ltd — Invoice 1042,24360,CR,24360,Revenue - B2B Services\n";const b=new Blob([h],{type:"text/csv"});const a=document.createElement("a");a.href=URL.createObjectURL(b);a.download="jm_tally_template.csv";a.click()}} style={{...S.btnO,fontSize:11}}>⬇ Template</button>
+                <button type="button" onClick={()=>{const h="Date,Narration,Remarks,Withdrawal,Deposit,Balance\n24/01/2025,NEFT IN-123/ACME Pvt Ltd,Invoice 1042 · GST period Mar,0,24360,150000\n24/01/2025,UPI-SALARY,,25000,0,125000\n";const b=new Blob([h],{type:"text/csv"});const a=document.createElement("a");a.href=URL.createObjectURL(b);a.download="jm_tally_template.csv";a.click()}} style={{...S.btnO,fontSize:11}}>⬇ Template</button>
               </div>
             </div>
             <Tbl cols={[{h:"Date",k:"d"},{h:"File",k:"f"},{h:"Period",k:"p"},{h:"Txns",k:"t"},{h:"Status",cell:r=><Chip cat={r.status==="Done"?"Revenue":r.status==="Failed"?"Director Payment":r.status==="Nothing new"?"Bank Charges":"Bank Charges"} label={String(r.status)}/>}]} rows={importHistory} empty="No imports yet — upload a CSV or Excel statement to import."/>
@@ -2734,6 +2844,92 @@ export default function App() {
           <F label="Reference No."><input value={nt.ref} onChange={e=>setNt(p=>({...p,ref:e.target.value}))} placeholder="NEFT/IMPS/UPI ref · vendor invoice #" style={IS}/></F>
           {nt.category==="Vendor - IT Solutions"&&<div style={{gridColumn:"1/-1",fontSize:11,color:"#0369a1",lineHeight:1.5,padding:"8px 10px",background:"rgba(107,122,255,.1)",borderRadius:8,border:"1px solid rgba(107,122,255,.25)"}}>Payments to <strong>IT Solutions</strong> are <strong>expenses</strong> (P&amp;L / vendor ledger). For GST, use <strong>GST → ITC</strong>: splits use 18% inclusive CGST+SGST — reconcile with their invoice &amp; GSTR-2B.</div>}
         </div>
+      </Modal>
+
+      <Modal
+        open={dangerFlow != null}
+        title={dangerFlow?.kind === "void" ? "Void transaction?" : "Delete invoice?"}
+        onClose={closeDangerModal}
+        onSave={confirmDangerAction}
+        saveDisabled={
+          acctRole === "Viewer" || dangerRemark.trim().length < 3 || !dangerAck || dangerFlow == null
+        }
+        saveLabel={
+          dangerFlow?.kind === "void"
+            ? acctRole === "Viewer"
+              ? "View-only"
+              : "Void entry"
+            : acctRole === "Viewer"
+              ? "View-only"
+              : "Delete invoice"
+        }
+      >
+        {dangerFlow?.kind === "void" ? (
+          <div style={{ fontSize: 12, color: SKY.text2, lineHeight: 1.6, marginBottom: 14 }}>
+            The line stays in the books as <strong>voided</strong> (audit trail). It is excluded from balances and reports unless you show voided entries.
+          </div>
+        ) : (
+          <div style={{ fontSize: 12, color: "#f43f5e", lineHeight: 1.6, marginBottom: 14 }}>
+            This <strong>removes</strong> the invoice from the register. Ledger transactions already posted from payments are <strong>not</strong> removed automatically.
+          </div>
+        )}
+        {dangerFlow?.kind === "void" &&
+          (() => {
+            const t = txns?.find(x => x.id === dangerFlow.id)
+            if (!t) return null
+            return (
+              <div
+                style={{
+                  fontSize: 11,
+                  color: SKY.muted,
+                  marginBottom: 12,
+                  padding: "10px 12px",
+                  background: "#ffffff",
+                  borderRadius: 8,
+                  border: `1px solid ${SKY.borderHi}`,
+                  fontFamily: "ui-monospace, monospace",
+                }}
+              >
+                {t.date} · {t.drCr} · ₹{inr(t.amount)} · {String(t.particulars).slice(0, 120)}
+                {String(t.particulars).length > 120 ? "…" : ""}
+              </div>
+            )
+          })()}
+        {dangerFlow?.kind === "invoice" &&
+          (() => {
+            const inv = invoices.find(i => i.id === dangerFlow.id)
+            if (!inv) return null
+            return (
+              <div
+                style={{
+                  fontSize: 11,
+                  color: SKY.muted,
+                  marginBottom: 12,
+                  padding: "10px 12px",
+                  background: "#ffffff",
+                  borderRadius: 8,
+                  border: `1px solid ${SKY.borderHi}`,
+                }}
+              >
+                <strong style={{ color: SKY.text }}>{inv.num}</strong> · {inv.client} · ₹{inr(inv.total)}
+              </div>
+            )
+          })()}
+        <F label="Remark (required)">
+          <textarea
+            value={dangerRemark}
+            onChange={e => setDangerRemark(e.target.value)}
+            rows={3}
+            placeholder="Why are you voiding / deleting this? (min 3 characters)"
+            style={{ ...IS, resize: "vertical", minHeight: 72 }}
+          />
+        </F>
+        <label style={{ display: "flex", alignItems: "flex-start", gap: 10, fontSize: 12, color: SKY.text, cursor: "pointer", marginTop: 4 }}>
+          <input type="checkbox" checked={dangerAck} onChange={e => setDangerAck(e.target.checked)} style={{ marginTop: 2 }} />
+          <span>
+            I confirm I want to {dangerFlow?.kind === "void" ? "void this transaction" : "delete this invoice"}.
+          </span>
+        </label>
       </Modal>
 
       <Modal

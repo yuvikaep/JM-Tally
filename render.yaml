@@ -1,5 +1,5 @@
 # JM Tally — Web App (Node Web Service)
-# Serves the production SPA with `serve` after Vite build.
+# `node server.mjs` serves dist/ and injects VITE_ANTHROPIC_API_KEY into HTML at runtime (no rebuild when key changes).
 # Dashboard: New → Blueprint → connect repo, or New → Web Service (Node):
 #   Build:  npm install && npm run build
 #   Start:  npm start

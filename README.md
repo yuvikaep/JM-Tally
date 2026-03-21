@@ -27,11 +27,14 @@ npm run build
 npm start
 ```
 
-`npm start` serves `dist/` (used by **Render Web Service** and similar). **Vercel** / **Netlify** can use `dist` as the publish folder without `npm start`.
+`npm start` runs **`server.mjs`**: serves `dist/` and injects the Anthropic key into each HTML response from **`process.env`** (so **Render** can use `VITE_ANTHROPIC_API_KEY` without redeploying a new build when you rotate the key — restart the service). **Vercel** / **Netlify** static deploys only get the key if it was baked in at `vite build` time, unless you add similar runtime config.
 
 ## Environment
 
-Optional: `VITE_ANTHROPIC_API_KEY` in `.env` for live AI assistant replies (see `.env.example`). On Render, set this in the service **Environment** so it is available at **build** time (Vite inlines `VITE_*` variables).
+Optional: **`VITE_ANTHROPIC_API_KEY`** (or **`ANTHROPIC_API_KEY`**) for live AI chat.
+
+- **Local dev:** `.env` + `npm run dev` (Vite reads `VITE_*`).
+- **Render (this repo’s `npm start`):** set **`VITE_ANTHROPIC_API_KEY`** in the service Environment, then deploy once with the new `server.mjs`; after that, changing the key only needs a **service restart**.
 
 ## Deploy (Render)
 

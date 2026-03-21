@@ -12,10 +12,9 @@
     "build": "vite build",
     "lint": "eslint .",
     "preview": "vite preview",
-    "start": "serve dist -s -l tcp://0.0.0.0:${PORT:-4173}"
+    "start": "node server.mjs"
   },
   "dependencies": {
-    "serve": "^14.2.4",
     "react": "^19.2.4",
     "react-dom": "^19.2.4",
     "xlsx": "^0.18.5"
