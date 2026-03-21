@@ -1,10 +1,6 @@
 # JM Tally — Web App (Node Web Service)
-# `node server.mjs` serves dist/ and injects VITE_ANTHROPIC_API_KEY into HTML at runtime (no rebuild when key changes).
-# Dashboard: New → Blueprint → connect repo, or New → Web Service (Node):
-#   Build:  npm install && npm run build
-#   Start:  npm start
-# AI chat: OPENAI_API_KEY / ANTHROPIC_API_KEY (or VITE_*) — npm start proxies /api/openai + /api/anthropic.
-# Optional: VITE_CHAT_PROVIDER or CHAT_PROVIDER = openai | anthropic
+# Default AI: OpenAI — set OPENAI_API_KEY from https://platform.openai.com/api-keys
+# npm start proxies /api/openai + /api/anthropic; CHAT_PROVIDER=anthropic for Claude-only.
 # Use a Web Service with `npm start` — Static Site will not run server.mjs.
 
 services:
@@ -13,20 +9,22 @@ services:
     runtime: node
     plan: free
     buildCommand: npm install && npm run build
-    # serve must bind 0.0.0.0:$PORT — plain -l $PORT listens on localhost only (Render times out)
     startCommand: npm start
     healthCheckPath: /
     envVars:
       - key: NODE_VERSION
         value: "20"
-      # Either is enough for server.mjs + AI chat (Option A: Web Service + npm start).
-      - key: ANTHROPIC_API_KEY
-        sync: false
-      - key: VITE_ANTHROPIC_API_KEY
-        sync: false
+      - key: CHAT_PROVIDER
+        value: openai
       - key: OPENAI_API_KEY
         sync: false
       - key: VITE_OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_CHAT_MODEL
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: VITE_ANTHROPIC_API_KEY
         sync: false
       - key: VITE_CHAT_PROVIDER
         sync: false

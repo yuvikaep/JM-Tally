@@ -10,7 +10,7 @@
 | **Mobile** | Planned — same product (e.g. React Native / Expo or native apps) against a future API + sync |
 | **Desktop** | Planned — e.g. Electron or Tauri shell loading the web app or a dedicated desktop build |
 
-For **AI chat**, use a **Node** host with **`npm start`** (see [Deploy (Render)](#deploy-render) — **Option A**). Plain **static / CDN** deploys do not run `server.mjs`, so there is no `/api` proxy or runtime key injection unless users paste a key in the browser.
+For **AI chat**, use a **Node** host with **`npm start`** (see [Deploy (Render)](#deploy-render)) or **Vercel** with the included **`api/`** serverless routes. Plain **static / CDN** deploys without those routes only get chat if users paste a key in the browser.
 
 ## Run locally
 
@@ -18,6 +18,8 @@ For **AI chat**, use a **Node** host with **`npm start`** (see [Deploy (Render)]
 npm install
 npm run dev
 ```
+
+Add **`OPENAI_API_KEY`** (and optionally **`CHAT_PROVIDER=anthropic`** for Claude) to **`.env`** for the dev proxy. Keys: **https://platform.openai.com/api-keys**
 
 ## Production build
 
@@ -27,40 +29,36 @@ npm run build
 npm start
 ```
 
-`npm start` runs **`server.mjs`**: serves `dist/` and injects LLM keys from **`process.env`** into HTML (restart to rotate keys; no rebuild). **Vercel** / **Netlify** static deploys only get keys if baked at `vite build` time, unless you add similar runtime config.
+`npm start` runs **`server.mjs`**: serves `dist/`, proxies **`/api/openai`** and **`/api/anthropic`**, and injects config into HTML from **`process.env`**.
 
-## Environment
+## Environment — AI chat (OpenAI by default)
 
-**AI chat — pick one or both providers:**
+| What | Env vars | Notes |
+| ---- | -------- | ----- |
+| **OpenAI (default)** | **`OPENAI_API_KEY`** or `VITE_OPENAI_API_KEY` | Create keys at **https://platform.openai.com/api-keys**. Prefer **`OPENAI_API_KEY`** on the server so the secret is not baked into the JS bundle. |
+| **Model** | `OPENAI_CHAT_MODEL` or `VITE_OPENAI_CHAT_MODEL` | Default in app: **`gpt-4o-mini`**. |
+| **Use Claude instead** | `ANTHROPIC_API_KEY` or `VITE_ANTHROPIC_API_KEY` | Plus **`CHAT_PROVIDER=anthropic`** (or **`VITE_CHAT_PROVIDER`**) so the app does not stay on OpenAI. |
+| **Force provider** | **`CHAT_PROVIDER`** or **`VITE_CHAT_PROVIDER`** | `openai` (default) or `anthropic`. Injected at runtime on Render via `server.mjs`. |
 
-| Provider | Env vars (any one name) | Default model |
-| -------- | ------------------------ | ------------- |
-| **Claude (Anthropic)** | `ANTHROPIC_API_KEY` or `VITE_ANTHROPIC_API_KEY` | `claude-sonnet-4-20250514` (in app) |
-| **OpenAI** | `OPENAI_API_KEY` or `VITE_OPENAI_API_KEY` | `gpt-4o-mini` (override with `OPENAI_CHAT_MODEL` / `VITE_OPENAI_CHAT_MODEL`) |
+- **Local:** `.env` + `npm run dev` (Vite proxies `/api/openai` and `/api/anthropic`). You can also paste keys in the app under **API keys & provider**.
+- **Render:** Web Service + **`npm start`**; set **`OPENAI_API_KEY`** in **Environment**, then **restart** after changes.
+- **Vercel:** Set **`OPENAI_API_KEY`** under **Project → Settings → Environment Variables**; redeploy. The **`api/openai/v1/chat/completions.js`** function uses it. Avoid **`VITE_OPENAI_API_KEY`** unless you accept the key in the client bundle.
 
-**Which provider runs:** set **`VITE_CHAT_PROVIDER`** or **`CHAT_PROVIDER`** to `openai` or `anthropic` on the server (injected into the page), or **`VITE_CHAT_PROVIDER`** at build time, or choose in the app under **API keys & provider**. If only one key is configured, that provider is used automatically.
-
-- **Local dev:** `.env` + `npm run dev` (Vite proxies `/api/anthropic/...` and `/api/openai/...`). You can also paste keys in the app (sent as `Authorization: Bearer` to the proxy).
-- **Render Option A:** set the keys you need on the **Web Service** → **Environment**, then **restart** after changes.
-
-## Deploy (Render) — Option A (recommended for AI chat)
+## Deploy (Render) — Web Service + `npm start`
 
 Use a **Web Service** (Node), **not** a **Static Site**.
 
-1. **New** → **Web Service** (or **Blueprint** from this repo’s `render.yaml`).
-2. **Build command:** `npm install && npm run build`
-3. **Start command:** `npm start` (runs `server.mjs` on `0.0.0.0:$PORT`, serves `dist/`, proxies Anthropic + OpenAI chat APIs, injects config into HTML).
-4. **Environment:** add **`OPENAI_API_KEY`** and/or **`ANTHROPIC_API_KEY`** (or the `VITE_*` names). Optional: **`VITE_CHAT_PROVIDER`** = `openai` | `anthropic` to set the default model.
-5. Deploy, then open **Logs**: warnings appear only for providers whose keys are missing (both are optional if you paste a key in the browser).
-
-**Blueprint:** connect the repo; `render.yaml` defines the Web Service above.
+1. **New** → **Web Service** (or **Blueprint** from **`render.yaml`**).
+2. **Build:** `npm install && npm run build`
+3. **Start:** `npm start`
+4. **Environment:** **`OPENAI_API_KEY`** = secret from **https://platform.openai.com/api-keys**. Optional: **`CHAT_PROVIDER=anthropic`** and **`ANTHROPIC_API_KEY`** if you want Claude only or both.
+5. **Logs:** if OpenAI is unset, you’ll see a warning until **`OPENAI_API_KEY`** is set (default chat is OpenAI).
 
 **Manual:** New → **Web Service** → Node, **Build:** `npm install && npm run build`, **Start:** `npm start`.
 
-### Deploy (Vercel)
+## Deploy (Vercel)
 
-This repo includes **`api/anthropic/v1/messages.js`** and **`api/openai/v1/chat/completions.js`** so chat works without `server.mjs`.
-
-1. Set **`ANTHROPIC_API_KEY`** (and/or **`OPENAI_API_KEY`**) in **Vercel → Project → Settings → Environment Variables** (use the names **without** `VITE_` for secrets you do not want embedded in the JS bundle).
-2. If you previously set **`VITE_ANTHROPIC_API_KEY`** to a wrong or rotated value, **delete it** or fix it — it is baked in at build time and overrides nothing for the proxy, but the app may still **send that bad key** on the direct-to-Anthropic fallback and you will see **`invalid x-api-key`**.
-3. Redeploy after changing env vars. `vercel.json` rewrites skip `/api/*` so these functions are reachable.
+1. Set **`OPENAI_API_KEY`** in **Vercel → Environment Variables** (Production / Preview as needed). Keys: **https://platform.openai.com/api-keys**
+2. Optional: **`CHAT_PROVIDER=anthropic`** and **`ANTHROPIC_API_KEY`** for Claude.
+3. Redeploy. **`vercel.json`** keeps **`/api/*`** off the SPA rewrite so **`api/openai/...`** runs as a serverless function.
+4. Remove wrong **`VITE_*`** secrets if you no longer want them embedded in the client build.

@@ -476,7 +476,7 @@ function openaiChatModel() {
   return typeof m === "string" && m.trim() ? m.trim() : "gpt-4o-mini"
 }
 
-/** `openai` | `anthropic` — localStorage wins, then server/Vite CHAT_PROVIDER, then auto from keys. */
+/** `openai` | `anthropic` — localStorage wins, then server-injected / Vite CHAT_PROVIDER, then keys; default OpenAI. */
 function resolveChatProvider() {
   try {
     const ls = localStorage.getItem(CHAT_PROVIDER_LS)
@@ -494,7 +494,7 @@ function resolveChatProvider() {
   const hasA = !!getAnthropicApiKey()
   if (hasO && !hasA) return "openai"
   if (hasA && !hasO) return "anthropic"
-  return "anthropic"
+  return "openai"
 }
 
 function toOpenAIChatMessages(system, messages) {
@@ -528,7 +528,14 @@ async function fetchOpenAIChatMessages({ system, messages, max_tokens = 800 }) {
   if (!res.ok) {
     if (res.status === 404 || res.status === 503 || res.status === 405)
       throw new Error("no_key")
-    throw new Error(data.error?.message || `OpenAI API ${res.status}`)
+    const em = String(data.error?.message || "")
+    const code = data.error?.code || data.error?.type || ""
+    if (
+      /incorrect api key|invalid_api_key|invalid api key/i.test(em) ||
+      /invalid_api_key|invalid_request_error/i.test(String(code))
+    )
+      throw new Error("bad_openai_key")
+    throw new Error(em || `OpenAI API ${res.status}`)
   }
   const text = data.choices?.[0]?.message?.content
   if (typeof text !== "string")
@@ -971,10 +978,12 @@ function Chat({ onAddBatch, acctRole, snap, systemPrompt, welcomeName }) {
     } catch (e) {
       const hint =
         e?.message === "no_key"
-          ? "⚠️ **No API key for chat.** Open **API keys & provider** below — use **OpenAI** (`sk-…`) or **Claude** (`sk-ant-…`), or on **Render** set **`OPENAI_API_KEY`** / **`ANTHROPIC_API_KEY`** (or `VITE_*`) on a **Web Service** with **`npm start`**, then redeploy."
-          : e?.message === "bad_anthropic_key"
-            ? "⚠️ **Anthropic rejected this API key** (`invalid x-api-key`). Create a **new key** at [console.anthropic.com](https://console.anthropic.com) and either: paste it under **API keys & provider**, **or** on **Vercel** set **`ANTHROPIC_API_KEY`** (recommended — server-only) and **remove** any wrong **`VITE_ANTHROPIC_API_KEY`** so an old key is not baked into the JS bundle, then **redeploy**."
-            : `⚠️ **API issue:** ${String(e?.message || e).slice(0, 220)}`
+          ? "⚠️ **No API key for chat.** Add **OPENAI_API_KEY** from **https://platform.openai.com/api-keys** on **Render** or **Vercel** (server env — avoid VITE_* for secrets), or paste a key under **API keys & provider** below. For Claude only, set **CHAT_PROVIDER=anthropic**."
+          : e?.message === "bad_openai_key"
+            ? "⚠️ **OpenAI rejected this API key.** Create a new secret key at **https://platform.openai.com/api-keys**. On Vercel/Render set **OPENAI_API_KEY** and remove any wrong **VITE_OPENAI_API_KEY**, then redeploy."
+            : e?.message === "bad_anthropic_key"
+              ? "⚠️ **Anthropic rejected this API key** (`invalid x-api-key`). Create a **new key** at [console.anthropic.com](https://console.anthropic.com) and either: paste it under **API keys & provider**, **or** on **Vercel** set **`ANTHROPIC_API_KEY`** (recommended — server-only) and **remove** any wrong **`VITE_ANTHROPIC_API_KEY`** so an old key is not baked into the JS bundle, then **redeploy**."
+              : `⚠️ **API issue:** ${String(e?.message || e).slice(0, 220)}`
       setMsgs(p=>p.slice(0,-1).concat([{role:"ai",text:hint}]))
     }
     setBusy(false)
@@ -1038,15 +1047,18 @@ function Chat({ onAddBatch, acctRole, snap, systemPrompt, welcomeName }) {
                       setKeyBanner(`Using ${v === "openai" ? "OpenAI" : "Claude (Anthropic)"}.`)
                     }}
                   >
+                    <option value="openai">OpenAI (platform.openai.com/api-keys)</option>
                     <option value="anthropic">Claude (Anthropic)</option>
-                    <option value="openai">OpenAI</option>
                   </select>
                 </div>
                 <div style={{ fontSize: 10, color: SKY.muted, lineHeight: 1.5, marginBottom: 8 }}>
-                  Keys are saved in <strong>localStorage</strong> on this device. For production, prefer{" "}
-                  <code style={{ fontSize: 9 }}>npm start</code> with <code style={{ fontSize: 9 }}>OPENAI_API_KEY</code> or{" "}
-                  <code style={{ fontSize: 9 }}>ANTHROPIC_API_KEY</code> on the server. Env{" "}
-                  <code style={{ fontSize: 9 }}>VITE_CHAT_PROVIDER=openai</code> sets the default provider.
+                  Keys are saved in <strong>localStorage</strong> on this device. Recommended: set{" "}
+                  <code style={{ fontSize: 9 }}>OPENAI_API_KEY</code> from{" "}
+                  <a href="https://platform.openai.com/api-keys" target="_blank" rel="noreferrer" style={{ color: JM.p }}>
+                    platform.openai.com/api-keys
+                  </a>{" "}
+                  on Render (<code style={{ fontSize: 9 }}>npm start</code>) or Vercel. Use{" "}
+                  <code style={{ fontSize: 9 }}>CHAT_PROVIDER=anthropic</code> only for Claude.
                 </div>
                 <div style={{ marginBottom: 10 }}>
                   <label style={LB}>OpenAI (platform.openai.com)</label>

@@ -31,7 +31,7 @@ const MIME = {
 function injectRuntimeConfig(html) {
   const anthropicApiKey = String(process.env.VITE_ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY || "").trim()
   const openaiApiKey = String(process.env.VITE_OPENAI_API_KEY || process.env.OPENAI_API_KEY || "").trim()
-  const chatProvider = String(process.env.VITE_CHAT_PROVIDER || process.env.CHAT_PROVIDER || "").trim()
+  const chatProvider = String(process.env.VITE_CHAT_PROVIDER || process.env.CHAT_PROVIDER || "openai").trim()
   const payload = JSON.stringify({ anthropicApiKey, openaiApiKey, chatProvider })
   const tag = `<script>window.__JM_TALLY_CONFIG__=${payload}</script>`
   if (/<\/head>/i.test(html)) return html.replace(/<\/head>/i, `${tag}</head>`)
@@ -192,12 +192,12 @@ const server = http.createServer((req, res) => {
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`JM Tally listening on 0.0.0.0:${PORT}`)
-  if (!getAnthropicKey())
-    console.warn(
-      "[jm-tally] ANTHROPIC_API_KEY / VITE_ANTHROPIC_API_KEY not set — Claude /api proxy returns 503 until you add it."
-    )
   if (!getOpenAIKey())
     console.warn(
-      "[jm-tally] OPENAI_API_KEY / VITE_OPENAI_API_KEY not set — OpenAI /api proxy returns 503 until you add it (optional)."
+      "[jm-tally] OPENAI_API_KEY not set — default chat provider is OpenAI; /api/openai proxy returns 503 until you add a key (platform.openai.com/api-keys)."
+    )
+  if (!getAnthropicKey())
+    console.warn(
+      "[jm-tally] ANTHROPIC_API_KEY not set — Claude path unavailable until you add a key or set CHAT_PROVIDER=anthropic with a valid Anthropic key."
     )
 })
