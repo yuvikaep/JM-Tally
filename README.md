@@ -10,7 +10,7 @@
 | **Mobile** | Planned — same product (e.g. React Native / Expo or native apps) against a future API + sync |
 | **Desktop** | Planned — e.g. Electron or Tauri shell loading the web app or a dedicated desktop build |
 
-Deploy the web app to any host that can run **Node** (build + `npm start`) or to **static + CDN** hosts that serve `dist/` with SPA fallback.
+For **AI chat**, use a **Node** host with **`npm start`** (see [Deploy (Render)](#deploy-render) — **Option A**). Plain **static / CDN** deploys do not run `server.mjs`, so there is no `/api` proxy or runtime key injection unless users paste a key in the browser.
 
 ## Run locally
 
@@ -31,13 +31,21 @@ npm start
 
 ## Environment
 
-Optional: **`VITE_ANTHROPIC_API_KEY`** (or **`ANTHROPIC_API_KEY`**) for live AI chat.
+Optional: **`ANTHROPIC_API_KEY`** or **`VITE_ANTHROPIC_API_KEY`** for live AI chat (same value; pick one).
 
-- **Local dev:** `.env` + `npm run dev` (Vite reads `VITE_*`).
-- **Render (this repo’s `npm start`):** set **`VITE_ANTHROPIC_API_KEY`** in the service Environment, then deploy once with the new `server.mjs`; after that, changing the key only needs a **service restart**.
+- **Local dev:** `.env` with either name + `npm run dev` (Vite proxy reads both). For `npm run build && npm start` locally, `server.mjs` reads **`process.env`** at runtime.
+- **Render Option A:** set **`ANTHROPIC_API_KEY`** or **`VITE_ANTHROPIC_API_KEY`** on the **Web Service** → **Environment**, then **Save** and **Manual Deploy** (or push). Rotating the key only needs a **restart** — no rebuild.
 
-## Deploy (Render)
+## Deploy (Render) — Option A (recommended for AI chat)
 
-**Blueprint:** connect the repo; `render.yaml` defines a **Node Web Service** (`npm run build` → `npm start`).
+Use a **Web Service** (Node), **not** a **Static Site**.
+
+1. **New** → **Web Service** (or **Blueprint** from this repo’s `render.yaml`).
+2. **Build command:** `npm install && npm run build`
+3. **Start command:** `npm start` (runs `server.mjs` on `0.0.0.0:$PORT`, serves `dist/`, proxies `/api/anthropic/v1/messages`, injects the key into HTML).
+4. **Environment:** add **`ANTHROPIC_API_KEY`** *or* **`VITE_ANTHROPIC_API_KEY`** (your Anthropic secret from [console.anthropic.com](https://console.anthropic.com)).
+5. Deploy, then open **Logs**: you should **not** see `[jm-tally] ... not set` if the variable is wired to this service.
+
+**Blueprint:** connect the repo; `render.yaml` defines the Web Service above.
 
 **Manual:** New → **Web Service** → Node, **Build:** `npm install && npm run build`, **Start:** `npm start`.

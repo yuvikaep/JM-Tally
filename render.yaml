@@ -18,5 +18,8 @@ services:
     envVars:
       - key: NODE_VERSION
         value: "20"
+      # Either is enough for server.mjs + AI chat (Option A: Web Service + npm start).
+      - key: ANTHROPIC_API_KEY
+        sync: false
       - key: VITE_ANTHROPIC_API_KEY
         sync: false
