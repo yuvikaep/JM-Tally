@@ -1,7 +1,8 @@
 {
-  "name": "tally",
+  "name": "jm-tally",
   "private": true,
   "version": "0.0.0",
+  "description": "JM Tally — full web accounting app for Indian SMEs (ledger, invoices, GST). Mobile and desktop clients planned.",
   "type": "module",
   "engines": {
     "node": ">=20"
@@ -10,9 +11,11 @@
     "dev": "vite",
     "build": "vite build",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "start": "serve dist -s -l ${PORT:-4173}"
   },
   "dependencies": {
+    "serve": "^14.2.4",
     "react": "^19.2.4",
     "react-dom": "^19.2.4",
     "xlsx": "^0.18.5"

@@ -1,14 +1,20 @@
-# Render Blueprint — Static Site (Vite + React)
-# New → Blueprint → connect this repo (render.yaml in root).
-# Env: add VITE_ANTHROPIC_API_KEY in the service Environment tab if you use AI chat.
+# JM Tally — Web App (Node Web Service)
+# Serves the production SPA with `serve` after Vite build.
+# Dashboard: New → Blueprint → connect repo, or New → Web Service (Node):
+#   Build:  npm install && npm run build
+#   Start:  npm start
+# Set VITE_ANTHROPIC_API_KEY in Environment (build-time) if you use AI chat.
 
 services:
   - type: web
-    name: hisaabkitaab
-    runtime: static
+    name: jm-tally
+    runtime: node
+    plan: free
     buildCommand: npm install && npm run build
-    staticPublishPath: dist
-    routes:
-      - type: rewrite
-        source: /*
-        destination: /index.html
+    startCommand: npm start
+    healthCheckPath: /
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
+      - key: VITE_ANTHROPIC_API_KEY
+        sync: false
