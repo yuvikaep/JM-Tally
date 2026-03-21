@@ -245,6 +245,70 @@ export function buildJournalLines({ amount, drCr, category }) {
   ]
 }
 
+/** TDS withheld by customer: Dr TDS Receivable, Cr revenue nominal (no bank movement). */
+export function buildInvoiceTdsJournalLines(amount, revenueCategory) {
+  const a = Math.round((Number(amount) || 0) * 100) / 100
+  const nominal = categoryToNominalAccount(revenueCategory)
+  return [
+    { account: "TDS Receivable", debit: a, credit: 0 },
+    { account: nominal, debit: 0, credit: a },
+  ]
+}
+
+/**
+ * Ledger rows to mirror an invoice settlement (bank inflow + optional TDS).
+ * Bank receipt affects running bank balance; TDS row uses `excludeFromBankRunning`.
+ */
+export function draftInvoiceSettlementTxns({ prevTxns, inv, incBank, incTds, dateDdMmYyyy, stamp = Date.now() }) {
+  const catRaw = inv?.revenueCategory
+  const cat =
+    catRaw && String(catRaw).startsWith("Revenue") ? catRaw : "Revenue - B2B Services"
+  const b = Math.round((Number(incBank) || 0) * 100) / 100
+  const td = Math.round((Number(incTds) || 0) * 100) / 100
+  let id = Math.max(0, ...(prevTxns || []).map(t => Number(t.id) || 0))
+  const out = []
+  const dateStr = String(dateDdMmYyyy || "").trim() || "01/01/2025"
+
+  if (b > 0.005) {
+    id += 1
+    const journalLines = buildJournalLines({ amount: b, drCr: "CR", category: cat })
+    const v = validateBalanced(journalLines)
+    if (!v.ok) return { error: v.errors[0] || "Unbalanced journal (bank receipt)" }
+    out.push({
+      id,
+      date: dateStr,
+      particulars: `Bank receipt — ${inv.num} — ${inv.client}`,
+      amount: b,
+      drCr: "CR",
+      category: cat,
+      fy: inferFY(dateStr),
+      journalLines,
+      void: false,
+      audit: { ref: `invoice:${inv.id}:bank:${stamp}` },
+    })
+  }
+  if (td > 0.005) {
+    id += 1
+    const journalLines = buildInvoiceTdsJournalLines(td, cat)
+    const v = validateBalanced(journalLines)
+    if (!v.ok) return { error: v.errors[0] || "Unbalanced journal (TDS)" }
+    out.push({
+      id,
+      date: dateStr,
+      particulars: `TDS deducted by client — ${inv.num} — ${inv.client}`,
+      amount: td,
+      drCr: "CR",
+      category: cat,
+      fy: inferFY(dateStr),
+      journalLines,
+      void: false,
+      excludeFromBankRunning: true,
+      audit: { ref: `invoice:${inv.id}:tds:${stamp}` },
+    })
+  }
+  return { drafts: out }
+}
+
 export function validateBalanced(lines) {
   const d = lines.reduce((s, l) => s + (Number(l.debit) || 0), 0)
   const c = lines.reduce((s, l) => s + (Number(l.credit) || 0), 0)
@@ -299,9 +363,11 @@ export function withRecalculatedBalances(txns) {
     if (t.void) return { ...t, balance: null }
 
     const delta =
-      t.drCr === "CR"
-        ? Math.round(Number(t.amount) * 100) / 100
-        : -Math.round(Number(t.amount) * 100) / 100
+      t.excludeFromBankRunning
+        ? 0
+        : t.drCr === "CR"
+          ? Math.round(Number(t.amount) * 100) / 100
+          : -Math.round(Number(t.amount) * 100) / 100
     const storedRaw = t.balance
     const stored =
       storedRaw != null && storedRaw !== "" && Number.isFinite(Number(storedRaw))
@@ -394,6 +460,7 @@ export function aggregateMonthlyCashflow(txns) {
   const act = (txns || []).filter(t => !t.void)
   const mon = {}
   for (const t of act) {
+    if (t.excludeFromBankRunning) continue
     const p = String(t.date || "").split("/")
     if (p.length !== 3) continue
     const k = `${p[1]}/${p[2]}`

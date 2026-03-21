@@ -19,6 +19,7 @@ import {
   fyToMonthOptions,
   distinctFYs,
   inferFY,
+  draftInvoiceSettlementTxns,
 } from "./accountingEngine.js"
 import { bankFileToImportMatrix, importBankStatementFromMatrix } from "./bankStatementImport.js"
 import {
@@ -674,8 +675,9 @@ export default function App() {
   const stats = useMemo(()=>{
     if(!txns) return {cr:0,dr:0,balance:0,flowNet:0,count:0}
     const act = txns.filter(t=>!t.void)
-    const cr = act.filter(t=>t.drCr==="CR").reduce((s,t)=>s+t.amount,0)
-    const dr = act.filter(t=>t.drCr==="DR").reduce((s,t)=>s+t.amount,0)
+    const cash = act.filter(t => !t.excludeFromBankRunning)
+    const cr = cash.filter(t=>t.drCr==="CR").reduce((s,t)=>s+t.amount,0)
+    const dr = cash.filter(t=>t.drCr==="DR").reduce((s,t)=>s+t.amount,0)
     const sorted = [...act].sort((a,b)=>parseDdMmYyyy(a.date)-parseDdMmYyyy(b.date)||a.id-b.id)
     const last = sorted[sorted.length-1]
     const closing = last?.balance != null && Number.isFinite(Number(last.balance)) ? Number(last.balance) : 0
@@ -697,8 +699,9 @@ export default function App() {
   const reportStats = useMemo(() => {
     const act = reportLedger
     if (!act.length) return { cr: 0, dr: 0, balance: 0, flowNet: 0, count: 0 }
-    const cr = act.filter(t => t.drCr === "CR").reduce((s, t) => s + t.amount, 0)
-    const dr = act.filter(t => t.drCr === "DR").reduce((s, t) => s + t.amount, 0)
+    const cash = act.filter(t => !t.excludeFromBankRunning)
+    const cr = cash.filter(t => t.drCr === "CR").reduce((s, t) => s + t.amount, 0)
+    const dr = cash.filter(t => t.drCr === "DR").reduce((s, t) => s + t.amount, 0)
     const sorted = [...act].sort((a, b) => parseDdMmYyyy(a.date) - parseDdMmYyyy(b.date) || a.id - b.id)
     const last = sorted[sorted.length - 1]
     const closing = last?.balance != null && Number.isFinite(Number(last.balance)) ? Number(last.balance) : 0
@@ -1102,29 +1105,61 @@ export default function App() {
     setModal(null)
   }
 
-  const markInvoicePaidFull = id => {
-    if (acctRole === "Viewer") return
-    setInvoices(list =>
-      list.map(inv => {
-        if (inv.id !== id) return inv
-        const tot = Number(inv.total) || 0
-        const cur = Number(inv.paidAmount) || 0
-        const rem = Math.round((tot - cur) * 100) / 100
-        const pb0 = Number(inv.paidBankTotal)
-        const bankBase = Number.isFinite(pb0) ? pb0 : cur
-        return {
-          ...inv,
-          status: "paid",
-          paidAmount: tot,
-          paidBankTotal: rem > 0.01 ? Math.round((bankBase + rem) * 100) / 100 : Math.round(bankBase * 100) / 100,
-          paidTdsTotal: Number(inv.paidTdsTotal) || 0,
-          paidAt: todayISO(),
-        }
+  const markInvoicePaidFull = useCallback(
+    id => {
+      if (acctRole === "Viewer") return
+      const inv = invoices.find(i => i.id === id)
+      if (!inv) return
+      const tot = Number(inv.total) || 0
+      const cur = Number(inv.paidAmount) || 0
+      const rem = Math.round((tot - cur) * 100) / 100
+      if (rem <= 0.005) {
+        toast_("Invoice already fully paid", "#f59e0b")
+        return
+      }
+      const pb0 = Number(inv.paidBankTotal)
+      const bankBase = Number.isFinite(pb0) ? pb0 : cur
+      const paidAt = todayISO()
+      const dateDdMmYyyy = isoToDdMmYyyy(paidAt)
+      if (periodLockIso && isPeriodLocked(dateDdMmYyyy, periodLockIso)) {
+        toast_("Date falls in a locked period — posting blocked", "#f43f5e")
+        return
+      }
+      const nextInv = {
+        ...inv,
+        status: "paid",
+        paidAmount: tot,
+        paidBankTotal: rem > 0.01 ? Math.round((bankBase + rem) * 100) / 100 : Math.round(bankBase * 100) / 100,
+        paidTdsTotal: Number(inv.paidTdsTotal) || 0,
+        paidAt,
+      }
+      const res = draftInvoiceSettlementTxns({
+        prevTxns: txns,
+        inv: nextInv,
+        incBank: rem,
+        incTds: 0,
+        dateDdMmYyyy,
       })
-    )
-    appendAudit({ action: "INVOICE_PAID", invoiceId: id })
-    toast_("Marked fully paid (no TDS). If client deducted TDS, use Pay… instead.", "#10b981")
-  }
+      if (res.error) {
+        toast_(res.error, "#f43f5e")
+        return
+      }
+      setInvoices(list => list.map(i => (i.id === id ? nextInv : i)))
+      if (res.drafts?.length) {
+        const createdAt = new Date().toISOString()
+        const stamped = res.drafts.map(d => ({
+          ...d,
+          audit: { ...d.audit, createdAt, createdBy: acctRole },
+        }))
+        setTxns(prev =>
+          withRecalculatedBalances(normalizeTxnCategories([...prev, ...stamped].map(t => enrichTxnJournal(t))))
+        )
+      }
+      appendAudit({ action: "INVOICE_PAID", invoiceId: id })
+      toast_("Marked paid · bank receipt posted to ledger", "#10b981")
+    },
+    [invoices, txns, acctRole, periodLockIso, appendAudit]
+  )
 
   const deleteInvoice = id => {
     if (acctRole === "Viewer") return
@@ -1172,44 +1207,69 @@ export default function App() {
     toast_("Invoices exported", "#10b981")
   }
 
-  const applyInvoicePaymentModal = () => {
+  const applyInvoicePaymentModal = useCallback(() => {
     if (acctRole === "Viewer" || invPayId == null) return
+    const inv0 = invoices.find(i => i.id === invPayId)
+    if (!inv0) return
     const received = Math.round((parseFloat(String(invPayAmt).replace(/,/g, "")) || 0) * 100) / 100
     const tds = Math.round((parseFloat(String(invPayTds).replace(/,/g, "")) || 0) * 100) / 100
     if (received <= 0 && tds <= 0) {
       toast_("Enter bank receipt and/or TDS deducted by client (₹)", "#f43f5e")
       return
     }
-    setInvoices(list =>
-      list.map(inv => {
-        if (inv.id !== invPayId) return inv
-        const tot = Number(inv.total) || 0
-        const bal = invoiceBalance(inv)
-        const settlement = Math.round((received + tds) * 100) / 100
-        let incBank = received
-        let incTds = tds
-        let increment = settlement
-        if (settlement > bal + 0.001 && settlement > 0) {
-          increment = Math.round(bal * 100) / 100
-          incBank = Math.round((received * bal) / settlement * 100) / 100
-          incTds = Math.round((increment - incBank) * 100) / 100
-        }
-        const capped = Math.round((Number(inv.paidAmount) + increment) * 100) / 100
-        const paid = capped >= tot - 0.01
-        const pb0 = Number(inv.paidBankTotal)
-        const pt0 = Number(inv.paidTdsTotal)
-        const baseBank = Number.isFinite(pb0) ? pb0 : Number(inv.paidAmount) || 0
-        const baseTds = Number.isFinite(pt0) ? pt0 : 0
-        return {
-          ...inv,
-          paidAmount: Math.min(capped, tot),
-          paidBankTotal: Math.round((baseBank + incBank) * 100) / 100,
-          paidTdsTotal: Math.round((baseTds + incTds) * 100) / 100,
-          status: paid ? "paid" : "partial",
-          paidAt: paid ? todayISO() : inv.paidAt,
-        }
-      })
-    )
+    const tot = Number(inv0.total) || 0
+    const bal = invoiceBalance(inv0)
+    const settlement = Math.round((received + tds) * 100) / 100
+    let incBank = received
+    let incTds = tds
+    let increment = settlement
+    if (settlement > bal + 0.001 && settlement > 0) {
+      increment = Math.round(bal * 100) / 100
+      incBank = Math.round((received * bal) / settlement * 100) / 100
+      incTds = Math.round((increment - incBank) * 100) / 100
+    }
+    const capped = Math.round((Number(inv0.paidAmount) + increment) * 100) / 100
+    const paid = capped >= tot - 0.01
+    const pb0 = Number(inv0.paidBankTotal)
+    const pt0 = Number(inv0.paidTdsTotal)
+    const baseBank = Number.isFinite(pb0) ? pb0 : Number(inv0.paidAmount) || 0
+    const baseTds = Number.isFinite(pt0) ? pt0 : 0
+    const nextInv = {
+      ...inv0,
+      paidAmount: Math.min(capped, tot),
+      paidBankTotal: Math.round((baseBank + incBank) * 100) / 100,
+      paidTdsTotal: Math.round((baseTds + incTds) * 100) / 100,
+      status: paid ? "paid" : "partial",
+      paidAt: paid ? todayISO() : inv0.paidAt,
+    }
+    const paymentDateIso = todayISO()
+    const dateDdMmYyyy = isoToDdMmYyyy(paymentDateIso)
+    if (periodLockIso && isPeriodLocked(dateDdMmYyyy, periodLockIso)) {
+      toast_("Date falls in a locked period — posting blocked", "#f43f5e")
+      return
+    }
+    const res = draftInvoiceSettlementTxns({
+      prevTxns: txns,
+      inv: nextInv,
+      incBank,
+      incTds,
+      dateDdMmYyyy,
+    })
+    if (res.error) {
+      toast_(res.error, "#f43f5e")
+      return
+    }
+    setInvoices(list => list.map(inv => (inv.id === invPayId ? nextInv : inv)))
+    if (res.drafts?.length) {
+      const createdAt = new Date().toISOString()
+      const stamped = res.drafts.map(d => ({
+        ...d,
+        audit: { ...d.audit, createdAt, createdBy: acctRole },
+      }))
+      setTxns(prev =>
+        withRecalculatedBalances(normalizeTxnCategories([...prev, ...stamped].map(t => enrichTxnJournal(t))))
+      )
+    }
     appendAudit({
       action: "INVOICE_PAYMENT",
       invoiceId: invPayId,
@@ -1219,13 +1279,13 @@ export default function App() {
     })
     const sumMsg =
       tds > 0
-        ? `Recorded · Bank ₹${inr(received)} + TDS ₹${inr(tds)} = ₹${inr(received + tds)} toward invoice`
-        : `Recorded · Bank ₹${inr(received)}`
+        ? `Posted to ledger · Bank ₹${inr(received)} + TDS ₹${inr(tds)} = ₹${inr(received + tds)}`
+        : `Posted to ledger · Bank ₹${inr(received)}`
     toast_(sumMsg, "#10b981")
     setInvPayId(null)
     setInvPayAmt("")
     setInvPayTds("")
-  }
+  }, [acctRole, invPayId, invPayAmt, invPayTds, invoices, txns, periodLockIso, appendAudit])
 
   const filtered = useMemo(()=>{
     if(!txns) return []
