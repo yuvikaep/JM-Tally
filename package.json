@@ -12,7 +12,7 @@
     "build": "vite build",
     "lint": "eslint .",
     "preview": "vite preview",
-    "start": "serve dist -s -l ${PORT:-4173}"
+    "start": "serve dist -s -l tcp://0.0.0.0:${PORT:-4173}"
   },
   "dependencies": {
     "serve": "^14.2.4",
