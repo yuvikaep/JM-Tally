@@ -56,3 +56,11 @@ Use a **Web Service** (Node), **not** a **Static Site**.
 **Blueprint:** connect the repo; `render.yaml` defines the Web Service above.
 
 **Manual:** New → **Web Service** → Node, **Build:** `npm install && npm run build`, **Start:** `npm start`.
+
+### Deploy (Vercel)
+
+This repo includes **`api/anthropic/v1/messages.js`** and **`api/openai/v1/chat/completions.js`** so chat works without `server.mjs`.
+
+1. Set **`ANTHROPIC_API_KEY`** (and/or **`OPENAI_API_KEY`**) in **Vercel → Project → Settings → Environment Variables** (use the names **without** `VITE_` for secrets you do not want embedded in the JS bundle).
+2. If you previously set **`VITE_ANTHROPIC_API_KEY`** to a wrong or rotated value, **delete it** or fix it — it is baked in at build time and overrides nothing for the proxy, but the app may still **send that bad key** on the direct-to-Anthropic fallback and you will see **`invalid x-api-key`**.
+3. Redeploy after changing env vars. `vercel.json` rewrites skip `/api/*` so these functions are reachable.

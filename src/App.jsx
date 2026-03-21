@@ -536,6 +536,23 @@ async function fetchOpenAIChatMessages({ system, messages, max_tokens = 800 }) {
   return { content: [{ text }], _provider: "openai" }
 }
 
+function anthropicErrMessage(raw) {
+  try {
+    const d = JSON.parse(raw)
+    return String(d.error?.message || d.message || "")
+  } catch {
+    return ""
+  }
+}
+
+function throwIfAnthropicAuthRejected(raw, status) {
+  const em = anthropicErrMessage(raw)
+  if (/invalid x-api-key|invalid api key|authentication_error/i.test(raw) || /invalid x-api-key|authentication/i.test(em))
+    throw new Error("bad_anthropic_key")
+  if (em) throw new Error(em)
+  throw new Error(`API ${status}`)
+}
+
 /** Prefer same-origin proxy; fall back to direct Anthropic (requires browser opt-in header). */
 async function fetchAnthropicChatMessages({ system, messages, max_tokens = 800 }) {
   const payload = {
@@ -545,12 +562,46 @@ async function fetchAnthropicChatMessages({ system, messages, max_tokens = 800 }
     messages,
   }
   const headers = { "Content-Type": "application/json", "anthropic-version": "2023-06-01" }
+  const bodyStr = JSON.stringify(payload)
+
+  const callDirect = async () => {
+    const key = getAnthropicApiKey()
+    if (!key) throw new Error("no_key")
+    const r = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        ...headers,
+        "x-api-key": key,
+        "anthropic-dangerous-direct-browser-access": "true",
+      },
+      body: bodyStr,
+    })
+    const raw = await r.text()
+    if (r.ok) {
+      try {
+        return JSON.parse(raw)
+      } catch {
+        throw new Error("Anthropic returned non-JSON")
+      }
+    }
+    throwIfAnthropicAuthRejected(raw, r.status)
+  }
+
   let res = await fetch(anthropicProxyUrl(), {
     method: "POST",
     headers,
-    body: JSON.stringify(payload),
+    body: bodyStr,
   })
-  if (res.ok) return res.json()
+  const raw = await res.text()
+  if (res.ok) {
+    try {
+      return JSON.parse(raw)
+    } catch {
+      // Vercel/SPA often returns 200 HTML for /api/* if functions missing — try direct
+      return callDirect()
+    }
+  }
+
   const key = getAnthropicApiKey()
   const proxyUnavailable =
     res.status === 404 ||
@@ -560,22 +611,10 @@ async function fetchAnthropicChatMessages({ system, messages, max_tokens = 800 }
     res.status === 403 ||
     res.status === 502 ||
     res.status === 503
-  if (key && proxyUnavailable) {
-    res = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        ...headers,
-        "x-api-key": key,
-        "anthropic-dangerous-direct-browser-access": "true",
-      },
-      body: JSON.stringify(payload),
-    })
-    if (res.ok) return res.json()
-  }
-  if (!key && (res.status === 404 || res.status === 503 || res.status === 405))
-    throw new Error("no_key")
-  const d = await res.json().catch(() => ({}))
-  throw new Error(d.error?.message || `API ${res.status}`)
+  if (key && proxyUnavailable) return callDirect()
+
+  if (!key && (res.status === 404 || res.status === 503 || res.status === 405)) throw new Error("no_key")
+  throwIfAnthropicAuthRejected(raw, res.status)
 }
 
 async function fetchAIChatMessages(args) {
@@ -933,7 +972,9 @@ function Chat({ onAddBatch, acctRole, snap, systemPrompt, welcomeName }) {
       const hint =
         e?.message === "no_key"
           ? "⚠️ **No API key for chat.** Open **API keys & provider** below — use **OpenAI** (`sk-…`) or **Claude** (`sk-ant-…`), or on **Render** set **`OPENAI_API_KEY`** / **`ANTHROPIC_API_KEY`** (or `VITE_*`) on a **Web Service** with **`npm start`**, then redeploy."
-          : `⚠️ **API issue:** ${String(e?.message || e).slice(0, 220)}`
+          : e?.message === "bad_anthropic_key"
+            ? "⚠️ **Anthropic rejected this API key** (`invalid x-api-key`). Create a **new key** at [console.anthropic.com](https://console.anthropic.com) and either: paste it under **API keys & provider**, **or** on **Vercel** set **`ANTHROPIC_API_KEY`** (recommended — server-only) and **remove** any wrong **`VITE_ANTHROPIC_API_KEY`** so an old key is not baked into the JS bundle, then **redeploy**."
+            : `⚠️ **API issue:** ${String(e?.message || e).slice(0, 220)}`
       setMsgs(p=>p.slice(0,-1).concat([{role:"ai",text:hint}]))
     }
     setBusy(false)
