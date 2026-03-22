@@ -34,6 +34,7 @@ async function request(path, { method = "GET", body, auth = false } = {}) {
     body: body != null ? JSON.stringify(body) : undefined,
   })
   const text = await res.text()
+  const ct = res.headers.get("content-type") || ""
   let data = {}
   try {
     data = text ? JSON.parse(text) : {}
@@ -41,7 +42,12 @@ async function request(path, { method = "GET", body, auth = false } = {}) {
     data = { message: text || "Request failed" }
   }
   if (!res.ok) {
-    const err = new Error(data.message || data.error || `HTTP ${res.status}`)
+    let msg = data.message || data.error || `HTTP ${res.status}`
+    if (res.status === 404 && !ct.includes("application/json")) {
+      msg =
+        "API not reachable from this site. In Vercel → Settings → Environment Variables, set VITE_API_URL to your Render app URL (https://…onrender.com), save, then redeploy the frontend."
+    }
+    const err = new Error(msg)
     err.code = data.error
     err.status = res.status
     err.data = data
