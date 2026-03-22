@@ -48,6 +48,37 @@ export function formatImportParticulars(narration, remarks) {
   return ""
 }
 
+/** Beneficiary bank names at end of Axis/HDFC-style NEFT strings (salary to staff accounts). */
+const RETAIL_BANK_BENEFICIARY_RE =
+  /(?:STATE BANK OF INDIA|PUNJAB NATIONAL BANK|BANK OF BARODA|BANK OF INDIA|HDFC BANK|HDFC\s+BANK|AXIS BANK|ICICI|CENTRAL BANK OF INDIA|IDBI|FEDERAL|IDFC|KOTAK MAHINDRA|PUNJAB NATIONAL BAN|BANK OF BARODA\/+)/i
+
+const VENDOR_LIKE_DR_RE = /vendor|invoice|consult|prof\.?\s*fee|professional\s*fee|rent|lease|kiraya|tds\s*deduct/i
+
+/**
+ * Stronger debit classification from narration (+ optional remarks) — used on import and when normalizing legacy Misc rows.
+ * @returns {string|null} App category or null to keep Misc / upstream guess.
+ */
+export function inferDebitCategoryFromBankText(particulars, bankRemark) {
+  const n = combineNarrationAndRemarks(particulars, bankRemark)
+  if (!n) return null
+  const low = n.toLowerCase()
+
+  if (/\bepfo\b|epfo\s+payment|epf\s+payment|provident\s*fund|esi\s+payment|professional\s*tax\s*pay|pt\s+payment\b/i.test(n)) {
+    return "Employer PF / ESI Expense"
+  }
+
+  if (VENDOR_LIKE_DR_RE.test(low)) return null
+
+  if (/INB\/NEFT|NEFT\/AXODH|NEFT\/[A-Z]{2,}\d/i.test(n) && RETAIL_BANK_BENEFICIARY_RE.test(n)) {
+    return "Salary"
+  }
+  if (/IMPS\/P2A/i.test(n) && /FEDERAL|HDFC|SBI|AXIS|STATE BANK|SBIN/i.test(n)) {
+    return "Salary"
+  }
+
+  return null
+}
+
 function guessCategory(particulars, drCr) {
   const n = String(particulars || "")
   if (drCr === "CR") {
@@ -63,6 +94,8 @@ function guessCategory(particulars, drCr) {
   if (/consulta|vitra/i.test(n)) return "Vendor - Professional"
   if (/preserve|faciliteez/i.test(n)) return "Vendor - Supplies"
   if (JOB_PORTAL_HINT_RE.test(n)) return "Recruitment - Job Portals"
+  const inferred = inferDebitCategoryFromBankText(n, "")
+  if (inferred) return inferred
   if (/salary|payroll|staff\s*salary|wages|pf\s*payment|esi/i.test(n)) return "Salary"
   if (/\bdirector\b|remuneration|partner\s*drawing/i.test(n)) return "Director Payment"
   if (/rent|lease|kiraya|landlord/i.test(n)) return "Rent Expense"
@@ -393,13 +426,18 @@ function rowDrCrAmount(row, m) {
   return null
 }
 
+/** True when the row was added by a bank file import (`audit.ref` prefix `import:`). */
+export function isTxnFromBankFileImport(t) {
+  return String(t?.audit?.ref ?? "").startsWith("import:")
+}
+
 /**
- * @returns {{ newTxns: object[], stats: object, error?: string, headerHint?: string }}
+ * Parse a bank statement matrix into draft rows (before duplicate / period checks).
+ * Used for import preview JSON and by `importBankStatementFromMatrix`.
+ * @returns {{ ok: true, drafts: object[], bodyRowCount: number } | { ok: false, error: string, headerHint?: string, newTxns: [], stats: object }}
  */
-export function importBankStatementFromMatrix(matrix, ctx) {
-  const { txns, periodLockIso, acctRole, fileName } = ctx
-  if (acctRole === "Viewer") return { error: "Viewer role cannot import.", newTxns: [], stats: {} }
-  if (!matrix?.length) return { error: "File is empty.", newTxns: [], stats: {} }
+export function bankMatrixToDraftRows(matrix) {
+  if (!matrix?.length) return { ok: false, error: "File is empty.", newTxns: [], stats: {} }
 
   const previewRows = () =>
     matrix
@@ -415,6 +453,7 @@ export function importBankStatementFromMatrix(matrix, ctx) {
     headerIdx = findStatementHeaderRow(matrix)
     if (headerIdx < 0) {
       return {
+        ok: false,
         error:
           "Could not find header row (Date + Debit/Credit or Amount). Many bank XLSX files have title rows before the table — we scan the first 50 lines. Try re-downloading CSV from net banking, or the template.",
         newTxns: [],
@@ -427,6 +466,7 @@ export function importBankStatementFromMatrix(matrix, ctx) {
     hasAmount = m.debit >= 0 || m.credit >= 0 || m.amount >= 0
     if (m.date < 0 || !hasAmount) {
       return {
+        ok: false,
         error: "Found a possible header row but columns did not match (Date + amounts).",
         newTxns: [],
         stats: {},
@@ -488,6 +528,7 @@ export function importBankStatementFromMatrix(matrix, ctx) {
 
   if (!drafts.length) {
     return {
+      ok: false,
       error:
         "No transaction rows parsed. Dates may be in an unsupported format, or amount columns are empty on all rows.",
       newTxns: [],
@@ -497,6 +538,21 @@ export function importBankStatementFromMatrix(matrix, ctx) {
   }
 
   drafts.sort((a, b) => parseDdMmYyyy(a.date) - parseDdMmYyyy(b.date) || a.particulars.localeCompare(b.particulars))
+  return { ok: true, drafts, bodyRowCount: body.length, headerSummary: headers.slice(0, 14).join(" | ") }
+}
+
+/**
+ * @returns {{ newTxns: object[], stats: object, error?: string, headerHint?: string }}
+ */
+export function importBankStatementFromMatrix(matrix, ctx) {
+  const { txns, periodLockIso, acctRole, fileName } = ctx
+  if (acctRole === "Viewer") return { error: "Viewer role cannot import.", newTxns: [], stats: {} }
+
+  const parsed = bankMatrixToDraftRows(matrix)
+  if (!parsed.ok) {
+    return { error: parsed.error, newTxns: [], stats: parsed.stats || {}, headerHint: parsed.headerHint }
+  }
+  const { drafts } = parsed
 
   const active = [...txns.filter(t => !t.void)]
   const baseId = Math.max(0, ...txns.map(t => Number(t.id) || 0))

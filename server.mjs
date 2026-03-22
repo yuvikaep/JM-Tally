@@ -1,6 +1,5 @@
 /**
- * Production static server for Render (and similar).
- * Serves dist/, proxies POST /api/openai/v1/chat/completions, injects OPENAI_API_KEY into HTML at runtime.
+ * Production static server for Render (and similar). Serves dist/ + SPA fallback.
  */
 import fs from "node:fs"
 import http from "node:http"
@@ -27,75 +26,6 @@ const MIME = {
   ".woff2": "font/woff2",
 }
 
-function injectRuntimeConfig(html) {
-  const openaiApiKey = String(process.env.VITE_OPENAI_API_KEY || process.env.OPENAI_API_KEY || "").trim()
-  const payload = JSON.stringify({ openaiApiKey })
-  const tag = `<script>window.__JM_TALLY_CONFIG__=${payload}</script>`
-  if (/<\/head>/i.test(html)) return html.replace(/<\/head>/i, `${tag}</head>`)
-  if (/<\/body>/i.test(html)) return html.replace(/<\/body>/i, `${tag}</body>`)
-  return tag + html
-}
-
-const rootResolved = path.resolve(root)
-const OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
-
-function getOpenAIKey() {
-  return String(process.env.VITE_OPENAI_API_KEY || process.env.OPENAI_API_KEY || "").trim()
-}
-
-function getOpenAIChatModel() {
-  return String(process.env.OPENAI_CHAT_MODEL || process.env.VITE_OPENAI_CHAT_MODEL || "gpt-4o-mini").trim()
-}
-
-/** POST /api/openai/v1/chat/completions — Bearer from client request or server env. */
-function handleOpenAIProxy(req, res) {
-  const auth = String(req.headers.authorization || "")
-  const fromClient = auth.startsWith("Bearer ") ? auth.slice(7).trim() : ""
-  const key = fromClient || getOpenAIKey()
-  if (!key) {
-    res.writeHead(503, { "Content-Type": "application/json; charset=utf-8" })
-    res.end(
-      JSON.stringify({
-        error: {
-          message:
-            "No OpenAI key: send Authorization: Bearer sk-… from the app, or set OPENAI_API_KEY on the server.",
-        },
-      })
-    )
-    return
-  }
-  const chunks = []
-  req.on("data", c => chunks.push(c))
-  req.on("end", async () => {
-    try {
-      let body = chunks.length ? Buffer.concat(chunks).toString("utf8") : "{}"
-      let parsed
-      try {
-        parsed = JSON.parse(body)
-      } catch {
-        parsed = {}
-      }
-      if (!parsed.model) parsed.model = getOpenAIChatModel()
-      body = JSON.stringify(parsed)
-      const r = await fetch(OPENAI_CHAT_URL, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${key}`,
-        },
-        body,
-      })
-      const txt = await r.text()
-      const ct = r.headers.get("content-type") || "application/json; charset=utf-8"
-      res.writeHead(r.status, { "Content-Type": ct })
-      res.end(txt)
-    } catch (e) {
-      res.writeHead(502, { "Content-Type": "application/json; charset=utf-8" })
-      res.end(JSON.stringify({ error: { message: String(e?.message || e) } }))
-    }
-  })
-}
-
 function safeFileFromUrlPath(urlPath) {
   const clean = String(urlPath || "").replace(/^\/+/, "")
   const parts = clean.split("/").filter(p => p && p !== "." && p !== "..")
@@ -106,23 +36,15 @@ function safeFileFromUrlPath(urlPath) {
   return full
 }
 
+const rootResolved = path.resolve(root)
+
 const server = http.createServer((req, res) => {
   try {
     const host = req.headers.host || "localhost"
     const url = new URL(req.url || "/", `http://${host}`)
     let pathname = decodeURIComponent(url.pathname)
-    if (pathname === "/api/openai/v1/chat/completions" && req.method === "POST") {
-      handleOpenAIProxy(req, res)
-      return
-    }
     const filePath = pathname === "/" ? path.join(rootResolved, "index.html") : safeFileFromUrlPath(pathname)
     if (filePath && fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
-      if (path.extname(filePath) === ".html") {
-        const html = fs.readFileSync(filePath, "utf8")
-        res.writeHead(200, { "Content-Type": MIME[".html"] })
-        res.end(injectRuntimeConfig(html))
-        return
-      }
       const ext = path.extname(filePath)
       const ct = MIME[ext] || "application/octet-stream"
       res.writeHead(200, { "Content-Type": ct })
@@ -138,7 +60,7 @@ const server = http.createServer((req, res) => {
     }
     const html = fs.readFileSync(indexPath, "utf8")
     res.writeHead(200, { "Content-Type": MIME[".html"] })
-    res.end(injectRuntimeConfig(html))
+    res.end(html)
   } catch (e) {
     res.writeHead(500, { "Content-Type": "text/plain" })
     res.end(String(e?.message || e))
@@ -147,6 +69,4 @@ const server = http.createServer((req, res) => {
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`JM Tally listening on 0.0.0.0:${PORT}`)
-  if (!getOpenAIKey())
-    console.warn("[jm-tally] OPENAI_API_KEY not set — AI chat proxy returns 503 until you add it (platform.openai.com/api-keys).")
 })

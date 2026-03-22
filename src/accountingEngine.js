@@ -143,6 +143,7 @@ export const CHART_OF_ACCOUNTS = {
     { code: "5320", name: "Foreign Exchange Loss", type: "Expense", normal: "Debit" },
     { code: "5400", name: "Income Tax Expense", type: "Expense", normal: "Debit" },
     { code: "5410", name: "GST Expense / Penalties (non-claimable)", type: "Expense", normal: "Debit" },
+    { code: "5415", name: "GST Payment – Output Tax (GSTR-3B)", type: "Expense", normal: "Debit" },
     { code: "5500", name: "Depreciation Expense", type: "Expense", normal: "Debit" },
     { code: "5600", name: "Miscellaneous Expense", type: "Expense", normal: "Debit" },
     { code: "5610", name: "Bad Debts / Write-offs", type: "Expense", normal: "Debit" },
@@ -205,8 +206,14 @@ export function coaRowsWithBalances(txns) {
 export function categoryToNominalAccount(category) {
   if (!category) return "Miscellaneous Expense"
   if (category.startsWith("Revenue")) return "Service Revenue"
+  if (category === "Salary Income") return "Other Income"
+  if (category === "Electricity Expense") return "Utilities – Electricity & Water"
+  if (category === "Food Expense") return "Staff Welfare & Benefits"
+  if (category === "Travel Expense") return "Travel & Conveyance"
   if (/rent/i.test(category)) return "Rent Expense"
   if (category === "Salary") return "Salary Expense"
+  if (category === "Employer PF / ESI Expense") return "Employer PF / ESI Expense"
+  if (category === "GST Payment (Output Tax)") return "GST Payment – Output Tax (GSTR-3B)"
   if (category === "Director Payment") return "Director Remuneration"
   if (category.startsWith("Recruitment")) return "Marketing & Recruitment"
   if (category.startsWith("Vendor")) return "Professional & Vendor Expense"
@@ -307,6 +314,19 @@ export function draftInvoiceSettlementTxns({ prevTxns, inv, incBank, incTds, dat
     })
   }
   return { drafts: out }
+}
+
+/** True if this row was auto-posted from invoice payment (see `draftInvoiceSettlementTxns`). */
+export function isTxnLinkedToInvoice(t, invoiceId) {
+  const id = Number(invoiceId)
+  if (!Number.isFinite(id) || id <= 0) return false
+  const ref = t?.audit?.ref
+  return typeof ref === "string" && ref.startsWith(`invoice:${id}:`)
+}
+
+/** Drop bank/TDS settlement lines for an invoice (before rebuild or delete). */
+export function stripInvoiceSettlementTxns(txns, invoiceId) {
+  return (txns || []).filter(t => !isTxnLinkedToInvoice(t, invoiceId))
 }
 
 export function validateBalanced(lines) {

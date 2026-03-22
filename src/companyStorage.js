@@ -13,6 +13,9 @@ const SUFFIX = {
   audit: "audit_v1",
 }
 
+/** Suffix segment in `companyStorageKey(companyId, suffix)` — for migrations / copies. */
+export const COMPANY_KEY_SUFFIXES = Object.values(SUFFIX)
+
 const FLAT_KEYS = ["txns_v3", "invoices_v1", "inventory_v1", "import_history_v1", "settings_v1", "audit_v1"]
 
 export function companyStorageKey(companyId, suffix) {
@@ -178,4 +181,34 @@ export async function bootstrapCompanies(store, epochTarget) {
 
   const payload = await loadCompanyPayload(store, activeId)
   return { registry, activeCompanyId: activeId, payload }
+}
+
+/**
+ * One-time move from legacy unprefixed keys (pre–per-user storage) into `scopedStore`.
+ * Clears legacy registry + company keys from `rawStore` so data is not duplicated.
+ */
+export async function migrateLegacyBooksToUserScope(rawStore, scopedStore) {
+  const scopedReg = await readRegistry(scopedStore)
+  if (scopedReg?.companies?.length) return
+
+  const legacyReg = await readRegistry(rawStore)
+  if (!legacyReg?.companies?.length) return
+
+  await scopedStore.set("hisaab_epoch", STORAGE_EPOCH)
+  await writeRegistry(scopedStore, legacyReg)
+  for (const c of legacyReg.companies) {
+    for (const suf of COMPANY_KEY_SUFFIXES) {
+      const k = companyStorageKey(c.id, suf)
+      const v = await rawStore.get(k)
+      if (v !== null && v !== undefined) await scopedStore.set(k, v)
+    }
+  }
+
+  await rawStore.remove(REGISTRY_KEY)
+  for (const c of legacyReg.companies) {
+    for (const suf of COMPANY_KEY_SUFFIXES) {
+      await rawStore.remove(companyStorageKey(c.id, suf))
+    }
+  }
+  await rawStore.remove("hisaab_epoch")
 }

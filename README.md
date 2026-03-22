@@ -1,6 +1,6 @@
 # JM Tally
 
-**JM Tally** is a full **web application** for Indian SMEs: double-entry style ledger, sales invoices, GST helpers, bank statement import, multi-company workspaces, and an optional **OpenAI**-powered assistant. The UI is **React** + **Vite**; books are **local-first** in the browser today.
+**JM Tally** is a full **web application** for Indian SMEs: double-entry style ledger, sales invoices, GST helpers, bank statement import, multi-company workspaces, and a **built-in** (no API key) accounting assistant. The UI is **React** + **Vite**; books are **local-first** in the browser today.
 
 ## Platforms
 
@@ -10,7 +10,7 @@
 | **Mobile** | Planned |
 | **Desktop** | Planned |
 
-**AI chat** uses **OpenAI** only. Keys: **https://platform.openai.com/api-keys**
+**AI chat** uses **embedded rules** plus your **live ledger** in the browser — no OpenAI or other cloud LLM keys.
 
 ## Run locally
 
@@ -18,8 +18,6 @@
 npm install
 npm run dev
 ```
-
-Add **`OPENAI_API_KEY`** to **`.env`** for the dev proxy (or paste a key in the app under **OpenAI API key**).
 
 ## Production build
 
@@ -29,25 +27,17 @@ npm run build
 npm start
 ```
 
-`npm start` runs **`server.mjs`**: serves `dist/`, proxies **`/api/openai/v1/chat/completions`**, injects **`OPENAI_API_KEY`** into HTML from **`process.env`** (restart after rotating the key).
-
-| Variable | Purpose |
-| -------- | ------- |
-| **`OPENAI_API_KEY`** | Preferred on **Render** / **Vercel** (secret stays on the server). |
-| `VITE_OPENAI_API_KEY` | Optional; can embed in client bundle — avoid for production if you can use server env only. |
-| `OPENAI_CHAT_MODEL` / `VITE_OPENAI_CHAT_MODEL` | Default model: **`gpt-4o-mini`**. |
+`npm start` runs **`server.mjs`**, which serves **`dist/`** with SPA fallback (suitable for **Render** and similar Node hosts).
 
 ## Deploy (Render)
 
 1. **Web Service** (Node), **not** Static Site.  
 2. **Build:** `npm install && npm run build` · **Start:** `npm start`  
-3. **Environment:** **`OPENAI_API_KEY`** from **https://platform.openai.com/api-keys**  
-4. **Restart** the service after changing env.
+3. No AI-related environment variables are required.
 
 Blueprint: **`render.yaml`**.
 
 ## Deploy (Vercel)
 
-1. **`OPENAI_API_KEY`** in **Project → Settings → Environment Variables**.  
-2. **Redeploy.** Serverless handler: **`api/openai/v1/chat/completions.js`**.  
-3. **`vercel.json`** keeps **`/api/*`** off the SPA rewrite.
+1. Connect the repo; **`vercel.json`** keeps **`/api/*`** off the SPA rewrite (reserved for future server routes).  
+2. **Redeploy** after changes.

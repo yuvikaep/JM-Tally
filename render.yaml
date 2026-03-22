@@ -1,5 +1,4 @@
-# JM Tally — Web App (Node). AI chat: OPENAI_API_KEY from https://platform.openai.com/api-keys
-# npm start → server.mjs serves dist + /api/openai proxy
+# JM Tally — Web App (Node). npm start → server.mjs serves dist/
 
 services:
   - type: web
@@ -12,9 +11,3 @@ services:
     envVars:
       - key: NODE_VERSION
         value: "20"
-      - key: OPENAI_API_KEY
-        sync: false
-      - key: VITE_OPENAI_API_KEY
-        sync: false
-      - key: OPENAI_CHAT_MODEL
-        sync: false
