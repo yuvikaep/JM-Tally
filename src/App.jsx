@@ -40,8 +40,10 @@ import {
   newCompanyId,
   migrateLegacyBooksToUserScope,
 } from "./companyStorage.js"
-import { AuthScreen } from "./AuthScreen.jsx"
-import { getSession, clearSession, createScopedStore } from "./authStorage.js"
+import { createScopedStore } from "./authStorage.js"
+import { useAuth } from "./auth/AuthContext.jsx"
+import { AuthRouter } from "./auth/AuthRouter.jsx"
+import authStyles from "./auth/auth.module.css"
 import {
   DEFAULT_AUTOMATION_SKILLS,
   coerceAutomationSkills,
@@ -9351,19 +9353,29 @@ ${buildInvoicePrintDocumentHtml({
 }
 
 export default function App() {
-  const [sessionUser, setSessionUser] = useState(() => getSession())
+  const { user, activeCompany, loading, onboardingStep, logout } = useAuth()
 
-  if (!sessionUser) {
-    return <AuthScreen baseStore={store} onLoggedIn={setSessionUser} />
+  if (loading) {
+    return (
+      <div className={authStyles.spinnerWrap}>
+        <div className={authStyles.spinner} />
+      </div>
+    )
+  }
+
+  if (!user || onboardingStep || !activeCompany) {
+    return <AuthRouter />
   }
 
   return (
     <BooksApp
-      authUser={sessionUser}
-      onLogout={() => {
-        clearSession()
-        setSessionUser(null)
+      authUser={{
+        id: user.id,
+        email: user.email,
+        firstName: user.firstName,
+        lastName: user.lastName,
       }}
+      onLogout={logout}
     />
   )
 }

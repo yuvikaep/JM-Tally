@@ -1,0 +1,517 @@
+.page {
+  min-height: 100vh;
+  background: #f0f9ff;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px 16px;
+  box-sizing: border-box;
+  color: #0c4a6e;
+}
+
+@media (prefers-color-scheme: dark) {
+  .page {
+    background: #0c1929;
+    color: #e2e8f0;
+  }
+}
+
+.brandHeader {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  margin-bottom: 22px;
+}
+
+.brandLogo {
+  object-fit: contain;
+  flex-shrink: 0;
+}
+
+.brandName {
+  font-size: 1.125rem;
+  font-weight: 800;
+  color: #6b7aff;
+  letter-spacing: -0.02em;
+}
+
+@media (prefers-color-scheme: dark) {
+  .brandName {
+    color: #9ca8ff;
+  }
+}
+
+.card {
+  width: 100%;
+  max-width: 420px;
+  background: #ffffff;
+  border-radius: 14px;
+  border: 1px solid #bae6fd;
+  box-shadow: 0 8px 30px rgba(107, 122, 255, 0.14);
+  padding: 28px 24px 32px;
+  box-sizing: border-box;
+}
+
+@media (prefers-color-scheme: dark) {
+  .card {
+    background: #1e293b;
+    box-shadow: 0 4px 24px rgba(0, 0, 0, 0.35);
+  }
+}
+
+.title {
+  font-size: 1.35rem;
+  font-weight: 700;
+  color: #0c4a6e;
+  margin: 0 0 6px;
+  letter-spacing: -0.02em;
+}
+
+@media (prefers-color-scheme: dark) {
+  .title {
+    color: #f1f5f9;
+  }
+}
+
+.subtitle {
+  font-size: 0.875rem;
+  color: #64748b;
+  margin: 0 0 20px;
+  line-height: 1.45;
+}
+
+@media (prefers-color-scheme: dark) {
+  .subtitle {
+    color: #94a3b8;
+  }
+}
+
+.field {
+  margin-bottom: 14px;
+}
+
+.label {
+  display: block;
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: #475569;
+  margin-bottom: 6px;
+}
+
+@media (prefers-color-scheme: dark) {
+  .label {
+    color: #cbd5e1;
+  }
+}
+
+.input,
+.select,
+.textarea {
+  width: 100%;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid #bae6fd;
+  font-size: 0.875rem;
+  font-family: inherit;
+  box-sizing: border-box;
+  background: #fff;
+  color: #0c4a6e;
+}
+
+.input:focus-visible,
+.select:focus-visible,
+.textarea:focus-visible {
+  outline: none;
+  border-color: #6b7aff;
+  box-shadow: 0 0 0 3px rgba(107, 122, 255, 0.2);
+}
+
+@media (prefers-color-scheme: dark) {
+  .input,
+  .select,
+  .textarea {
+    background: #0f172a;
+    border-color: #334155;
+    color: #f1f5f9;
+  }
+}
+
+.textarea {
+  resize: vertical;
+  min-height: 72px;
+}
+
+.error {
+  font-size: 0.8125rem;
+  color: #dc2626;
+  margin: 0 0 12px;
+  line-height: 1.4;
+}
+
+.success {
+  font-size: 0.8125rem;
+  color: #059669;
+  margin: 0 0 12px;
+}
+
+.btnPrimary {
+  width: 100%;
+  padding: 11px 16px;
+  border: none;
+  border-radius: 10px;
+  background: linear-gradient(135deg, #8b9aff, #6b7aff);
+  color: #fff;
+  font-size: 0.875rem;
+  font-weight: 700;
+  font-family: inherit;
+  cursor: pointer;
+  box-shadow: 0 4px 14px rgba(107, 122, 255, 0.35);
+}
+
+.btnPrimary:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+  box-shadow: none;
+}
+
+.btnPrimary:not(:disabled):hover {
+  filter: brightness(1.04);
+}
+
+.btnAccent {
+  width: 100%;
+  padding: 11px 16px;
+  border: none;
+  border-radius: 10px;
+  background: linear-gradient(135deg, #8b9aff, #6b7aff);
+  color: #fff;
+  font-size: 0.875rem;
+  font-weight: 700;
+  font-family: inherit;
+  cursor: pointer;
+  box-shadow: 0 4px 14px rgba(107, 122, 255, 0.35);
+}
+
+.btnAccent:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.btnGhost {
+  width: 100%;
+  padding: 10px;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  background: transparent;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  font-family: inherit;
+  cursor: pointer;
+  color: #475569;
+}
+
+@media (prefers-color-scheme: dark) {
+  .btnGhost {
+    border-color: #475569;
+    color: #cbd5e1;
+  }
+}
+
+.link {
+  background: none;
+  border: none;
+  padding: 0;
+  font-size: 0.8125rem;
+  color: #6b7aff;
+  cursor: pointer;
+  font-family: inherit;
+  text-decoration: underline;
+  font-weight: 600;
+}
+
+.linkMuted {
+  background: none;
+  border: none;
+  padding: 0;
+  font-size: 0.8125rem;
+  color: #64748b;
+  cursor: pointer;
+  font-family: inherit;
+}
+
+.row {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  margin-top: 16px;
+}
+
+.spinnerWrap {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #f0f9ff;
+}
+
+@media (prefers-color-scheme: dark) {
+  .spinnerWrap {
+    background: #0c1929;
+  }
+}
+
+.spinner {
+  width: 40px;
+  height: 40px;
+  border: 3px solid #bae6fd;
+  border-top-color: #6b7aff;
+  border-radius: 50%;
+  animation: spin 0.75s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.progress {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 20px;
+  justify-content: center;
+}
+
+.progressStep {
+  flex: 1;
+  height: 4px;
+  border-radius: 4px;
+  background: #e2e8f0;
+  max-width: 100px;
+}
+
+@media (prefers-color-scheme: dark) {
+  .progressStep {
+    background: #334155;
+  }
+}
+
+.progressStepActive {
+  background: linear-gradient(90deg, #8b9aff, #6b7aff);
+}
+
+.progressStepDone {
+  background: #6b7aff;
+}
+
+.otpRow {
+  display: flex;
+  gap: 8px;
+  justify-content: center;
+  margin-bottom: 16px;
+}
+
+.otpBox {
+  width: 40px;
+  height: 44px;
+  text-align: center;
+  font-size: 1.125rem;
+  font-weight: 700;
+  border-radius: 8px;
+  border: 1px solid #cbd5e1;
+  font-family: inherit;
+  box-sizing: border-box;
+}
+
+@media (prefers-color-scheme: dark) {
+  .otpBox {
+    background: #0f172a;
+    border-color: #475569;
+    color: #f1f5f9;
+  }
+}
+
+.planGrid {
+  display: grid;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.planCard {
+  border: 2px solid #e2e8f0;
+  border-radius: 10px;
+  padding: 16px;
+  text-align: left;
+  cursor: pointer;
+  background: #fff;
+  font-family: inherit;
+  position: relative;
+}
+
+@media (prefers-color-scheme: dark) {
+  .planCard {
+    background: #0f172a;
+    border-color: #334155;
+  }
+}
+
+.planCardSelected {
+  border-color: #6b7aff;
+  box-shadow: 0 0 0 1px #6b7aff;
+}
+
+.planName {
+  font-weight: 700;
+  color: #0c4a6e;
+  margin: 0 0 6px;
+}
+
+@media (prefers-color-scheme: dark) {
+  .planName {
+    color: #f1f5f9;
+  }
+}
+
+.planPrice {
+  font-size: 1.125rem;
+  font-weight: 700;
+  color: #0f172a;
+  margin-bottom: 8px;
+}
+
+@media (prefers-color-scheme: dark) {
+  .planPrice {
+    color: #e2e8f0;
+  }
+}
+
+.planFeat {
+  font-size: 0.8125rem;
+  color: #64748b;
+  margin: 0;
+  line-height: 1.45;
+}
+
+.badge {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  font-size: 0.65rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  background: linear-gradient(135deg, #8b9aff, #6b7aff);
+  color: #fff;
+  padding: 4px 8px;
+  border-radius: 4px;
+}
+
+.note {
+  font-size: 0.75rem;
+  color: #64748b;
+  text-align: center;
+  margin-top: 10px;
+  line-height: 1.45;
+}
+
+.googleBtn {
+  width: 100%;
+  padding: 10px;
+  border: 1px solid #bae6fd;
+  border-radius: 8px;
+  background: #fff;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  font-family: inherit;
+  cursor: not-allowed;
+  opacity: 0.75;
+  color: #64748b;
+}
+
+@media (prefers-color-scheme: dark) {
+  .googleBtn {
+    background: #1e293b;
+    border-color: #475569;
+  }
+}
+
+.divider {
+  text-align: center;
+  font-size: 0.75rem;
+  color: #94a3b8;
+  margin: 14px 0;
+}
+
+.pickerList {
+  width: 100%;
+  max-width: 480px;
+}
+
+.companyRow {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  margin-bottom: 10px;
+  cursor: pointer;
+  background: #fff;
+  text-align: left;
+  width: 100%;
+  font-family: inherit;
+  box-sizing: border-box;
+}
+
+@media (prefers-color-scheme: dark) {
+  .companyRow {
+    background: #1e293b;
+    border-color: #334155;
+  }
+}
+
+.companyRowSelected {
+  border-color: #6b7aff;
+  box-shadow: 0 0 0 1px #6b7aff;
+}
+
+.avatar {
+  width: 40px;
+  height: 40px;
+  border-radius: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 700;
+  font-size: 0.875rem;
+  color: #fff;
+  flex-shrink: 0;
+}
+
+.emptyState {
+  text-align: center;
+  padding: 24px 16px;
+}
+
+.emptyIcon {
+  font-size: 2.5rem;
+  margin-bottom: 12px;
+  opacity: 0.85;
+}
+
+.addDashed {
+  width: 100%;
+  padding: 16px;
+  border: 2px dashed #bae6fd;
+  border-radius: 10px;
+  background: transparent;
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: #6b7aff;
+  cursor: pointer;
+  font-family: inherit;
+  margin-bottom: 12px;
+}
