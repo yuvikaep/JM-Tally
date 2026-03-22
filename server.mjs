@@ -33,12 +33,55 @@ function pgSslOption() {
   return false
 }
 
+/** Supabase transaction pooler (6543 / pooler host) needs pgbouncer=true for node-pg. */
+function normalizeDatabaseUrl(url) {
+  if (!url) return url
+  let u = String(url).trim()
+  const isPooler = /pooler\.supabase\.com/i.test(u) || /:6543([/?]|$)/.test(u)
+  if (isPooler && !/[?&]pgbouncer=true\b/i.test(u)) {
+    u += u.includes("?") ? "&pgbouncer=true" : "?pgbouncer=true"
+  }
+  return u
+}
+
 function getPool() {
   if (!DATABASE_URL) return null
   if (!pool) {
-    pool = new Pool({ connectionString: DATABASE_URL, ssl: pgSslOption() })
+    pool = new Pool({
+      connectionString: normalizeDatabaseUrl(DATABASE_URL),
+      ssl: pgSslOption(),
+      max: 20,
+      idleTimeoutMillis: 30000,
+      connectionTimeoutMillis: 20000,
+    })
   }
   return pool
+}
+
+/** User-facing message for common DB / network failures (no stack traces). */
+function publicErrorMessage(e) {
+  const msg = String(e?.message || e || "")
+  const code = e?.code
+  if (code === "42P01" || /relation .* does not exist/i.test(msg)) {
+    return "Database tables are not ready. Wait for deploy to finish, or run migrations in Supabase SQL editor."
+  }
+  if (code === "28P01" || /password authentication failed/i.test(msg)) {
+    return "Database login failed. Update DATABASE_URL with the correct password from Supabase."
+  }
+  if (code === "3D000" || /database .* does not exist/i.test(msg)) {
+    return "Database name in DATABASE_URL is wrong. Copy the connection string from Supabase again."
+  }
+  if (code === "ECONNREFUSED" || code === "ETIMEDOUT" || code === "ENOTFOUND") {
+    return "Cannot reach the database. Check DATABASE_URL and that Supabase allows your IP if required."
+  }
+  if (code === "23505" || /unique constraint/i.test(msg)) {
+    return "This email is already registered. Log in instead."
+  }
+  if (/prepared statement|bind message|unsupported/i.test(msg)) {
+    return "Database connection mode error. In Supabase use the Direct connection string (port 5432), not Transaction pooler, for this server."
+  }
+  if (process.env.DEBUG_API === "1") return msg.slice(0, 500)
+  return "Something went wrong. Try again. If it persists, check Render logs."
 }
 
 /** Pool.query() uses arbitrary connections — BEGIN/COMMIT must use one client. */
@@ -66,11 +109,10 @@ async function initDb() {
     console.warn("DATABASE_URL not set — API routes disabled")
     return
   }
-  // Do not require pgcrypto: PostgreSQL 13+ (incl. Supabase) provides gen_random_uuid() in core.
-  // CREATE EXTENSION pgcrypto often fails on managed DBs (permission denied) and blocked all DDL.
+  // UUIDs are always supplied in application code (no gen_random_uuid() in schema — avoids PG extension issues).
   await p.query(`
     CREATE TABLE IF NOT EXISTS users (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      id UUID PRIMARY KEY,
       first_name TEXT NOT NULL,
       last_name TEXT NOT NULL,
       email TEXT UNIQUE NOT NULL,
@@ -80,7 +122,7 @@ async function initDb() {
   `)
   await p.query(`
     CREATE TABLE IF NOT EXISTS companies (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      id UUID PRIMARY KEY,
       name TEXT NOT NULL,
       business_type TEXT,
       gst TEXT,
@@ -93,7 +135,7 @@ async function initDb() {
   `)
   await p.query(`
     CREATE TABLE IF NOT EXISTS user_companies (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      id UUID PRIMARY KEY,
       user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
       role TEXT DEFAULT 'Admin',
@@ -102,7 +144,7 @@ async function initDb() {
   `)
   await p.query(`
     CREATE TABLE IF NOT EXISTS password_resets (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      id UUID PRIMARY KEY,
       email TEXT NOT NULL,
       otp TEXT NOT NULL,
       expires_at TIMESTAMPTZ NOT NULL,
@@ -261,6 +303,17 @@ async function handleApi(req, res) {
     const url = new URL(req.url || "/", `http://${host}`)
     let pathname = url.pathname
     if (pathname.length > 1 && pathname.endsWith("/")) pathname = pathname.slice(0, -1)
+
+    if (method === "GET" && pathname === "/api/auth/health") {
+      try {
+        await p.query("SELECT 1")
+        sendJson(res, 200, { ok: true, database: "connected" })
+      } catch (he) {
+        sendJson(res, 503, { ok: false, database: "error", message: publicErrorMessage(he) })
+      }
+      return
+    }
+
     if (method === "POST" && pathname === "/api/auth/signup") {
       const body = await readBody(req)
       const firstName = String(body.firstName || "").trim()
@@ -542,11 +595,10 @@ async function handleApi(req, res) {
   } catch (e) {
     console.error("API handler error:", e?.code || "", e?.message || e, e?.detail || "")
     if (!res.headersSent) {
-      const debug = process.env.DEBUG_API === "1"
       sendJson(res, 500, {
         error: "SERVER_ERROR",
-        message: debug ? String(e?.message || e) : "Something went wrong.",
-        ...(debug && e?.code ? { pgCode: e.code } : {}),
+        message: publicErrorMessage(e),
+        ...(process.env.DEBUG_API === "1" && e?.code ? { pgCode: e.code } : {}),
       })
     }
   }
@@ -596,10 +648,10 @@ const server = http.createServer((req, res) => {
 
     if (pathname.startsWith("/api/")) {
       handleApi(req, res).catch(err => {
-        console.error("handleApi:", err)
+        console.error("handleApi:", err?.code, err?.message, err)
         if (!res.headersSent) {
           res.__req = req
-          sendJson(res, 500, { error: "SERVER_ERROR", message: "Something went wrong." })
+          sendJson(res, 500, { error: "SERVER_ERROR", message: publicErrorMessage(err) })
         }
       })
       return
@@ -629,12 +681,29 @@ const server = http.createServer((req, res) => {
   }
 })
 
-initDb()
-  .catch(err => {
-    console.error("DB init failed:", err?.code, err?.message, err?.detail || "")
+async function startServer() {
+  if (DATABASE_URL) {
+    let lastErr = null
+    for (let attempt = 1; attempt <= 5; attempt++) {
+      try {
+        await initDb()
+        lastErr = null
+        break
+      } catch (err) {
+        lastErr = err
+        console.error(`initDb attempt ${attempt}/5 failed:`, err?.code, err?.message, err?.detail || "")
+        if (attempt < 5) await new Promise(r => setTimeout(r, 2500))
+      }
+    }
+    if (lastErr) {
+      console.error("FATAL: could not initialize database after 5 attempts. Fix DATABASE_URL or run SQL in Supabase.")
+      process.exit(1)
+    }
+  }
+
+  server.listen(PORT, "0.0.0.0", () => {
+    console.log(`JM Tally listening on 0.0.0.0:${PORT}`)
   })
-  .finally(() => {
-    server.listen(PORT, "0.0.0.0", () => {
-      console.log(`JM Tally listening on 0.0.0.0:${PORT}`)
-    })
-  })
+}
+
+startServer()
