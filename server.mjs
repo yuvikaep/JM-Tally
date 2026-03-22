@@ -33,22 +33,47 @@ function pgSslOption() {
   return false
 }
 
-/** Supabase transaction pooler (6543 / pooler host) needs pgbouncer=true for node-pg. */
-function normalizeDatabaseUrl(url) {
-  if (!url) return url
-  let u = String(url).trim()
-  const isPooler = /pooler\.supabase\.com/i.test(u) || /:6543([/?]|$)/.test(u)
-  if (isPooler && !/[?&]pgbouncer=true\b/i.test(u)) {
-    u += u.includes("?") ? "&pgbouncer=true" : "?pgbouncer=true"
+/** Render/Supabase pastes often include wrapping quotes — breaks pg and new URL(). */
+function cleanDatabaseUrl(raw) {
+  if (raw == null || raw === "") return raw
+  let s = String(raw).trim()
+  s = s.replace(/^["']|["']$/g, "").trim()
+  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
+    s = s.slice(1, -1).trim()
   }
-  return u
+  return s
+}
+
+/** Supabase transaction pooler (6543 / pooler host) needs pgbouncer=true for node-pg. */
+function appendSupabasePoolerParam(url) {
+  if (!url) return url
+  const isPooler = /pooler\.supabase\.com/i.test(url) || /:6543([/?]|$)/.test(url)
+  if (!isPooler || /[?&]pgbouncer=true\b/i.test(url)) return url
+  try {
+    const u = new URL(url)
+    u.searchParams.set("pgbouncer", "true")
+    return u.toString()
+  } catch {
+    try {
+      return url.includes("?") ? `${url}&pgbouncer=true` : `${url}?pgbouncer=true`
+    } catch {
+      return url
+    }
+  }
 }
 
 function getPool() {
   if (!DATABASE_URL) return null
   if (!pool) {
+    const cleaned = cleanDatabaseUrl(DATABASE_URL)
+    let connStr = cleaned
+    try {
+      connStr = appendSupabasePoolerParam(cleaned)
+    } catch (e) {
+      console.warn("appendSupabasePoolerParam:", e?.message)
+    }
     pool = new Pool({
-      connectionString: normalizeDatabaseUrl(DATABASE_URL),
+      connectionString: connStr,
       ssl: pgSslOption(),
       max: 20,
       idleTimeoutMillis: 30000,
