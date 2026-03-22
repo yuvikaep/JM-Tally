@@ -29,7 +29,7 @@ let pool = null
 function pgSslOption() {
   if (NODE_ENV === "production") return { rejectUnauthorized: false }
   const u = DATABASE_URL || ""
-  if (/render\.com|amazonaws\.com|neon\.tech|supabase\.co/i.test(u)) return { rejectUnauthorized: false }
+  if (/render\.com|amazonaws\.com|neon\.tech|supabase\.(co|com)/i.test(u)) return { rejectUnauthorized: false }
   return false
 }
 
@@ -111,18 +111,48 @@ async function initDb() {
   console.log("Database tables ready")
 }
 
-function corsHeaders() {
-  return {
-    "Access-Control-Allow-Origin": FRONTEND_URL === "*" ? "*" : FRONTEND_URL,
+function normalizeOrigin(s) {
+  return String(s || "")
+    .trim()
+    .replace(/\/$/, "")
+}
+
+/** Comma-separated FRONTEND_URL values; must echo request Origin exactly for browser CORS. */
+function parseAllowedOrigins() {
+  const raw = (FRONTEND_URL || "*").trim()
+  if (!raw || raw === "*") return ["*"]
+  const out = raw.split(",").map(normalizeOrigin).filter(Boolean)
+  return out.length ? out : ["*"]
+}
+
+function corsHeaders(res) {
+  const req = res.__req
+  const list = parseAllowedOrigins()
+  const base = {
     "Access-Control-Allow-Methods": "GET, POST, PUT, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type, Authorization",
     "Access-Control-Max-Age": "86400",
   }
+  if (list.includes("*")) {
+    return { ...base, "Access-Control-Allow-Origin": "*" }
+  }
+  const origin = req?.headers?.origin
+  if (origin) {
+    const no = normalizeOrigin(origin)
+    if (list.some(l => normalizeOrigin(l) === no)) {
+      return { ...base, "Access-Control-Allow-Origin": no }
+    }
+    return base
+  }
+  if (list.length) {
+    return { ...base, "Access-Control-Allow-Origin": list[0] }
+  }
+  return base
 }
 
 function sendJson(res, status, obj) {
   if (res.headersSent) return
-  res.writeHead(status, { "Content-Type": "application/json; charset=utf-8", ...corsHeaders() })
+  res.writeHead(status, { "Content-Type": "application/json; charset=utf-8", ...corsHeaders(res) })
   res.end(JSON.stringify(obj))
 }
 
@@ -548,6 +578,7 @@ const server = http.createServer((req, res) => {
       handleApi(req, res).catch(err => {
         console.error("handleApi:", err)
         if (!res.headersSent) {
+          res.__req = req
           sendJson(res, 500, { error: "SERVER_ERROR", message: "Something went wrong." })
         }
       })
