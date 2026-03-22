@@ -227,6 +227,7 @@ async function assertCompanyAccess(p, userId, companyId) {
 }
 
 async function handleApi(req, res) {
+  res.__req = req
   const p = getPool()
   if (!p || !JWT_SECRET) {
     sendJson(res, 503, { error: "SERVICE_UNAVAILABLE", message: "Server configuration incomplete." })
@@ -236,7 +237,13 @@ async function handleApi(req, res) {
   const method = req.method || "GET"
 
   if (method === "OPTIONS") {
-    res.writeHead(204, corsHeaders())
+    const h = corsHeaders(res)
+    if (!h["Access-Control-Allow-Origin"]) {
+      res.writeHead(403, { "Content-Type": "text/plain; charset=utf-8" })
+      res.end("CORS: origin not allowed. Set FRONTEND_URL on the API to your Vercel URL (comma-separated for multiple).")
+      return
+    }
+    res.writeHead(204, h)
     res.end()
     return
   }
