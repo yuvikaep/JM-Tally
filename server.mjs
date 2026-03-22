@@ -112,12 +112,17 @@ async function initDb() {
 }
 
 function normalizeOrigin(s) {
-  return String(s || "")
+  let x = String(s || "")
     .trim()
+    .replace(/^["']|["']$/g, "")
     .replace(/\/$/, "")
+  if (x && !/^https?:\/\//i.test(x)) {
+    x = `https://${x}`
+  }
+  return x
 }
 
-/** Comma-separated FRONTEND_URL values; must echo request Origin exactly for browser CORS. */
+/** Comma-separated FRONTEND_URL values (optional). Used for logging / future strict mode. */
 function parseAllowedOrigins() {
   const raw = (FRONTEND_URL || "*").trim()
   if (!raw || raw === "*") return ["*"]
@@ -125,6 +130,11 @@ function parseAllowedOrigins() {
   return out.length ? out : ["*"]
 }
 
+/**
+ * Browsers require Access-Control-Allow-Origin to echo the page origin exactly.
+ * If FRONTEND_URL was mis-typed vs Vercel, the old allowlist logic omitted ACAO → endless CORS failures.
+ * We echo Origin for any browser request; auth is still enforced by JWT on protected routes.
+ */
 function corsHeaders(res) {
   const req = res.__req
   const list = parseAllowedOrigins()
@@ -139,10 +149,7 @@ function corsHeaders(res) {
   const origin = req?.headers?.origin
   if (origin) {
     const no = normalizeOrigin(origin)
-    if (list.some(l => normalizeOrigin(l) === no)) {
-      return { ...base, "Access-Control-Allow-Origin": no }
-    }
-    return base
+    return { ...base, "Access-Control-Allow-Origin": no }
   }
   if (list.length) {
     return { ...base, "Access-Control-Allow-Origin": list[0] }
