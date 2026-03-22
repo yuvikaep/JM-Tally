@@ -66,7 +66,8 @@ async function initDb() {
     console.warn("DATABASE_URL not set — API routes disabled")
     return
   }
-  await p.query(`CREATE EXTENSION IF NOT EXISTS pgcrypto`)
+  // Do not require pgcrypto: PostgreSQL 13+ (incl. Supabase) provides gen_random_uuid() in core.
+  // CREATE EXTENSION pgcrypto often fails on managed DBs (permission denied) and blocked all DDL.
   await p.query(`
     CREATE TABLE IF NOT EXISTS users (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -539,9 +540,14 @@ async function handleApi(req, res) {
 
     sendJson(res, 404, { error: "NOT_FOUND", message: "Not found." })
   } catch (e) {
-    console.error(e)
+    console.error("API handler error:", e?.code || "", e?.message || e, e?.detail || "")
     if (!res.headersSent) {
-      sendJson(res, 500, { error: "SERVER_ERROR", message: "Something went wrong." })
+      const debug = process.env.DEBUG_API === "1"
+      sendJson(res, 500, {
+        error: "SERVER_ERROR",
+        message: debug ? String(e?.message || e) : "Something went wrong.",
+        ...(debug && e?.code ? { pgCode: e.code } : {}),
+      })
     }
   }
 }
@@ -625,7 +631,7 @@ const server = http.createServer((req, res) => {
 
 initDb()
   .catch(err => {
-    console.error("DB init failed:", err)
+    console.error("DB init failed:", err?.code, err?.message, err?.detail || "")
   })
   .finally(() => {
     server.listen(PORT, "0.0.0.0", () => {
