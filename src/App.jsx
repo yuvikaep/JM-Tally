@@ -1376,6 +1376,28 @@ function tryChatRecategorize(msg, txns) {
   return { type: "ready", t, target }
 }
 
+/**
+ * Before posting a new chat draft, check if an existing txn already matches
+ * the same amount (+ optional date) and offer category change instead.
+ */
+function tryFindExistingTxnForDraft(msg, draftEntries, txns) {
+  if (!Array.isArray(draftEntries) || !draftEntries.length || !Array.isArray(txns) || !txns.length) return null
+  const d = draftEntries[0]
+  const amt = Math.round((Number(d?.amt) || 0) * 100)
+  if (!amt) return null
+  const date = parseDdMmYyyyFromPaste(msg || "")
+  const active = txns.filter(t => !t.void)
+  let pool = active.filter(t => Math.round((Number(t.amount) || 0) * 100) === amt)
+  if (date) pool = pool.filter(t => t.date === date)
+  if (pool.length === 0) return null
+  if (pool.length > 1) return { type: "ambiguous", n: pool.length, amount: amt / 100, date }
+  const t = pool[0]
+  const target = String(d?.cat || "").trim()
+  if (!target || !CATS.includes(target)) return { type: "exists", t }
+  if (t.category === target) return { type: "already", t, target }
+  return { type: "ready", t, target }
+}
+
 /** Deduped short strings saved per company for the embedded assistant (browser storage). */
 function normalizeAssistantMemory(arr) {
   if (!Array.isArray(arr)) return []
@@ -2042,6 +2064,46 @@ function Chat({
 
       const draftEntries = extractChatDraftFromUserMessage(msg)
       const hasDraft = draftEntries.length > 0
+      if (hasDraft) {
+        const existing = tryFindExistingTxnForDraft(msg, draftEntries, ledgerTxns || [])
+        if (existing?.type === "ready") {
+          const t = existing.t
+          const target = existing.target
+          const text = `लगता है यह txn पहले से मौजूद है: **#${t.id}** · ${t.date} · ₹${inr0(t.amount)} · ${t.category}\n\nDuplicate post करने के बजाय इसे **${target}** में बदल दूँ? नीचे **✓ Apply** दबाएँ।`
+          hist.current.push({ role: "assistant", content: text })
+          setMsgs(p => p.slice(0, -1).concat([{ role: "ai", text }]))
+          const recatId = `rc-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`
+          window.setTimeout(
+            () =>
+              setMsgs(p => [
+                ...p,
+                {
+                  role: "recat_confirm",
+                  recatId,
+                  txnId: t.id,
+                  fromCat: t.category,
+                  toCat: target,
+                  particulars: t.particulars,
+                },
+              ]),
+            400
+          )
+          return
+        }
+        if (existing?.type === "already") {
+          const t = existing.t
+          const text = `यह txn पहले से मौजूद है और सही category में है: **#${t.id}** · ${t.date} · ₹${inr0(t.amount)} · **${existing.target}**`
+          hist.current.push({ role: "assistant", content: text })
+          setMsgs(p => p.slice(0, -1).concat([{ role: "ai", text }]))
+          return
+        }
+        if (existing?.type === "ambiguous") {
+          const text = `Same amount के **${existing.n}** txns मिले। Date (dd/mm/yyyy) या narration जोड़ो, फिर मैं सही txn की category बदल दूँगा।`
+          hist.current.push({ role: "assistant", content: text })
+          setMsgs(p => p.slice(0, -1).concat([{ role: "ai", text }]))
+          return
+        }
+      }
       let draftSummary = ""
       if (hasDraft) {
         const e = draftEntries[0]
@@ -2685,7 +2747,9 @@ function BooksApp({ authUser, onLogout }) {
   useEffect(() => {
     ;(async () => {
       try {
-        await migrateLegacyBooksToUserScope(store, scopedStore)
+        // Auth-backed accounts should never inherit pre-auth legacy browser books.
+        // Skipping this migration prevents new signups from seeing old/demo data
+        // that may exist in shared localStorage on the same device.
         const { registry, activeCompanyId: aid, payload } = await bootstrapCompanies(scopedStore, STORAGE_EPOCH)
         setCompanies((registry.companies || []).map(c => normalizeCompanyRecord(c)).filter(Boolean))
         setActiveCompanyId(aid)
