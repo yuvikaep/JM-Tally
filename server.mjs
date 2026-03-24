@@ -490,6 +490,43 @@ async function handleApi(req, res) {
       return
     }
 
+    if (method === "POST" && pathname === "/api/auth/change-password") {
+      const userId = await getUserIdFromAuth(req)
+      if (!userId) {
+        sendJson(res, 401, { error: "UNAUTHORIZED", message: "Unauthorized." })
+        return
+      }
+      const body = await readBody(req)
+      const currentPassword = String(body.currentPassword || "")
+      const newPassword = String(body.newPassword || "")
+      if (!currentPassword || !newPassword) {
+        sendJson(res, 400, { error: "VALIDATION", message: "Please fill all required fields." })
+        return
+      }
+      if (newPassword.length < 8) {
+        sendJson(res, 400, { error: "WEAK_PASSWORD", message: "Password must be at least 8 characters." })
+        return
+      }
+      if (newPassword === currentPassword) {
+        sendJson(res, 400, { error: "VALIDATION", message: "New password must be different from current password." })
+        return
+      }
+      const r = await p.query(`SELECT id, password_hash FROM users WHERE id = $1`, [userId])
+      if (!r.rows.length) {
+        sendJson(res, 401, { error: "UNAUTHORIZED", message: "Unauthorized." })
+        return
+      }
+      const ok = await bcrypt.compare(currentPassword, r.rows[0].password_hash)
+      if (!ok) {
+        sendJson(res, 401, { error: "AUTH_FAILED", message: "Current password is incorrect." })
+        return
+      }
+      const hash = await bcrypt.hash(newPassword, BCRYPT_ROUNDS)
+      await p.query(`UPDATE users SET password_hash = $1 WHERE id = $2`, [hash, userId])
+      sendJson(res, 200, { message: "Password changed successfully." })
+      return
+    }
+
     if (method === "GET" && pathname === "/api/auth/companies") {
       const userId = await getUserIdFromAuth(req)
       if (!userId) {

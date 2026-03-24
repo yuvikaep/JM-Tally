@@ -38,7 +38,6 @@ import {
   appendCompanyAudit,
   removeCompanyData,
   newCompanyId,
-  migrateLegacyBooksToUserScope,
 } from "./companyStorage.js"
 import { createScopedStore } from "./authStorage.js"
 import { useAuth } from "./auth/AuthContext.jsx"
@@ -1350,8 +1349,81 @@ function hasChatRecategorizeIntent(msg) {
   return false
 }
 
+function extractRecategorizeNameAnchor(msg, target) {
+  const raw = String(msg || "")
+  if (!raw.trim()) return ""
+
+  const quoted = raw.match(/["'`]{1}([^"'`]{2,120})["'`]{1}/)
+  if (quoted) return quoted[1].trim()
+
+  const m = raw.match(/\b(?:name|part(?:icular)?s?|narration|description)\s*(?:is|:)?\s*([^\n,.;]{2,140})/i)
+  if (m) {
+    let s = String(m[1] || "").trim()
+    if (target) s = s.replace(new RegExp(`\\b${String(target).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i"), "").trim()
+    return s
+  }
+
+  const pre = raw.split(/\b(?:as|to|in|under|into)\b/i)[0] || ""
+  let s = pre
+    .replace(/\b(recategorize|reclassify|re-categor|change|set|move|mark|book|categorize|category|txn|transaction|line|entry|this|that|the)\b/gi, " ")
+    .replace(/\b\d{1,2}[\/-]\d{1,2}[\/-]\d{2,4}\b/g, " ")
+    .replace(/[₹,]/g, " ")
+    .replace(/\b\d+(?:\.\d+)?\b/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+  if (target) {
+    s = s
+      .replace(new RegExp(`\\b${String(target).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i"), "")
+      .replace(/\s+/g, " ")
+      .trim()
+  }
+  return s
+}
+
+function tokenizeAnchor(anchor) {
+  return String(anchor || "")
+    .toLowerCase()
+    .split(/[^a-z0-9]+/i)
+    .map(s => s.trim())
+    .filter(s => s.length >= 3)
+}
+
+function extractTxnLookupAnchor(msg) {
+  const text = String(msg || "").trim()
+  if (!text) return ""
+  const q = text.match(/["'`]{1}([^"'`]{2,120})["'`]{1}/)
+  if (q) return q[1].trim()
+  const p1 = text.match(/\b(?:list|show|find|search)\s+(?:of\s+)?(.+?)\s*(?:txn|transaction|transactions)\b/i)
+  if (p1) return String(p1[1] || "").trim()
+  const p2 = text.match(/\b(?:txn|transaction|transactions)\s+(?:of|for|with|named)\s+(.+)$/i)
+  if (p2) return String(p2[1] || "").trim()
+  const p3 = text.match(/\b(?:name|part(?:icular)?s?|narration)\s*(?:is|:)?\s*([^\n,.;]{2,140})/i)
+  if (p3) return String(p3[1] || "").trim()
+  return ""
+}
+
+function hasTxnLookupIntent(msg) {
+  const m = String(msg || "")
+  return /\b(list|show|find|search|which|where)\b/i.test(m) && /\b(txn|transaction|transactions)\b/i.test(m)
+}
+
+function tryTxnLookupByName(msg, txns) {
+  if (!hasTxnLookupIntent(msg)) return null
+  const anchor = extractTxnLookupAnchor(msg)
+  const terms = tokenizeAnchor(anchor)
+  if (!terms.length) return { type: "need_anchor" }
+  const pool = (Array.isArray(txns) ? txns : []).filter(t => !t.void)
+  const rows = pool.filter(t => {
+    const p = String(t.particulars || "").toLowerCase()
+    return terms.every(w => p.includes(w))
+  })
+  if (!rows.length) return { type: "no_match", anchor }
+  const sorted = [...rows].sort((a, b) => parseDdMmYyyy(b.date) - parseDdMmYyyy(a.date) || b.id - a.id)
+  return { type: "ready", anchor, rows: sorted.slice(0, 8), total: rows.length }
+}
+
 /**
- * If user asks to move a Misc line to another category, match by date + amount from paste.
+ * If user asks to recategorize a line, match by date + amount and/or particulars text.
  * @returns {null | { type: string, t?: object, target?: string, n?: number, amount?: any, date?: any }}
  */
 function tryChatRecategorize(msg, txns) {
@@ -1363,11 +1435,19 @@ function tryChatRecategorize(msg, txns) {
 
   const amt = parseAmountFromBankPaste(msg)
   const date = parseDdMmYyyyFromPaste(msg)
-  if (amt == null && !date) return { type: "no_anchor" }
+  const anchor = extractRecategorizeNameAnchor(msg, target)
+  const terms = tokenizeAnchor(anchor)
 
-  let pool = txns.filter(t => !t.void && (t.category === "Misc Income" || t.category === "Misc Expense"))
+  let pool = txns.filter(t => !t.void)
   if (date) pool = pool.filter(t => t.date === date)
   if (amt != null) pool = pool.filter(t => Math.round((Number(t.amount) || 0) * 100) === Math.round(amt * 100))
+  if (terms.length) {
+    pool = pool.filter(t => {
+      const p = String(t.particulars || "").toLowerCase()
+      return terms.every(w => p.includes(w))
+    })
+  }
+  if (amt == null && !date && !terms.length) return { type: "no_anchor" }
 
   if (pool.length === 0) return { type: "no_match", amount: amt, date, target }
   if (pool.length > 1) return { type: "ambiguous", n: pool.length, amount: amt, date, target }
@@ -1564,7 +1644,7 @@ function localAccountingAssistantReply(
   }
 
   const mem = formatAssistantMemoryBlock(assistantMemory)
-  return `Bank **₹${bal}** · Top rev **${topRev} ₹${topRevAmt}** · GST(est) **₹${gstEst}**${mem}`
+  return `I need a bit more detail to act on this.\n\nTry one of these:\n- **list txn of <name>**\n- **change txn #<id> to <category>**\n- **<date> <amount> ko <category> karo**\n\n${mem ? `Also, saved notes for this company are available.${mem}` : ""}`
 }
 
 function ChatConfirmCard({ acctRole, initialEntries, onAddBatch, onDismiss }) {
@@ -2035,7 +2115,7 @@ function Chat({
         return
       }
       if (recat?.type === "no_anchor") {
-        const text = `Date + ₹ amount चाहिए।`
+        const text = `Date + ₹ amount **या** txn का name/particulars चाहिए।`
         hist.current.push({ role: "assistant", content: text })
         setMsgs(p => p.slice(0, -1).concat([{ role: "ai", text }]))
         return
@@ -2057,6 +2137,30 @@ function Chat({
       if (recat?.type === "already") {
         const t = recat.t
         const text = `✓ **#${t.id}** already **${recat.target}**`
+        hist.current.push({ role: "assistant", content: text })
+        setMsgs(p => p.slice(0, -1).concat([{ role: "ai", text }]))
+        return
+      }
+
+      const lookup = tryTxnLookupByName(msg, ledgerTxns || [])
+      if (lookup?.type === "need_anchor") {
+        const text = `Kis name/particulars par txn chahiye? Example: **list txn of PRATIBHA SINGH**`
+        hist.current.push({ role: "assistant", content: text })
+        setMsgs(p => p.slice(0, -1).concat([{ role: "ai", text }]))
+        return
+      }
+      if (lookup?.type === "no_match") {
+        const text = `**${String(lookup.anchor || "").slice(0, 60)}** के लिए कोई txn नहीं मिला। Name का थोड़ा और हिस्सा भेजो।`
+        hist.current.push({ role: "assistant", content: text })
+        setMsgs(p => p.slice(0, -1).concat([{ role: "ai", text }]))
+        return
+      }
+      if (lookup?.type === "ready") {
+        const lines = lookup.rows
+          .map(t => `• **#${t.id}** · ${t.date} · ₹${inr0(t.amount)} · ${t.category} · ${String(t.particulars || "").slice(0, 36)}`)
+          .join("\n")
+        const more = lookup.total > lookup.rows.length ? `\n…और **${lookup.total - lookup.rows.length}** match(s)` : ""
+        const text = `**${String(lookup.anchor || "").slice(0, 60)}** के लिए **${lookup.total}** txn मिले:\n${lines}${more}\n\nCategory बदलनी हो तो लिखो: **txn #id ko <category> karo**`
         hist.current.push({ role: "assistant", content: text })
         setMsgs(p => p.slice(0, -1).concat([{ role: "ai", text }]))
         return
@@ -2648,12 +2752,14 @@ function AssistantRulesPanel({ skills, setSkills, acctRole, cats, onRunOnLedger,
 }
 
 // ═══════════════ MAIN APP (requires login) ═══════════════
-function BooksApp({ authUser, onLogout }) {
+function BooksApp({ authUser, onLogout, onChangePassword }) {
   const scopedStore = useMemo(() => createScopedStore(authUser.id, store), [authUser.id])
   const [txns, setTxns] = useState(null)
   const [page, setPage] = useState("dash")
   const [loading, setLoading] = useState(true)
   const [modal, setModal] = useState(null)
+  const [settingsPwd, setSettingsPwd] = useState({ current: "", next: "", confirm: "" })
+  const [settingsSaving, setSettingsSaving] = useState(false)
   const [editManualClientId, setEditManualClientId] = useState(null)
   const [editClientPresetKey, setEditClientPresetKey] = useState(null)
   const [coDraft, setCoDraft] = useState(emptyCompanyFormDraft)
@@ -3075,6 +3181,42 @@ function BooksApp({ authUser, onLogout }) {
     },
     [scopedStore]
   )
+
+  const savePasswordFromSettings = useCallback(async () => {
+    const currentPassword = String(settingsPwd.current || "")
+    const newPassword = String(settingsPwd.next || "")
+    const confirmPassword = String(settingsPwd.confirm || "")
+    if (!currentPassword || !newPassword || !confirmPassword) {
+      toast_("Please fill all password fields", "#f43f5e")
+      return
+    }
+    if (newPassword.length < 8) {
+      toast_("New password must be at least 8 characters", "#f43f5e")
+      return
+    }
+    if (newPassword !== confirmPassword) {
+      toast_("New password and confirm password do not match", "#f43f5e")
+      return
+    }
+    if (newPassword === currentPassword) {
+      toast_("New password must be different from current password", "#f43f5e")
+      return
+    }
+    if (typeof onChangePassword !== "function") {
+      toast_("Password change is not available right now", "#f43f5e")
+      return
+    }
+    try {
+      setSettingsSaving(true)
+      await onChangePassword(currentPassword, newPassword)
+      setSettingsPwd({ current: "", next: "", confirm: "" })
+      toast_("Password changed successfully", "#10b981")
+    } catch (e) {
+      toast_(String(e?.message || "Could not change password"), "#f43f5e")
+    } finally {
+      setSettingsSaving(false)
+    }
+  }, [settingsPwd, onChangePassword])
 
   const deleteCompany = useCallback(
     async id => {
@@ -7876,21 +8018,36 @@ ${buildInvoicePrintDocumentHtml({
               <div style={{ fontSize: 9, color: "#475569" }}>{repFy ? formatFyLabel(repFy) : "All FYs"}</div>
             </div>
           </div>
-          <button
-            type="button"
-            onClick={() => {
-              if (window.confirm("Log out? Your data stays saved on this device for this account.")) onLogout()
-            }}
-            style={{
-              ...S.btnO,
-              width: "100%",
-              justifyContent: "center",
-              fontSize: 11,
-              color: "#64748b",
-            }}
-          >
-            Log out
-          </button>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+            <button
+              type="button"
+              onClick={() => setModal("settings")}
+              style={{
+                ...S.btnO,
+                width: "100%",
+                justifyContent: "center",
+                fontSize: 11,
+                color: "#0369a1",
+              }}
+            >
+              Settings
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                if (window.confirm("Log out? Your data stays saved on this device for this account.")) onLogout()
+              }}
+              style={{
+                ...S.btnO,
+                width: "100%",
+                justifyContent: "center",
+                fontSize: 11,
+                color: "#64748b",
+              }}
+            >
+              Log out
+            </button>
+          </div>
         </div>
       </div>
 
@@ -8452,6 +8609,80 @@ ${buildInvoicePrintDocumentHtml({
             </F>
           </div>
         </AddClientAccordion>
+      </Modal>
+
+      <Modal
+        open={modal === "settings"}
+        title="Settings"
+        wide
+        onClose={() => setModal(null)}
+        onSave={savePasswordFromSettings}
+        saveDisabled={settingsSaving || acctRole === "Viewer"}
+        saveLabel={acctRole === "Viewer" ? "View-only" : settingsSaving ? "Saving..." : "Change password"}
+      >
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+          <div style={{ background: SKY.surface, border: `1px solid ${SKY.border}`, borderRadius: 10, padding: 12 }}>
+            <div style={{ fontSize: 12, fontWeight: 700, color: SKY.text2, marginBottom: 10 }}>User profile</div>
+            <div style={{ fontSize: 11, color: "#64748b", marginBottom: 4 }}>Email</div>
+            <div style={{ fontSize: 12, color: "#0c4a6e", fontWeight: 700, marginBottom: 10 }}>{authUser.email}</div>
+            <div style={{ fontSize: 11, color: "#64748b", marginBottom: 4 }}>Role</div>
+            <div style={{ fontSize: 12, color: "#0c4a6e", fontWeight: 700, marginBottom: 10 }}>{acctRole}</div>
+            <div style={{ fontSize: 11, color: "#64748b", marginBottom: 4 }}>Active FY</div>
+            <div style={{ fontSize: 12, color: "#0c4a6e", fontWeight: 700 }}>{repFy ? formatFyLabel(repFy) : "All FYs"}</div>
+          </div>
+
+          <div style={{ background: SKY.surface, border: `1px solid ${SKY.border}`, borderRadius: 10, padding: 12 }}>
+            <div style={{ fontSize: 12, fontWeight: 700, color: SKY.text2, marginBottom: 10 }}>Company settings</div>
+            <div style={{ fontSize: 11, color: "#64748b", marginBottom: 4 }}>Active company</div>
+            <div style={{ fontSize: 12, color: "#0c4a6e", fontWeight: 700, marginBottom: 10 }}>
+              {activeCompany?.name || "Company"}
+            </div>
+            <div style={{ fontSize: 11, color: "#64748b", marginBottom: 12 }}>
+              Update legal name, GSTIN, address, bank details, logo and invoice footer from Companies.
+            </div>
+            <button
+              type="button"
+              onClick={() => setModal("companies")}
+              style={{ ...S.btnO, fontSize: 11, color: "#0369a1", borderColor: "#7dd3fc" }}
+            >
+              Open company settings
+            </button>
+          </div>
+        </div>
+
+        <div style={{ marginTop: 14, background: "#ffffff", border: `1px solid ${SKY.border}`, borderRadius: 10, padding: 12 }}>
+          <div style={{ fontSize: 12, fontWeight: 700, color: SKY.text2, marginBottom: 10 }}>Change password</div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+            <F label="Current password">
+              <input
+                type="password"
+                value={settingsPwd.current}
+                onChange={e => setSettingsPwd(p => ({ ...p, current: e.target.value }))}
+                style={IS}
+                placeholder="Enter current password"
+              />
+            </F>
+            <div />
+            <F label="New password">
+              <input
+                type="password"
+                value={settingsPwd.next}
+                onChange={e => setSettingsPwd(p => ({ ...p, next: e.target.value }))}
+                style={IS}
+                placeholder="Minimum 8 characters"
+              />
+            </F>
+            <F label="Confirm new password">
+              <input
+                type="password"
+                value={settingsPwd.confirm}
+                onChange={e => setSettingsPwd(p => ({ ...p, confirm: e.target.value }))}
+                style={IS}
+                placeholder="Re-enter new password"
+              />
+            </F>
+          </div>
+        </div>
       </Modal>
 
       <Modal
@@ -9417,7 +9648,7 @@ ${buildInvoicePrintDocumentHtml({
 }
 
 export default function App() {
-  const { user, activeCompany, loading, onboardingStep, logout } = useAuth()
+  const { user, activeCompany, loading, onboardingStep, logout, changePasswordRequest } = useAuth()
 
   if (loading) {
     return (
@@ -9440,6 +9671,7 @@ export default function App() {
         lastName: user.lastName,
       }}
       onLogout={logout}
+      onChangePassword={changePasswordRequest}
     />
   )
 }

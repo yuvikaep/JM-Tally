@@ -198,6 +198,10 @@ export function AuthProvider({ children }) {
     return api.resetPassword({ email, otp, newPassword })
   }, [])
 
+  const changePasswordRequest = useCallback(async (currentPassword, newPassword) => {
+    return api.changePassword({ currentPassword, newPassword })
+  }, [])
+
   const value = {
     user,
     companies,
@@ -219,6 +223,7 @@ export function AuthProvider({ children }) {
     sendPasswordReset,
     verifyOtpRequest,
     resetPasswordRequest,
+    changePasswordRequest,
   }
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>

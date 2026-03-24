@@ -103,3 +103,7 @@ export async function verifyOtp(payload) {
 export async function resetPassword(payload) {
   return request("/api/auth/reset-password", { method: "POST", body: payload })
 }
+
+export async function changePassword(payload) {
+  return request("/api/auth/change-password", { method: "POST", body: payload, auth: true })
+}
