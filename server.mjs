@@ -44,6 +44,70 @@ function cleanDatabaseUrl(raw) {
   return s
 }
 
+function looksLikePgUrl(s) {
+  return /^postgres(ql)?:\/\//i.test(String(s || "").trim())
+}
+
+function splitPgUrlParts(rawUrl) {
+  const u = String(rawUrl || "")
+  const m = u.match(/^(postgres(?:ql)?):\/\/([\s\S]*)$/i)
+  if (!m) return null
+  const scheme = m[1]
+  const rest = m[2]
+  const firstDelim = (() => {
+    const idxs = [rest.indexOf("/"), rest.indexOf("?"), rest.indexOf("#")].filter(i => i >= 0)
+    return idxs.length ? Math.min(...idxs) : -1
+  })()
+  const authority = firstDelim === -1 ? rest : rest.slice(0, firstDelim)
+  const tail = firstDelim === -1 ? "" : rest.slice(firstDelim)
+  return { scheme, authority, tail }
+}
+
+/**
+ * Render env var mistakes we can automatically recover from:
+ * - Wrapping quotes/newlines (handled in cleanDatabaseUrl)
+ * - Password contains reserved URI characters (notably @ # ? / space)
+ * Node-postgres uses WHATWG URL parsing internally and throws ERR_INVALID_URL.
+ */
+function repairDatabaseUrlIfNeeded(cleaned) {
+  const s = String(cleaned || "").trim()
+  if (!s || !looksLikePgUrl(s)) return s
+
+  // If the platform parser accepts it, leave it alone.
+  try {
+    // eslint-disable-next-line no-new
+    new URL(s)
+    return s
+  } catch {
+    /* try to repair below */
+  }
+
+  const parts = splitPgUrlParts(s)
+  if (!parts) return s
+  const { scheme, authority, tail } = parts
+
+  const lastAt = authority.lastIndexOf("@")
+  if (lastAt === -1) return s
+
+  const userInfo = authority.slice(0, lastAt)
+  const hostPort = authority.slice(lastAt + 1)
+  if (!hostPort) return s
+
+  const colon = userInfo.indexOf(":")
+  if (colon === -1) return s
+
+  const user = userInfo.slice(0, colon)
+  const pass = userInfo.slice(colon + 1)
+
+  // Only encode when it likely contains reserved characters that break parsing.
+  const needsEnc = /[@#/?\s]/.test(pass) || /[@#/?\s]/.test(user)
+  if (!needsEnc) return s
+
+  const encUser = encodeURIComponent(user)
+  const encPass = encodeURIComponent(pass)
+  return `${scheme}://${encUser}:${encPass}@${hostPort}${tail}`
+}
+
 /** Supabase transaction pooler (6543 / pooler host) needs pgbouncer=true for node-pg. */
 function appendSupabasePoolerParam(url) {
   if (!url) return url
@@ -66,19 +130,26 @@ function getPool() {
   if (!DATABASE_URL) return null
   if (!pool) {
     const cleaned = cleanDatabaseUrl(DATABASE_URL)
-    let connStr = cleaned
+    let connStr = repairDatabaseUrlIfNeeded(cleaned)
     try {
-      connStr = appendSupabasePoolerParam(cleaned)
+      connStr = appendSupabasePoolerParam(connStr)
     } catch (e) {
       console.warn("appendSupabasePoolerParam:", e?.message)
     }
-    pool = new Pool({
-      connectionString: connStr,
-      ssl: pgSslOption(),
-      max: 20,
-      idleTimeoutMillis: 30000,
-      connectionTimeoutMillis: 20000,
-    })
+    try {
+      pool = new Pool({
+        connectionString: connStr,
+        ssl: pgSslOption(),
+        max: 20,
+        idleTimeoutMillis: 30000,
+        connectionTimeoutMillis: 20000,
+      })
+    } catch (e) {
+      console.error(
+        "Invalid DATABASE_URL for pg. In Render set DATABASE_URL to a single-line postgresql:// URI with no quotes; URL-encode special characters in the password."
+      )
+      throw e
+    }
   }
   return pool
 }
