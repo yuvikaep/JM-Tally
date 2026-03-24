@@ -54,12 +54,11 @@ function splitPgUrlParts(rawUrl) {
   if (!m) return null
   const scheme = m[1]
   const rest = m[2]
-  const firstDelim = (() => {
-    const idxs = [rest.indexOf("/"), rest.indexOf("?"), rest.indexOf("#")].filter(i => i >= 0)
-    return idxs.length ? Math.min(...idxs) : -1
-  })()
-  const authority = firstDelim === -1 ? rest : rest.slice(0, firstDelim)
-  const tail = firstDelim === -1 ? "" : rest.slice(firstDelim)
+  // IMPORTANT: only "/" reliably separates authority from path.
+  // If the password contains "?" or "#", splitting authority on those characters prevents us from repairing it.
+  const slash = rest.indexOf("/")
+  const authority = slash === -1 ? rest : rest.slice(0, slash)
+  const tail = slash === -1 ? "" : rest.slice(slash)
   return { scheme, authority, tail }
 }
 
