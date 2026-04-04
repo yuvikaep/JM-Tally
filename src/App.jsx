@@ -423,6 +423,8 @@ function normalizeInvoiceRow(inv) {
   if (!Number.isFinite(paidTdsTotal)) paidTdsTotal = 0
   paidBankTotal = Math.max(0, Math.min(paidBankTotal, cap))
   paidTdsTotal = Math.max(0, Math.min(paidTdsTotal, cap))
+  const qRaw = Number(inv.qty)
+  const qty = Number.isFinite(qRaw) && qRaw > 0 ? qRaw : 1
   return {
     id: inv.id,
     num: String(inv.num || ""),
@@ -431,6 +433,7 @@ function normalizeInvoiceRow(inv) {
     client: String(inv.client || ""),
     gstin: String(inv.gstin || ""),
     sac: String(inv.sac || "998314"),
+    qty,
     taxable: t,
     gst_rate: g,
     cgst,
@@ -453,13 +456,64 @@ function normalizeInvoiceRow(inv) {
   }
 }
 
-function suggestNextInvoiceNum(list) {
+function escapeRegExp(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+}
+
+/** Next invoice # for `PREFIX-0001` style. Uses company prefix when set; falls back to max trailing digits if no prefix match. */
+function suggestNextInvoiceNum(list, seriesPrefix) {
+  const pfx = String(seriesPrefix ?? "INV").trim() || "INV"
+  const re = new RegExp(`^${escapeRegExp(pfx)}-(\\d+)$`, "i")
   let max = 0
+  let anySeries = false
   for (const inv of list || []) {
-    const parts = String(inv.num || "").match(/\d+/g)
-    if (parts) for (const x of parts) max = Math.max(max, parseInt(x, 10))
+    const m = String(inv.num || "").trim().match(re)
+    if (m) {
+      anySeries = true
+      max = Math.max(max, parseInt(m[1], 10))
+    }
   }
-  return `INV-${String(max + 1).padStart(4, "0")}`
+  if (!anySeries) {
+    for (const inv of list || []) {
+      const parts = String(inv.num || "").match(/\d+/g)
+      if (parts) for (const x of parts) max = Math.max(max, parseInt(x, 10))
+    }
+  }
+  return `${pfx}-${String(max + 1).padStart(4, "0")}`
+}
+
+/** Pre-GST line amount from qty × unit rate (qty defaults to 1). */
+function parseInvoiceQty(raw) {
+  const q = parseFloat(String(raw ?? "1").replace(/,/g, ""))
+  if (!Number.isFinite(q) || q <= 0) return 1
+  return q
+}
+
+function lineTaxableFromNi(ni) {
+  const qty = parseInvoiceQty(ni?.qty)
+  const r = parseFloat(String(ni?.unitRate ?? "").replace(/,/g, "")) || 0
+  return Math.round(qty * r * 100) / 100
+}
+
+/** Suggest payment terms from the most recent invoice to the same client (name + GSTIN). */
+function suggestDueFromLastClientInvoice(invoices, clientName, gstin, invoiceDateIso) {
+  const key = clientKeyInv({ client: clientName, gstin })
+  if (!String(clientName || "").trim()) return null
+  let best = null
+  for (const inv of invoices || []) {
+    if (clientKeyInv(inv) !== key) continue
+    const ts = String(inv.createdAt || inv.date || "")
+    if (!best || ts >= best._ts) best = { inv, _ts: ts }
+  }
+  if (!best) return null
+  const d0 = Date.parse(best.inv.date)
+  const d1 = Date.parse(best.inv.dueDate || best.inv.date)
+  if (!Number.isFinite(d0) || !Number.isFinite(d1)) return null
+  const dd = Math.max(0, Math.round((d1 - d0) / 86400000))
+  return {
+    dueDays: String(dd),
+    dueDate: addDaysISO(invoiceDateIso, dd),
+  }
 }
 
 /** One row per distinct client+GSTIN from past invoices (latest row wins for defaults). */
@@ -654,6 +708,7 @@ function emptyCompanyFormDraft() {
     gstin: "",
     pan: "",
     currency: "INR",
+    invoiceSeriesPrefix: "INV",
     invoiceFooterEmail: "",
     invoiceFooterPhone: "",
   }
@@ -681,6 +736,7 @@ function normalizeCompanyRecord(c) {
     gstin: String(c.gstin || "").trim(),
     pan: String(c.pan || "").trim(),
     currency: String(c.currency || "INR").trim() || "INR",
+    invoiceSeriesPrefix: String(c.invoiceSeriesPrefix || "INV").trim() || "INV",
     invoiceFooterEmail: String(c.invoiceFooterEmail || "").trim(),
     invoiceFooterPhone: String(c.invoiceFooterPhone || "").trim(),
   }
@@ -708,6 +764,7 @@ function companyFromRegistry(c) {
     gstin: n.gstin,
     pan: n.pan,
     currency: n.currency,
+    invoiceSeriesPrefix: n.invoiceSeriesPrefix,
     invoiceFooterEmail: n.invoiceFooterEmail,
     invoiceFooterPhone: n.invoiceFooterPhone,
   }
@@ -2249,7 +2306,7 @@ function Chat({
           .concat([{ role: "ai", text: `**Error:** ${String(e?.message || e).slice(0, 220)}` }])
       )
     } finally {
-      setBusy(false)
+    setBusy(false)
     }
   }
 
@@ -2305,7 +2362,7 @@ function Chat({
               >
                 Enterprise protocol
               </span>
-            </div>
+          </div>
             <div style={{ display: "flex", gap: 6 }}>
               <button type="button" onClick={() => setAiTab("chat")} style={tabBtn(aiTab === "chat")}>
                 Chat
@@ -2313,7 +2370,7 @@ function Chat({
               <button type="button" onClick={() => setAiTab("rules")} style={tabBtn(aiTab === "rules")}>
                 Rules & templates
               </button>
-            </div>
+        </div>
           </div>
           <div style={{ fontSize: 11, color: "#64748b", marginTop: 6, lineHeight: 1.45 }}>
             {aiTab === "chat"
@@ -2471,7 +2528,7 @@ function Chat({
                       }
                     }}
                   />
-                </div>
+                  </div>
               )
             }
             if (m.role === "memory_confirm" && m.memoryId) {
@@ -2782,7 +2839,8 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
     dueDate: addDaysISO(todayISO(), 30),
     client: "",
     gstin: "",
-    taxable: "",
+    qty: "1",
+    unitRate: "",
     gst_rate: "18",
     sac: "998314",
     itemName: "",
@@ -2874,7 +2932,7 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
         setAssistantMemory(normalizeAssistantMemory(st?.assistantMemory))
         setManualClients(normalizeManualClients(st?.manualClients))
       } finally {
-        setLoading(false)
+      setLoading(false)
       }
     })()
   }, [scopedStore])
@@ -3683,13 +3741,14 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
     setInvoiceModalEditId(null)
     const d = todayISO()
     setNi({
-      num: suggestNextInvoiceNum(invoices),
+      num: suggestNextInvoiceNum(invoices, activeCompany?.invoiceSeriesPrefix),
       date: d,
       dueDays: "30",
       dueDate: addDaysISO(d, 30),
       client: "",
       gstin: "",
-      taxable: "",
+      qty: "1",
+      unitRate: "",
       gst_rate: "18",
       sac: "998314",
       itemName: "",
@@ -3715,6 +3774,9 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
     const dd = Number.isFinite(d0) && Number.isFinite(d1) ? Math.max(0, Math.round((d1 - d0) / 86400000)) : 30
     setInvoiceModalEditId(inv.id)
     const split = splitStoredInvoiceDesc(inv.desc)
+    const t = Number(inv.taxable) || 0
+    const q = Number(inv.qty) > 0 ? Number(inv.qty) : 1
+    const ur = q > 0 ? t / q : t
     setNi({
       num: inv.num,
       date: inv.date,
@@ -3722,7 +3784,8 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
       dueDate: inv.dueDate || inv.date,
       client: inv.client,
       gstin: inv.gstin,
-      taxable: String(inv.taxable ?? ""),
+      qty: String(q),
+      unitRate: ur ? String(Number.isFinite(ur) ? Math.round(ur * 1e6) / 1e6 : ur) : "",
       gst_rate: String(inv.gst_rate ?? "18"),
       sac: inv.sac || "998314",
       itemName: split.itemName,
@@ -3740,7 +3803,7 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
 
   const duplicateInvoice = inv => {
     if (acctRole === "Viewer") return
-    const nextNum = suggestNextInvoiceNum(invoices)
+    const nextNum = suggestNextInvoiceNum(invoices, activeCompany?.invoiceSeriesPrefix)
     const d = todayISO()
     const g = computeInvoiceGst(inv.taxable, inv.gst_rate, inv.place)
     const copy = normalizeInvoiceRow({
@@ -3751,6 +3814,7 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
       client: inv.client,
       gstin: inv.gstin,
       sac: inv.sac || "998314",
+      qty: Number(inv.qty) > 0 ? Number(inv.qty) : 1,
       taxable: inv.taxable,
       gst_rate: inv.gst_rate,
       cgst: g.cgst,
@@ -3854,6 +3918,20 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
     () => mergeManualClientsIntoPresets(manualClients, invoiceClientPresetsFromList(invoices)),
     [manualClients, invoices]
   )
+
+  const invoiceDescSuggestions = useMemo(() => {
+    const seen = new Set()
+    const out = []
+    for (const inv of invoices || []) {
+      const t = String(splitStoredInvoiceDesc(inv.desc).descExtra || "").trim()
+      if (t && !seen.has(t)) {
+        seen.add(t)
+        out.push(t)
+        if (out.length >= 24) break
+      }
+    }
+    return out
+  }, [invoices])
 
   useEffect(() => {
     if (modal !== "addClient") return
@@ -4072,38 +4150,52 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
       const manual = manualClients.find(m => manualClientKey(m) === key)
       const clientAddress = manual ? formatManualClientAddressForInvoice(manual) : String(row.clientAddress || "")
       const clientPan = manual ? String(manual.pan || "").trim() : String(row.clientPan || "")
-      setNi(p => ({
-        ...p,
-        clientPresetKey: key,
-        client: row.client,
-        gstin: row.gstin,
-        place: row.place,
-        sac: row.sac,
-        revenueCategory: row.revenueCategory,
-        clientAddress,
-        clientPan,
-      }))
+      setNi(p => {
+        const base = {
+          ...p,
+          clientPresetKey: key,
+          client: row.client,
+          gstin: row.gstin,
+          place: row.place,
+          sac: row.sac,
+          revenueCategory: row.revenueCategory,
+          clientAddress,
+          clientPan,
+        }
+        const sug = suggestDueFromLastClientInvoice(invoices, row.client, row.gstin, p.date)
+        if (sug) return { ...base, dueDays: sug.dueDays, dueDate: sug.dueDate }
+        return base
+      })
     },
-    [invoiceClientPresets, manualClients]
+    [invoiceClientPresets, manualClients, invoices]
   )
+
+  const maybeApplyClientDueFromHistory = useCallback(() => {
+    if (modal !== "inv" || invoiceModalEditId != null) return
+    setNi(p => {
+      const sug = suggestDueFromLastClientInvoice(invoices, p.client, p.gstin, p.date)
+      if (!sug) return p
+      const expectedDue = addDaysISO(p.date, parseInt(p.dueDays, 10) || 30)
+      if (p.dueDate !== expectedDue) return p
+      return { ...p, dueDays: sug.dueDays, dueDate: sug.dueDate }
+    })
+  }, [modal, invoiceModalEditId, invoices])
 
   const saveInvoiceFromModal = () => {
     if (acctRole === "Viewer") return
-    const g = computeInvoiceGst(ni.taxable, ni.gst_rate, ni.place)
-    const taxable = parseFloat(String(ni.taxable).replace(/,/g, "")) || 0
+    const taxable = lineTaxableFromNi(ni)
+    const g = computeInvoiceGst(taxable, ni.gst_rate, ni.place)
+    const numFinal = (ni.num.trim() || suggestNextInvoiceNum(invoices, activeCompany?.invoiceSeriesPrefix)).trim()
+    const qtySaved = parseInvoiceQty(ni.qty)
     if (!ni.client.trim()) {
       toast_("Enter client name", "#f43f5e")
       return
     }
-    if (!ni.num.trim()) {
-      toast_("Enter invoice number", "#f43f5e")
-      return
-    }
     if (!taxable || taxable <= 0) {
-      toast_("Enter taxable value (pre-GST)", "#f43f5e")
+      toast_("Enter quantity × rate (taxable value pre-GST)", "#f43f5e")
       return
     }
-    if (invoices.some(x => x.num === ni.num.trim() && x.id !== invoiceModalEditId)) {
+    if (invoices.some(x => x.num === numFinal && x.id !== invoiceModalEditId)) {
       toast_("Duplicate invoice #", "#f43f5e")
       return
     }
@@ -4122,12 +4214,13 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
       const prevTds = Math.min(Number(prev.paidTdsTotal) || 0, Math.max(0, cap - prevBank))
       const next = normalizeInvoiceRow({
         ...prev,
-        num: ni.num.trim(),
+        num: numFinal,
         date: ni.date,
         dueDate,
         client: ni.client.trim(),
         gstin: ni.gstin.trim(),
         sac: ni.sac.trim(),
+        qty: qtySaved,
         taxable,
         gst_rate: parseFloat(ni.gst_rate) || 0,
         cgst: g.cgst,
@@ -4158,12 +4251,13 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
 
     const inv = normalizeInvoiceRow({
       id: Math.max(0, ...invoices.map(x => x.id)) + 1,
-      num: ni.num.trim(),
+      num: numFinal,
       date: ni.date,
       dueDate,
       client: ni.client.trim(),
       gstin: ni.gstin.trim(),
       sac: ni.sac.trim(),
+      qty: qtySaved,
       taxable,
       gst_rate: parseFloat(ni.gst_rate) || 0,
       cgst: g.cgst,
@@ -4193,9 +4287,9 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
   }
 
   const printInvoiceDraft = () => {
-    const g = computeInvoiceGst(ni.taxable, ni.gst_rate, ni.place)
+    const taxable = lineTaxableFromNi(ni)
+    const g = computeInvoiceGst(taxable, ni.gst_rate, ni.place)
     const co = activeCompany
-    const taxable = parseFloat(String(ni.taxable).replace(/,/g, "")) || 0
     const lineLabel = String(ni.itemName || "").trim() || "Line item"
     const lineDetail = String(ni.desc || "").trim()
     const gstPct = String(ni.gst_rate || "0")
@@ -4221,6 +4315,7 @@ ${buildInvoicePrintDocumentHtml({
       gstPct,
       g,
       notes: ni.notes,
+      qty: parseInvoiceQty(ni.qty),
     })}
 </body></html>`
     if (!printHtmlDocument(html)) {
@@ -4260,6 +4355,7 @@ ${buildInvoicePrintDocumentHtml({
       gstPct,
       g,
       notes: inv.notes,
+      qty: Number(inv.qty) > 0 ? Number(inv.qty) : 1,
     })}
 </body></html>`
     if (!printHtmlDocument(html)) {
@@ -4526,8 +4622,8 @@ ${buildInvoicePrintDocumentHtml({
         <img src="/logo.png" alt="" width={56} height={56} style={{ objectFit: "contain", animation: "spin 1.1s linear infinite" }} />
         <div style={{ fontSize: 15, fontWeight: 800, color: JM.p, letterSpacing: "-0.02em" }}>JM Tally</div>
         <div style={{ fontSize: 12, color: "#64748b", fontWeight: 600 }}>Loading books…</div>
-      </div>
-    )
+    </div>
+  )
 
   const S = {
     wrap: { display: "flex", height: "100vh", overflow: "hidden", background: SKY.page, fontFamily: "'DM Sans',system-ui,sans-serif", fontSize: 13, color: SKY.text },
@@ -4820,7 +4916,7 @@ ${buildInvoicePrintDocumentHtml({
                     <span style={{fontWeight:700,fontFamily:"monospace"}}>
                       ₹{inr0(v)} <span style={{color:"#475569",fontWeight:400}}>({pct}%)</span>
                     </span>
-                  </div>
+            </div>
                   <div style={{ height: 4, background: "#e0f2fe", borderRadius: 10, overflow: "hidden" }}>
                     <div style={{height:"100%",background:c,borderRadius:10,width:Math.min(100,pct)+"%"}}/>
                   </div>
@@ -4831,7 +4927,7 @@ ${buildInvoicePrintDocumentHtml({
         </div>
       </div>
     </div>
-    )
+  )
   }
 
   const Txn = () => {
@@ -5225,7 +5321,7 @@ ${buildInvoicePrintDocumentHtml({
 
         {invPrimaryTab === "overview" ? (
           <>
-            <div style={S.g4}>
+        <div style={S.g4}>
               <Stat label="Outstanding (invoices)" value={"₹" + inr0(outstand)} sub={String(invoices.length) + " issued"} color="#f59e0b" />
               <Stat label="Overdue" value={String(overdueN)} sub="Past due date & unpaid" color={overdueN ? "#f43f5e" : "#94a3b8"} />
               <Stat label="GST on open balance (est.)" value={"₹" + inr0(gstOpen)} sub="CGST+SGST or IGST" color="#5563E8" />
@@ -6201,8 +6297,8 @@ ${buildInvoicePrintDocumentHtml({
               <Stat label="Capital & other credits" value={"₹" + inr0(oth.reduce((s, t) => s + t.amount, 0))} sub={String(oth.length) + " lines"} color="#f59e0b" />
               <Stat label="IT refund (CR)" value={"₹" + inr0(oth.filter(t => t.category === "Income Tax Refund").reduce((s, t) => s + t.amount, 0))} color="#10b981" />
               <Stat label="NEFT return (CR)" value={"₹" + inr0(oth.filter(t => t.category === "NEFT Return").reduce((s, t) => s + t.amount, 0))} color="#94a3b8" />
-            </div>
-            <div style={S.tabs}>
+        </div>
+        <div style={S.tabs}>
               {[
                 ["rev", "Revenue credits"],
                 ["oth", "Capital & other"],
@@ -6211,11 +6307,11 @@ ${buildInvoicePrintDocumentHtml({
                   {l}
                 </button>
               ))}
-            </div>
+        </div>
             <Tbl cols={bankCols} rows={iTab === "rev" ? rev : oth} empty="No rows for this filter." />
           </>
         ) : null}
-      </div>
+        </div>
     )
   }
 
@@ -7433,8 +7529,8 @@ ${buildInvoicePrintDocumentHtml({
       ],
     ]
     return (
-      <div>
-        <div style={S.tabs}>
+    <div>
+      <div style={S.tabs}>
           {[
             ["pl", "P&L"],
             ["bs", "Balance Sheet"],
@@ -7446,10 +7542,10 @@ ${buildInvoicePrintDocumentHtml({
               {l}
             </button>
           ))}
-        </div>
+      </div>
         {rTab === "pl" && (
           <div>
-            <div style={S.g2}>
+        <div style={S.g2}>
               <div style={{ ...S.card, maxHeight: 360, overflowY: "auto" }}>
                 <div style={{ fontSize: 12, fontWeight: 700, color: "#10b981", marginBottom: 12 }}>📈 Credits (by category)</div>
                 {crByCat.length === 0 ? (
@@ -7459,13 +7555,13 @@ ${buildInvoicePrintDocumentHtml({
                     <div key={n} style={{ display: "flex", justifyContent: "space-between", padding: "3px 0", borderBottom: "1px solid #e0f2fe", fontSize: 11.5 }}>
                       <span style={{ color: "#94a3b8" }}>{n}</span>
                       <span style={{ color: "#10b981", fontFamily: "monospace", fontWeight: 700 }}>₹{inr0(v)}</span>
-                    </div>
+        </div>
                   ))
                 )}
                 <div style={{ display: "flex", justifyContent: "space-between", padding: "7px 0", fontSize: 13, fontWeight: 800 }}>
                   <span>Total credits</span>
                   <span style={{ color: "#10b981", fontFamily: "monospace" }}>₹{inr0(plTotalCr)}</span>
-                </div>
+        </div>
               </div>
               <div style={{ ...S.card, maxHeight: 360, overflowY: "auto" }}>
                 <div style={{ fontSize: 12, fontWeight: 700, color: "#f43f5e", marginBottom: 12 }}>📉 Debits (by category)</div>
@@ -7604,8 +7700,8 @@ ${buildInvoicePrintDocumentHtml({
                 <div key={i} style={{ display: "flex", justifyContent: "space-between", padding: "3px 0 3px 14px", borderBottom: "1px solid #e0f2fe", fontSize: 11.5, fontWeight: b ? 700 : 400 }}>
                   <span style={{ color: "#94a3b8" }}>{l}</span>
                   <span style={{ fontFamily: "monospace", fontWeight: 700, color: c || "#0c4a6e" }}>{v}</span>
-                </div>
-              )
+    </div>
+  )
             )}
           </div>
         )}
@@ -7663,7 +7759,7 @@ ${buildInvoicePrintDocumentHtml({
           s: r.status || "ok",
         }))
         return (
-          <div>
+        <div>
             <div style={S.g4}>
               <Stat label="Total Items" value={String(inventory.length)} />
               <Stat label="Asset Value" value={"₹" + inr0(invVal)} />
@@ -7690,14 +7786,14 @@ ${buildInvoicePrintDocumentHtml({
               rows={rows}
               empty="No inventory — add items after you upload purchase data."
             />
-          </div>
-        )
+        </div>
+      )
       }
       case "rec": {
         const creds = ledger.filter(t => !t.void && t.drCr === "CR")
         const n = creds.length
         return (
-          <div>
+        <div>
             <div style={S.g4}>
               <Stat label="Credit lines" value={String(n)} />
               <Stat label="With category" value={String(n)} color="#10b981" />
@@ -7720,8 +7816,8 @@ ${buildInvoicePrintDocumentHtml({
               rows={creds.slice(-10).reverse()}
               empty="No credit transactions yet."
             />
-          </div>
-        )
+        </div>
+      )
       }
       case "bulk": return (
         <div>
@@ -7772,7 +7868,7 @@ ${buildInvoicePrintDocumentHtml({
               <div style={{display:"flex",gap:7}}>
                 {importHistory.length>0&&<button type="button" onClick={()=>{if(confirm("Clear import history list?"))setImportHistory([])}} style={{...S.btnO,fontSize:11,color:"#f43f5e",borderColor:"rgba(244,63,94,.35)"}}>Clear list</button>}
                 <button type="button" onClick={()=>{const h="Date,Narration,Remarks,Withdrawal,Deposit,Balance\n24/01/2025,NEFT IN-123/ACME Pvt Ltd,Invoice 1042 · GST period Mar,0,24360,150000\n24/01/2025,UPI-SALARY,,25000,0,125000\n";const b=new Blob([h],{type:"text/csv"});const a=document.createElement("a");a.href=URL.createObjectURL(b);a.download="jm_tally_template.csv";a.click()}} style={{...S.btnO,fontSize:11}}>⬇ Template</button>
-              </div>
+            </div>
             </div>
             <Tbl cols={[{h:"Date",k:"d"},{h:"File",k:"f"},{h:"Period",k:"p"},{h:"Txns",k:"t"},{h:"Status",cell:r=><Chip cat={r.status==="Done"?"Revenue":r.status==="Failed"?"Director Payment":r.status==="Nothing new"?"Bank Charges":"Bank Charges"} label={String(r.status)}/>}]} rows={importHistory} empty="No imports yet — upload a CSV or Excel statement to import."/>
           </div>
@@ -7797,9 +7893,9 @@ ${buildInvoicePrintDocumentHtml({
               <div style={{ fontSize: 13.5, fontWeight: 800, color: JM.p }}>JM Tally</div>
               <div style={{ fontSize: 9, color: JM.p, textTransform: "uppercase", letterSpacing: ".5px", marginTop: 1, fontWeight: 700 }} title={activeCompany?.legalName || ""}>
                 {activeCompany?.name || "Company"}
-              </div>
             </div>
           </div>
+        </div>
         </div>
         <div style={{ margin: "10px 12px 6px", background: JM.cardTint, border: `1px solid ${JM.r(0.22)}`, borderRadius: 9, padding: "10px 12px" }}>
           <div style={{fontSize:9,color:"#475569",fontWeight:600,letterSpacing:".5px",textTransform:"uppercase"}}>Bank balance</div>
@@ -7856,14 +7952,14 @@ ${buildInvoicePrintDocumentHtml({
                     }}
                   >
                     <span style={{ opacity: page === k ? 1 : 0.6, fontSize: ic === "🧾" ? 13 : 12, width: 16, textAlign: "center", flexShrink: 0, lineHeight: 1.2 }}>{ic}</span>
-                    <span>{pages[k]}</span>
+                  <span>{pages[k]}</span>
                     {page === k && (
                       <div style={{ position: "absolute", left: 0, top: "25%", bottom: "25%", width: 3, background: JM.p, borderRadius: "0 3px 3px 0" }} />
                     )}
-                  </button>
+                </button>
                 ))
               : null}
-          </div>
+            </div>
           <div style={{ marginBottom: 4, paddingBottom: 8, borderBottom: `1px solid ${SKY.borderHi}` }}>
             <button
               type="button"
@@ -7995,7 +8091,7 @@ ${buildInvoicePrintDocumentHtml({
               }}
             >
               <img src="/logo.png" alt="" width={22} height={22} style={{ objectFit: "contain" }} />
-            </div>
+          </div>
             <div style={{ minWidth: 0, flex: 1 }}>
               <div style={{ fontSize: 11, fontWeight: 700, color: "#0c4a6e" }}>
                 {acctRole}{" "}
@@ -8067,9 +8163,9 @@ ${buildInvoicePrintDocumentHtml({
                   ) : (
                     <span style={{ fontStyle: "italic", opacity: 0.85 }}> · Set bank in Companies</span>
                   )}
-                </div>
-              </div>
-            </div>
+          </div>
+          </div>
+        </div>
             <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", flexShrink: 0 }}>
               <span
                 style={{
@@ -8706,6 +8802,7 @@ ${buildInvoicePrintDocumentHtml({
             gstin: coDraft.gstin.trim(),
             pan: coDraft.pan.trim(),
             currency: coDraft.currency.trim() || "INR",
+            invoiceSeriesPrefix: coDraft.invoiceSeriesPrefix.trim() || "INV",
             bankName: coDraft.bankName.trim(),
             bankAccountName: coDraft.bankAccountName.trim(),
             bankAccountNumber: coDraft.bankAccountNumber.trim(),
@@ -8929,6 +9026,18 @@ ${buildInvoicePrintDocumentHtml({
             <option value="AED">AED</option>
           </select>
         </F>
+        <F label="Invoice number series (prefix)">
+          <input
+            value={coDraft.invoiceSeriesPrefix}
+            onChange={e => setCoDraft(p => ({ ...p, invoiceSeriesPrefix: e.target.value }))}
+            style={IS}
+            disabled={acctRole === "Viewer"}
+            placeholder="INV"
+          />
+        </F>
+        <div style={{ fontSize: 10, color: SKY.muted, marginTop: -6, marginBottom: 10, lineHeight: 1.45 }}>
+          New invoices default to <strong style={{ color: SKY.text2 }}>PREFIX-0001</strong>, <strong style={{ color: SKY.text2 }}>PREFIX-0002</strong>, … using this prefix. You can still edit the number on each invoice.
+        </div>
         <div style={{ fontSize: 10, fontWeight: 700, color: "#64748b", marginBottom: 8, marginTop: 6 }}>INVOICE FOOTER (PRINTED)</div>
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0 16px" }}>
           <F label="Enquiry email (footer line)">
@@ -9066,7 +9175,7 @@ ${buildInvoicePrintDocumentHtml({
         {dangerFlow?.kind === "void" ? (
           <div style={{ fontSize: 12, color: SKY.text2, lineHeight: 1.6, marginBottom: 14 }}>
             The line stays in the books as <strong>voided</strong> (audit trail). It is excluded from balances and reports unless you show voided entries.
-          </div>
+        </div>
         ) : (
           <div style={{ fontSize: 12, color: "#f43f5e", lineHeight: 1.6, marginBottom: 14 }}>
             This <strong>removes</strong> the invoice from the register and <strong>removes auto-posted bank/TDS lines</strong> for this invoice from the ledger (matched by invoice link). Other manual entries are unchanged.
@@ -9193,7 +9302,15 @@ ${buildInvoicePrintDocumentHtml({
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 11 }}>
               <F label="Invoice #">
-                <input value={ni.num} onChange={e => setNi(p => ({ ...p, num: e.target.value }))} style={IS} />
+                <input
+                  value={ni.num}
+                  onChange={e => setNi(p => ({ ...p, num: e.target.value }))}
+                  placeholder={suggestNextInvoiceNum(invoices, activeCompany?.invoiceSeriesPrefix)}
+                  style={IS}
+                />
+                <div style={{ fontSize: 10, color: SKY.muted, marginTop: 4, lineHeight: 1.4 }}>
+                  Next in series is filled automatically; change only if you need a different number.
+                </div>
               </F>
               <F label="Invoice date">
                 <input
@@ -9220,6 +9337,9 @@ ${buildInvoicePrintDocumentHtml({
               </F>
               <F label="Due date">
                 <input type="date" value={ni.dueDate} onChange={e => setNi(p => ({ ...p, dueDate: e.target.value }))} style={IS} />
+                <div style={{ fontSize: 10, color: SKY.muted, marginTop: 4, lineHeight: 1.4 }}>
+                  Choosing a saved client sets due date from their last invoice (you can change it). Typing a known client + GSTIN and tabbing out does the same if due date still matches invoice date + payment days.
+                </div>
               </F>
             </div>
             <div
@@ -9291,6 +9411,7 @@ ${buildInvoicePrintDocumentHtml({
                 <input
                   value={ni.client}
                   onChange={e => setNi(p => ({ ...p, client: e.target.value, clientPresetKey: "" }))}
+                  onBlur={maybeApplyClientDueFromHistory}
                   placeholder="Legal name as on PO / contract"
                   style={IS}
                 />
@@ -9309,6 +9430,7 @@ ${buildInvoicePrintDocumentHtml({
                   <input
                     value={ni.gstin}
                     onChange={e => setNi(p => ({ ...p, gstin: e.target.value, clientPresetKey: "" }))}
+                    onBlur={maybeApplyClientDueFromHistory}
                     placeholder="29AAACS1234F1Z0"
                     style={IS}
                   />
@@ -9355,8 +9477,8 @@ ${buildInvoicePrintDocumentHtml({
           </div>
 
           {(() => {
-            const g = computeInvoiceGst(ni.taxable, ni.gst_rate, ni.place)
-            const taxableNum = parseFloat(String(ni.taxable).replace(/,/g, "")) || 0
+            const taxableNum = lineTaxableFromNi(ni)
+            const g = computeInvoiceGst(taxableNum, ni.gst_rate, ni.place)
             return (
               <>
                 <div style={{ overflowX: "auto", borderRadius: 10, border: "1px solid #c4b5fd" }}>
@@ -9393,6 +9515,25 @@ ${buildInvoicePrintDocumentHtml({
                             placeholder="Item name / SKU"
                             style={{ ...IS, width: "100%", boxSizing: "border-box" }}
                           />
+                          {invoiceDescSuggestions.length > 0 ? (
+                            <select
+                              key={invoiceModalEditId == null ? "inv-desc-new" : `inv-desc-${invoiceModalEditId}`}
+                              defaultValue=""
+                              onChange={e => {
+                                const v = e.target.value
+                                if (v) setNi(p => ({ ...p, desc: v }))
+                                e.target.value = ""
+                              }}
+                              style={{ ...IS, width: "100%", boxSizing: "border-box", marginTop: 6, fontSize: 10, color: SKY.muted }}
+                            >
+                              <option value="">Insert from past invoices…</option>
+                              {invoiceDescSuggestions.map(s => (
+                                <option key={s} value={s}>
+                                  {s.length > 72 ? `${s.slice(0, 72)}…` : s}
+                                </option>
+                              ))}
+                            </select>
+                          ) : null}
                           <textarea
                             value={ni.desc}
                             onChange={e => setNi(p => ({ ...p, desc: e.target.value }))}
@@ -9417,12 +9558,24 @@ ${buildInvoicePrintDocumentHtml({
                             <option value="0">0%</option>
                           </select>
                         </td>
-                        <td style={{ padding: 8, borderTop: "1px solid #e9d5ff", textAlign: "right", color: SKY.muted }}>1</td>
                         <td style={{ padding: 8, borderTop: "1px solid #e9d5ff", textAlign: "right", verticalAlign: "top" }}>
                           <input
                             type="number"
-                            value={ni.taxable}
-                            onChange={e => setNi(p => ({ ...p, taxable: e.target.value }))}
+                            min={0}
+                            step="any"
+                            value={ni.qty}
+                            onChange={e => setNi(p => ({ ...p, qty: e.target.value }))}
+                            placeholder="1"
+                            style={{ ...IS, width: 72, textAlign: "right" }}
+                          />
+                        </td>
+                        <td style={{ padding: 8, borderTop: "1px solid #e9d5ff", textAlign: "right", verticalAlign: "top" }}>
+                          <input
+                            type="number"
+                            min={0}
+                            step="any"
+                            value={ni.unitRate}
+                            onChange={e => setNi(p => ({ ...p, unitRate: e.target.value }))}
                             placeholder="0"
                             style={{ ...IS, width: 88, textAlign: "right" }}
                           />

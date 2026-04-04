@@ -47,6 +47,10 @@ async function request(path, { method = "GET", body, auth = false } = {}) {
       msg =
         "API not reachable from this site. In Vercel → Settings → Environment Variables, set VITE_API_URL to your Render app URL (https://…onrender.com), save, then redeploy the frontend."
     }
+    if (res.status === 502 || res.status === 503) {
+      msg =
+        "Can't reach the API server (bad gateway). For local dev, run the backend in another terminal: npm start (or node server.mjs) with DATABASE_URL and JWT_SECRET set; it listens on port 4173, which Vite proxies to for /api."
+    }
     const err = new Error(msg)
     err.code = data.error
     err.status = res.status
