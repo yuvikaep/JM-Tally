@@ -460,26 +460,24 @@ function escapeRegExp(s) {
   return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
 }
 
-/** Next invoice # for `PREFIX-0001` style. Uses company prefix when set; falls back to max trailing digits if no prefix match. */
+/** Literal prefix before the numeric tail, e.g. `JM-2026-` → `JM-2026-0001`. */
+function normalizeInvoiceSeriesPrefix(raw) {
+  let p = String(raw ?? "").trim()
+  if (!p) p = "INV-"
+  if (p === "INV") p = "INV-"
+  return p
+}
+
+/** Next invoice # = prefix + 4-digit sequence (no extra hyphen — include hyphens in the prefix, e.g. JM-2026-). */
 function suggestNextInvoiceNum(list, seriesPrefix) {
-  const pfx = String(seriesPrefix ?? "INV").trim() || "INV"
-  const re = new RegExp(`^${escapeRegExp(pfx)}-(\\d+)$`, "i")
+  const pfx = normalizeInvoiceSeriesPrefix(seriesPrefix)
+  const re = new RegExp(`^${escapeRegExp(pfx)}(\\d+)$`, "i")
   let max = 0
-  let anySeries = false
   for (const inv of list || []) {
     const m = String(inv.num || "").trim().match(re)
-    if (m) {
-      anySeries = true
-      max = Math.max(max, parseInt(m[1], 10))
-    }
+    if (m) max = Math.max(max, parseInt(m[1], 10))
   }
-  if (!anySeries) {
-    for (const inv of list || []) {
-      const parts = String(inv.num || "").match(/\d+/g)
-      if (parts) for (const x of parts) max = Math.max(max, parseInt(x, 10))
-    }
-  }
-  return `${pfx}-${String(max + 1).padStart(4, "0")}`
+  return `${pfx}${String(max + 1).padStart(4, "0")}`
 }
 
 /** Pre-GST line amount from qty × unit rate (qty defaults to 1). */
@@ -708,7 +706,7 @@ function emptyCompanyFormDraft() {
     gstin: "",
     pan: "",
     currency: "INR",
-    invoiceSeriesPrefix: "INV",
+    invoiceSeriesPrefix: "INV-",
     invoiceFooterEmail: "",
     invoiceFooterPhone: "",
   }
@@ -736,7 +734,7 @@ function normalizeCompanyRecord(c) {
     gstin: String(c.gstin || "").trim(),
     pan: String(c.pan || "").trim(),
     currency: String(c.currency || "INR").trim() || "INR",
-    invoiceSeriesPrefix: String(c.invoiceSeriesPrefix || "INV").trim() || "INV",
+    invoiceSeriesPrefix: normalizeInvoiceSeriesPrefix(c.invoiceSeriesPrefix),
     invoiceFooterEmail: String(c.invoiceFooterEmail || "").trim(),
     invoiceFooterPhone: String(c.invoiceFooterPhone || "").trim(),
   }
@@ -8802,7 +8800,7 @@ ${buildInvoicePrintDocumentHtml({
             gstin: coDraft.gstin.trim(),
             pan: coDraft.pan.trim(),
             currency: coDraft.currency.trim() || "INR",
-            invoiceSeriesPrefix: coDraft.invoiceSeriesPrefix.trim() || "INV",
+            invoiceSeriesPrefix: normalizeInvoiceSeriesPrefix(coDraft.invoiceSeriesPrefix),
             bankName: coDraft.bankName.trim(),
             bankAccountName: coDraft.bankAccountName.trim(),
             bankAccountNumber: coDraft.bankAccountNumber.trim(),
@@ -9032,11 +9030,13 @@ ${buildInvoicePrintDocumentHtml({
             onChange={e => setCoDraft(p => ({ ...p, invoiceSeriesPrefix: e.target.value }))}
             style={IS}
             disabled={acctRole === "Viewer"}
-            placeholder="INV"
+            placeholder="JM-2026-"
           />
         </F>
         <div style={{ fontSize: 10, color: SKY.muted, marginTop: -6, marginBottom: 10, lineHeight: 1.45 }}>
-          New invoices default to <strong style={{ color: SKY.text2 }}>PREFIX-0001</strong>, <strong style={{ color: SKY.text2 }}>PREFIX-0002</strong>, … using this prefix. You can still edit the number on each invoice.
+          Type the full literal prefix before the digits (include hyphens), e.g. <strong style={{ color: SKY.text2 }}>JM-2026-</strong> →{" "}
+          <strong style={{ color: SKY.text2 }}>JM-2026-0001</strong>, <strong style={{ color: SKY.text2 }}>JM-2026-0002</strong>. Default{" "}
+          <strong style={{ color: SKY.text2 }}>INV-</strong> gives <strong style={{ color: SKY.text2 }}>INV-0001</strong>. You can still edit any invoice #.
         </div>
         <div style={{ fontSize: 10, fontWeight: 700, color: "#64748b", marginBottom: 8, marginTop: 6 }}>INVOICE FOOTER (PRINTED)</div>
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0 16px" }}>
