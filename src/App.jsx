@@ -114,6 +114,43 @@ const CATS = [
   "Payment Gateway",
 ]
 const REVENUE_CATS = CATS.filter(c => c.startsWith("Revenue"))
+
+/** Map Add Transaction UI (Debit/Credit) to bank journal side. */
+function ntDrCrToBank(ntDrCr) {
+  const s = String(ntDrCr || "Debit")
+  return s.startsWith("C") || s.toUpperCase() === "CR" ? "CR" : "DR"
+}
+
+/** Recent unique narrations for this category + type (Debit/Credit), newest first. */
+function collectTxnParticularsSuggestions(txns, category, ntDrCr) {
+  const bank = ntDrCrToBank(ntDrCr)
+  const cat = String(category || "").trim()
+  const seen = new Set()
+  const out = []
+  const list = [...(txns || [])].filter(t => !t.void && String(t.category || "") === cat && t.drCr === bank)
+  list.sort((a, b) => parseDdMmYyyy(b.date) - parseDdMmYyyy(a.date) || b.id - a.id)
+  for (const t of list) {
+    const p = String(t.particulars || "").trim()
+    if (!p || seen.has(p)) continue
+    seen.add(p)
+    out.push(p)
+    if (out.length >= 32) break
+  }
+  return out
+}
+
+function defaultTxnNarrationForCategory(category, ntDrCr) {
+  const cat = String(category || "Misc Expense").trim() || "Misc Expense"
+  return ntDrCrToBank(ntDrCr) === "CR" ? `Bank credit — ${cat}` : `Bank debit — ${cat}`
+}
+
+/** Prefer last matching narration; else a short template from category + type. */
+function pickSuggestedParticulars(txns, category, ntDrCr) {
+  const hist = collectTxnParticularsSuggestions(txns, category, ntDrCr)
+  if (hist.length) return hist[0]
+  return defaultTxnNarrationForCategory(category, ntDrCr)
+}
+
 const LEGACY_CATEGORY_MAP = {
   "Revenue - Credhast": "Revenue - B2B Services",
   "Revenue - WheelsEye": "Revenue - B2B Services",
@@ -3846,7 +3883,14 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
       closeQuickAdd()
       return
     }
-    setNt({ date: todayISO(), particulars: "", amount: "", drCr: "Debit", category: "Misc Expense", ref: "" })
+    setNt({
+      date: todayISO(),
+      particulars: pickSuggestedParticulars(txns, "Misc Expense", "Debit"),
+      amount: "",
+      drCr: "Debit",
+      category: "Misc Expense",
+      ref: "",
+    })
     setPage("txn")
     setModal("txn")
     closeQuickAdd()
@@ -3858,7 +3902,14 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
       closeQuickAdd()
       return
     }
-    setNt({ date: todayISO(), particulars: "", amount: "", drCr: "Debit", category: "Vendor - Other", ref: "" })
+    setNt({
+      date: todayISO(),
+      particulars: pickSuggestedParticulars(txns, "Vendor - Other", "Debit"),
+      amount: "",
+      drCr: "Debit",
+      category: "Vendor - Other",
+      ref: "",
+    })
     setPage("txn")
     setModal("txn")
     closeQuickAdd()
@@ -5010,7 +5061,30 @@ ${buildInvoicePrintDocumentHtml({
           >
             {miscRecatOnly ? "✓ Misc only (fix category)" : "Misc only (fix category)"}
           </button>
-          <button type="button" onClick={()=>setModal("txn")} disabled={acctRole==="Viewer"} style={{...S.btn,fontSize:11,padding:"5px 11px",opacity:acctRole==="Viewer"?0.45:1,cursor:acctRole==="Viewer"?"default":"pointer"}}>{acctRole==="Viewer"?"View-only":"+ Add"}</button>
+          <button
+            type="button"
+            onClick={() => {
+              setNt({
+                date: todayISO(),
+                particulars: pickSuggestedParticulars(txns, "Misc Expense", "Debit"),
+                amount: "",
+                drCr: "Debit",
+                category: "Misc Expense",
+                ref: "",
+              })
+              setModal("txn")
+            }}
+            disabled={acctRole === "Viewer"}
+            style={{
+              ...S.btn,
+              fontSize: 11,
+              padding: "5px 11px",
+              opacity: acctRole === "Viewer" ? 0.45 : 1,
+              cursor: acctRole === "Viewer" ? "default" : "pointer",
+            }}
+          >
+            {acctRole === "Viewer" ? "View-only" : "+ Add"}
+          </button>
           <button type="button" onClick={()=>{const h="Date,Particulars,Category,Type,Amount,Balance,FY\n"+txns.map(t=>[t.date,'"'+t.particulars.replace(/"/g,"'")+'"',t.category,t.drCr,t.amount,t.balance,t.fy].join(",")).join("\n");const b=new Blob([h],{type:"text/csv"});const a=document.createElement("a");a.href=URL.createObjectURL(b);a.download="jm_tally_txns.csv";a.click()}} style={{...S.btnO,fontSize:11,padding:"5px 11px"}}>⬇ CSV</button>
         </div>
         <Tbl cols={[
@@ -9145,10 +9219,61 @@ ${buildInvoicePrintDocumentHtml({
       <Modal open={modal==="txn"} title="Add Transaction" onClose={()=>setModal(null)} onSave={()=>addTxn()} saveDisabled={acctRole==="Viewer"} saveLabel={acctRole==="Viewer"?"View-only":"Save Entry"}>
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:11}}>
           <F label="Date"><input type="date" value={nt.date} onChange={e=>setNt(p=>({...p,date:e.target.value}))} style={IS}/></F>
-          <F label="Type"><select value={nt.drCr} onChange={e=>setNt(p=>({...p,drCr:e.target.value}))} style={IS}><option>Debit</option><option>Credit</option></select></F>
-          <div style={{gridColumn:"1/-1"}}><F label="Description / Narration"><input value={nt.particulars} onChange={e=>setNt(p=>({...p,particulars:e.target.value}))} placeholder="e.g. NEFT from client — invoice ref" style={IS}/></F></div>
+          <F label="Type">
+            <select
+              value={nt.drCr}
+              onChange={e => {
+                const drCr = e.target.value
+                setNt(p => {
+                  const next = { ...p, drCr }
+                  if (!String(p.particulars || "").trim()) next.particulars = pickSuggestedParticulars(txns, p.category, drCr)
+                  return next
+                })
+              }}
+              style={IS}
+            >
+              <option>Debit</option>
+              <option>Credit</option>
+            </select>
+          </F>
+          <div style={{ gridColumn: "1/-1" }}>
+            <F label="Description / Narration">
+              <input
+                list="jmt-txn-particulars-dl"
+                value={nt.particulars}
+                onChange={e => setNt(p => ({ ...p, particulars: e.target.value }))}
+                placeholder="Suggested from category & type — pick or edit"
+                style={IS}
+              />
+              <datalist id="jmt-txn-particulars-dl">
+                {collectTxnParticularsSuggestions(txns, nt.category, nt.drCr).map(s => (
+                  <option key={s} value={s} />
+                ))}
+                <option value={defaultTxnNarrationForCategory(nt.category, nt.drCr)} />
+              </datalist>
+            </F>
+          </div>
           <F label="Amount (₹)"><input type="number" value={nt.amount} onChange={e=>setNt(p=>({...p,amount:e.target.value}))} placeholder="0" style={IS}/></F>
-          <F label="Category"><select value={nt.category} onChange={e=>setNt(p=>({...p,category:e.target.value}))} style={IS}>{CATS.map(c=><option key={c}>{c}</option>)}</select></F>
+          <F label="Category">
+            <select
+              value={nt.category}
+              onChange={e => {
+                const category = e.target.value
+                setNt(p => {
+                  const next = { ...p, category }
+                  if (!String(p.particulars || "").trim()) next.particulars = pickSuggestedParticulars(txns, category, p.drCr)
+                  return next
+                })
+              }}
+              style={IS}
+            >
+              {CATS.map(c => (
+                <option key={c}>
+                  {c}
+                </option>
+              ))}
+            </select>
+          </F>
           <F label="Reference No."><input value={nt.ref} onChange={e=>setNt(p=>({...p,ref:e.target.value}))} placeholder="NEFT/IMPS/UPI ref · vendor invoice #" style={IS}/></F>
           {nt.category==="Vendor - IT Solutions"&&<div style={{gridColumn:"1/-1",fontSize:11,color:"#0369a1",lineHeight:1.5,padding:"8px 10px",background:"rgba(107,122,255,.1)",borderRadius:8,border:"1px solid rgba(107,122,255,.25)"}}>Payments to <strong>IT Solutions</strong> are <strong>expenses</strong> (P&amp;L / vendor ledger). For GST, use <strong>GST → ITC</strong>: splits use 18% inclusive CGST+SGST — reconcile with their invoice &amp; GSTR-2B.</div>}
         </div>
