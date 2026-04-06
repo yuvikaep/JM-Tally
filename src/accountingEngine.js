@@ -374,9 +374,31 @@ export function inferFY(ddmmyyyy) {
  * If a row has an imported `balance` (statement column), we **keep** it — CR/DR amounts
  * in the seed often do not recompute to that figure (partial lines, same-day ordering, etc.).
  * Rows without `balance` chain from the last known figure (new postings).
+ *
+ * @param {{ carryForwardAmount?: number }} [options] — If set, **ignore** imported balances and chain from
+ *   this opening bank figure (e.g. last FY closing). Then **closing = carryForward + net (CR−DR)** on bank lines.
  */
-export function withRecalculatedBalances(txns) {
+export function withRecalculatedBalances(txns, options = {}) {
   const sorted = [...txns].sort((a, b) => parseDdMmYyyy(a.date) - parseDdMmYyyy(b.date) || a.id - b.id)
+  const cfNum = options?.carryForwardAmount
+  const useCf = typeof cfNum === "number" && Number.isFinite(cfNum)
+  const carryStart = useCf ? Math.round(cfNum * 100) / 100 : null
+
+  if (useCf) {
+    let running = carryStart
+    return sorted.map(t => {
+      if (t.void) return { ...t, balance: null }
+      const delta =
+        t.excludeFromBankRunning
+          ? 0
+          : t.drCr === "CR"
+            ? Math.round(Number(t.amount) * 100) / 100
+            : -Math.round(Number(t.amount) * 100) / 100
+      running = Math.round((running + delta) * 100) / 100
+      return { ...t, balance: running }
+    })
+  }
+
   let running = null
 
   return sorted.map(t => {
