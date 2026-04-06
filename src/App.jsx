@@ -53,6 +53,7 @@ import {
 } from "./automationSkills.js"
 import { matchEnterpriseAgentQuery, getAgentSkillsOverviewMarkdown, tryEmbeddedAgentHelp } from "./accountingAgentTraining.js"
 import { tryNaturalLanguageJournal, tryGstPaymentJournalFromChat } from "./journalFromNaturalLanguage.js"
+import { parseBulkSalaryPaste, bulkSalaryRowsToConfirmEntries } from "./bulkSalaryPaste.js"
 
 const AUTOMATION_DEFAULT_IDS = new Set(DEFAULT_AUTOMATION_SKILLS.map(s => s.id))
 
@@ -2026,6 +2027,161 @@ function ChatMemoryConfirmCard({ note, onSave, onDismiss }) {
   )
 }
 
+function BulkSalaryPastePanel({ onAddBatch, acctRole, cats, onBulkSalaryPosted }) {
+  const [raw, setRaw] = useState("")
+  const [defaultCat, setDefaultCat] = useState("Salary")
+  const [defaultDate, setDefaultDate] = useState(() => todayISO())
+  const [preview, setPreview] = useState(null)
+  const [err, setErr] = useState("")
+
+  const runPreview = () => {
+    setErr("")
+    const r = parseBulkSalaryPaste(raw, { defaultDateIso: defaultDate, defaultCategory: defaultCat })
+    if (!r.ok) {
+      setPreview(null)
+      setErr(r.error || "Parse failed")
+      return
+    }
+    setPreview(r)
+  }
+
+  const postAll = () => {
+    if (!preview?.ok || !preview.rows?.length) return
+    const entries = bulkSalaryRowsToConfirmEntries(preview.rows)
+    const rows = entries.map(e => ({
+      particulars: e.desc,
+      amount: String(e.amt),
+      drCr: e.type === "CR" ? "CR" : "DR",
+      category: e.cat,
+      date: e.dateIso,
+    }))
+    const ok = onAddBatch(rows)
+    if (ok) {
+      if (typeof onBulkSalaryPosted === "function") onBulkSalaryPosted(rows.length)
+      setRaw("")
+      setPreview(null)
+      setErr("")
+    }
+  }
+
+  const sum = preview?.ok ? preview.rows.reduce((s, r) => s + r.amount, 0) : 0
+
+  return (
+    <div style={{ flex: 1, overflowY: "auto", padding: 14, maxWidth: 800 }}>
+      <div style={{ fontSize: 12, fontWeight: 800, color: "#0c4a6e", marginBottom: 8 }}>Bulk salary &amp; payroll lines</div>
+      <div style={{ fontSize: 11, color: SKY.muted, lineHeight: 1.55, marginBottom: 12 }}>
+        Paste a table copied from Excel/Sheets (tabs between columns). One row per employee. Columns:{" "}
+        <strong style={{ color: SKY.text2 }}>Name</strong>, <strong style={{ color: SKY.text2 }}>Amount</strong>,{" "}
+        <strong style={{ color: SKY.text2 }}>Type</strong> (e.g. Salary), <strong style={{ color: SKY.text2 }}>Date</strong> (e.g.{" "}
+        <code style={{ fontSize: 10 }}>2 April 2026</code> or <code style={{ fontSize: 10 }}>2026-04-02</code>). Header row is optional.
+        Narration posted as <strong style={{ color: SKY.text2 }}>Salary — Name</strong> (bank debit). You can also paste the same table in{" "}
+        <strong style={{ color: SKY.text2 }}>Chat</strong> — a review card will open if 2+ rows parse.
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 10 }}>
+        <F label="Default date (if a row has no date)">
+          <input type="date" value={defaultDate} onChange={e => setDefaultDate(e.target.value)} style={IS} disabled={acctRole === "Viewer"} />
+        </F>
+        <F label="Default type when column missing">
+          <select value={defaultCat} onChange={e => setDefaultCat(e.target.value)} style={IS} disabled={acctRole === "Viewer"}>
+            {(cats || []).map(c => (
+              <option key={c} value={c}>
+                {c}
+              </option>
+            ))}
+          </select>
+        </F>
+      </div>
+      <F label="Paste rows">
+        <textarea
+          value={raw}
+          onChange={e => {
+            setRaw(e.target.value)
+            setPreview(null)
+            setErr("")
+          }}
+          placeholder={"Neetesh\t20,771\tSalary\t2 April 2026\nVishal\t11,609\tSalary\t2 April 2026"}
+          rows={12}
+          style={{ ...IS, width: "100%", boxSizing: "border-box", fontFamily: "ui-monospace, monospace", fontSize: 11 }}
+          disabled={acctRole === "Viewer"}
+        />
+      </F>
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 10, marginBottom: 12 }}>
+        <button
+          type="button"
+          disabled={acctRole === "Viewer"}
+          onClick={runPreview}
+          style={{
+            background: JM.p,
+            border: "none",
+            borderRadius: 9,
+            padding: "8px 16px",
+            fontSize: 12,
+            fontWeight: 700,
+            color: "#fff",
+            cursor: acctRole === "Viewer" ? "default" : "pointer",
+            opacity: acctRole === "Viewer" ? 0.5 : 1,
+            fontFamily: "inherit",
+          }}
+        >
+          Preview
+        </button>
+        <button
+          type="button"
+          disabled={acctRole === "Viewer" || !preview?.ok}
+          onClick={postAll}
+          style={{
+            background: preview?.ok ? "#10b981" : "#bae6fd",
+            border: "none",
+            borderRadius: 9,
+            padding: "8px 16px",
+            fontSize: 12,
+            fontWeight: 700,
+            color: "#fff",
+            cursor: acctRole === "Viewer" || !preview?.ok ? "default" : "pointer",
+            opacity: acctRole === "Viewer" || !preview?.ok ? 0.55 : 1,
+            fontFamily: "inherit",
+          }}
+        >
+          Post all to ledger
+        </button>
+      </div>
+      {err ? (
+        <div style={{ fontSize: 11, color: "#f43f5e", marginBottom: 10 }}>{err}</div>
+      ) : null}
+      {preview?.ok && preview.warnings?.length ? (
+        <div style={{ fontSize: 10, color: "#f59e0b", marginBottom: 8, lineHeight: 1.45 }}>{preview.warnings.join(" ")}</div>
+      ) : null}
+      {preview?.ok ? (
+        <div style={{ border: `1px solid ${SKY.border}`, borderRadius: 10, overflow: "hidden" }}>
+          <div style={{ fontSize: 10, fontWeight: 800, padding: "8px 10px", background: SKY.surface2, color: SKY.text2 }}>
+            {preview.rows.length} line(s) · Total ₹{inr(sum)}
+          </div>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11 }}>
+            <thead>
+              <tr style={{ background: "#f8fafc" }}>
+                <th style={{ textAlign: "left", padding: 8 }}>Employee</th>
+                <th style={{ textAlign: "right", padding: 8 }}>Amount</th>
+                <th style={{ textAlign: "left", padding: 8 }}>Category</th>
+                <th style={{ textAlign: "left", padding: 8 }}>Date</th>
+              </tr>
+            </thead>
+            <tbody>
+              {preview.rows.map((r, i) => (
+                <tr key={i} style={{ borderTop: `1px solid ${SKY.rowLine}` }}>
+                  <td style={{ padding: 8 }}>{r.name}</td>
+                  <td style={{ padding: 8, textAlign: "right", fontFamily: "monospace" }}>₹{inr(r.amount)}</td>
+                  <td style={{ padding: 8 }}>{r.category}</td>
+                  <td style={{ padding: 8, fontFamily: "monospace" }}>{r.dateIso}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
 function Chat({
   onAddBatch,
   acctRole,
@@ -2044,6 +2200,7 @@ function Chat({
   onAssistantMemoryAdd,
   onRemoveAssistantNote,
   onAutomationRuleConfirm,
+  onBulkSalaryPosted,
 }) {
   const s = snap || {}
   const w = welcomeName || "your company"
@@ -2127,6 +2284,34 @@ function Chat({
                 role: "confirm",
                 confirmId: `gst-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
                 entries: [gstPay.draft],
+              },
+            ]),
+          400
+        )
+        return
+      }
+
+      const bulkSal = parseBulkSalaryPaste(msg, { defaultDateIso: todayISO(), defaultCategory: "Salary" })
+      if (bulkSal.ok && bulkSal.rows.length >= 2) {
+        if (acctRole === "Viewer") {
+          const text = "View-only — posting blocked."
+          hist.current.push({ role: "assistant", content: text })
+          setMsgs(p => p.slice(0, -1).concat([{ role: "ai", text }]))
+          return
+        }
+        const warn = bulkSal.warnings?.length ? `\n\n⚠ ${bulkSal.warnings.slice(0, 8).join(" ")}` : ""
+        const text = `**${bulkSal.rows.length} salary lines** parsed.${warn}\n\nReview & edit below, then **Confirm · सभी पोस्ट**.`
+        hist.current.push({ role: "assistant", content: text })
+        setMsgs(p => p.slice(0, -1).concat([{ role: "ai", text }]))
+        const entries = bulkSalaryRowsToConfirmEntries(bulkSal.rows)
+        window.setTimeout(
+          () =>
+            setMsgs(p => [
+              ...p,
+              {
+                role: "confirm",
+                confirmId: `salary-bulk-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
+                entries,
               },
             ]),
           400
@@ -2398,9 +2583,12 @@ function Chat({
                 Enterprise protocol
               </span>
           </div>
-            <div style={{ display: "flex", gap: 6 }}>
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
               <button type="button" onClick={() => setAiTab("chat")} style={tabBtn(aiTab === "chat")}>
                 Chat
+              </button>
+              <button type="button" onClick={() => setAiTab("bulk")} style={tabBtn(aiTab === "bulk")}>
+                Bulk salary
               </button>
               <button type="button" onClick={() => setAiTab("rules")} style={tabBtn(aiTab === "rules")}>
                 Rules & templates
@@ -2409,8 +2597,10 @@ function Chat({
           </div>
           <div style={{ fontSize: 11, color: "#64748b", marginTop: 6, lineHeight: 1.45 }}>
             {aiTab === "chat"
-              ? "बोलो / अपलोड → लेजर में एंट्री।"
-              : "Rules & templates — ledger पर रन करने के लिए।"}
+              ? "बोलो / अपलोड → लेजर में एंट्री। Paste multi-row salary sheet here for a review card."
+              : aiTab === "bulk"
+                ? "Paste employee rows (Name, Amount, Type, Date) — Preview, then post all as bank debits."
+                : "Rules & templates — ledger पर रन करने के लिए।"}
           </div>
           {aiTab === "chat" && Array.isArray(assistantMemory) && assistantMemory.length > 0 ? (
             <div
@@ -2526,6 +2716,8 @@ function Chat({
               onPostTemplate={onPostTemplate}
             />
           </div>
+        ) : aiTab === "bulk" ? (
+          <BulkSalaryPastePanel onAddBatch={onAddBatch} acctRole={acctRole} cats={cats} onBulkSalaryPosted={onBulkSalaryPosted} />
         ) : (
           <>
         <div ref={ref} style={{flex:1,overflowY:"auto",padding:14,display:"flex",flexDirection:"column",gap:9}}>
@@ -7816,6 +8008,7 @@ ${buildInvoicePrintDocumentHtml({
             onAssistantMemoryAdd={addAssistantMemoryNote}
             onRemoveAssistantNote={removeAssistantNote}
             onAutomationRuleConfirm={confirmAutomationRuleFromChat}
+            onBulkSalaryPosted={n => toast_(`Posted ${n} salary line(s) to ledger`, "#10b981")}
           />
         )
       case "stock": {
