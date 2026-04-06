@@ -5142,6 +5142,8 @@ ${buildInvoicePrintDocumentHtml({
     const topExpRows = drByCat.slice(0, 5)
     const crN = reportLedger.filter(t => t.drCr === "CR").length
     const drN = reportLedger.filter(t => t.drCr === "DR").length
+    const bankClosingFig = periodActive ? reportStats.balance : stats.balance
+    const reconGap = Math.round((reportStats.flowNet - bankClosingFig) * 100) / 100
     return (
     <div>
       {periodActive && (
@@ -5194,20 +5196,54 @@ ${buildInvoicePrintDocumentHtml({
       <div style={S.g4}>
         <Stat label="Total receipts (CR)" value={"₹"+inr0(reportStats.cr)} sub={periodActive?"Filtered period":"All dates in book"} color="#10b981" icon="💰"/>
         <Stat label="Total payments (DR)" value={"₹"+inr0(reportStats.dr)} sub={periodActive?"Filtered period":"All dates in book"} color="#f43f5e" icon="📤"/>
-        <Stat label="Booked CR − DR" value={"₹"+inr0(reportStats.flowNet)} sub="Sum of txn amounts · may differ from bank column" color="#6B7AFF" icon="📈"/>
+        <Stat
+          label="Booked CR − DR"
+          value={"₹" + inr0(reportStats.flowNet)}
+          sub="Σ (credits − debits) on bank lines only — not the same formula as running balance"
+          color="#6B7AFF"
+          icon="📈"
+        />
         <Stat label="Transactions" value={String(reportStats.count)} sub={"In scope · CR:"+crN+" · DR:"+drN} icon="⇄"/>
       </div>
       <div style={S.g3}>
         <Stat label="Top revenue category" value={topName} sub={topRev ? "₹"+inr0(topAmt)+" · "+topPct+"% of Revenue-* credits" : "Add Revenue-* credits"} color="#5563E8" icon="🤝"/>
         <Stat
           label={periodActive ? "Period closing (bank col.)" : "Bank closing (full book)"}
-          value={"₹" + inr0(periodActive ? reportStats.balance : stats.balance)}
-          sub={activeCompany?.bankAccountLabel?.slice(0, 36) || "Primary bank · set label in Companies"}
+          value={"₹" + inr0(bankClosingFig)}
+          sub={
+            (activeCompany?.bankAccountLabel?.slice(0, 36) || "Primary bank") +
+            " · last row’s Balance (running total; may follow bank CSV)"
+          }
           color="#6B7AFF"
           icon="🏦"
         />
         <Stat label="Director payment (DR)" value={"₹"+inr0(dirDrawTotal)} sub="Category: Director Payment" color="#f43f5e" icon="👤"/>
       </div>
+      {Math.abs(reconGap) > 0.01 ? (
+        <div
+          style={{
+            fontSize: 11,
+            color: "#475569",
+            marginBottom: 14,
+            padding: "10px 12px",
+            background: "rgba(245,158,11,.08)",
+            borderRadius: 10,
+            border: "1px solid rgba(245,158,11,.35)",
+            lineHeight: 1.55,
+          }}
+        >
+          <strong style={{ color: "#b45309" }}>Why “Booked CR − DR” ≠ “Bank closing”</strong>
+          <div style={{ marginTop: 6 }}>
+            <strong>Booked CR − DR</strong> (₹{inr0(reportStats.flowNet)}) is only the <strong>sum of credit amounts minus sum of debit amounts</strong> on lines that hit the bank (excluding TDS-only / non-bank lines).
+          </div>
+          <div style={{ marginTop: 6 }}>
+            <strong>Bank closing</strong> (₹{inr0(bankClosingFig)}) is the <strong>running balance</strong> on the <strong>last</strong> transaction — built forward from older rows, and when you <strong>import a bank CSV</strong> the app often <strong>uses the bank’s Balance column</strong>, so it stays aligned with the statement, not necessarily with “sum of all amounts from zero”.
+          </div>
+          <div style={{ marginTop: 6, fontWeight: 700, color: "#0c4a6e" }}>
+            Gap (Booked CR−DR minus Bank closing): ₹{inr0(reconGap)} — often matches an <strong>opening balance</strong> (e.g. ₹21,840 b/f) or a statement carry-over.
+          </div>
+        </div>
+      ) : null}
       <div style={S.g2}>
         <div style={{...S.card,marginBottom:0}}>
           <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
