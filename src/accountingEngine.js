@@ -597,3 +597,39 @@ export function filterTxnsForReport(txns, { fy, monthKey, fromIso, toIso } = {})
   }
   return list
 }
+
+/** Last day of month before FY `2025-26` starts → `31/03/2025` (Indian FY April–March). */
+export function fyPrevYearEndDdMmYyyy(fyCanonical) {
+  const m = /^(\d{4})-\d{2}$/.exec(String(fyCanonical || "").trim())
+  if (!m) return null
+  const y1 = parseInt(m[1], 10)
+  return `31/03/${y1}`
+}
+
+/** Last calendar day of the previous month (dd/mm/yyyy), for “month-end bank” hints. */
+export function lastCalendarMonthEndDdMmYyyy(now = new Date()) {
+  const d = new Date(now.getFullYear(), now.getMonth(), 0)
+  const dd = String(d.getDate()).padStart(2, "0")
+  const mm = String(d.getMonth() + 1).padStart(2, "0")
+  const yy = d.getFullYear()
+  return `${dd}/${mm}/${yy}`
+}
+
+/**
+ * Bank running balance after the last transaction on or before `endDdMmYyyy` (inclusive).
+ * Uses the `balance` column from `withRecalculatedBalances`. Returns null if no row has a balance yet.
+ */
+export function bankBalanceOnOrBeforeDate(txns, endDdMmYyyy) {
+  const endTs = parseDdMmYyyy(endDdMmYyyy)
+  if (!Number.isFinite(endTs)) return null
+  const sorted = [...(txns || [])]
+    .filter(t => !t.void)
+    .sort((a, b) => parseDdMmYyyy(a.date) - parseDdMmYyyy(b.date) || a.id - b.id)
+  let last = null
+  for (const t of sorted) {
+    if (parseDdMmYyyy(t.date) <= endTs) {
+      if (t.balance != null && Number.isFinite(Number(t.balance))) last = Number(t.balance)
+    }
+  }
+  return last
+}

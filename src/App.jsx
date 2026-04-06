@@ -19,6 +19,9 @@ import {
   fyToMonthOptions,
   distinctFYs,
   inferFY,
+  fyPrevYearEndDdMmYyyy,
+  lastCalendarMonthEndDdMmYyyy,
+  bankBalanceOnOrBeforeDate,
   draftInvoiceSettlementTxns,
   stripInvoiceSettlementTxns,
 } from "./accountingEngine.js"
@@ -2841,11 +2844,39 @@ function Chat({
       <div style={{width:250,display:"flex",flexDirection:"column",gap:10}}>
         <div style={{background:"#ffffff",border:"1px solid #bae6fd",borderRadius:12,padding:14}}>
           <div style={{fontSize:12,fontWeight:700,color:"#0c4a6e",marginBottom:10}}>💼 Live Financials</div>
-          {[["Bank balance","₹"+inr0(s.balance??0),"#6B7AFF"],["Top revenue cat",(s.topRevName||"—")+" · ₹"+inr0(s.topRevAmt??0),"#10b981"],["Salary (DR)","₹"+inr0(s.salaryDr??0),"#f43f5e"],["Output GST (est.)","₹"+inr0(s.gstEst??0),"#f59e0b"],["IT refund (CR)","₹"+inr0(s.itRefund??0),"#10b981"],["Transactions",String(s.count??0),"#94a3b8"]].map(([k,v,c])=>(
-            <div key={k} style={{display:"flex",justifyContent:"space-between",padding:"5px 9px",background:"#ffffff",borderRadius:7,marginBottom:4,fontSize:11}}>
-              <span style={{color:"#64748b"}}>{k}</span><span style={{fontWeight:700,color:c}}>{v}</span>
-            </div>
-          ))}
+          {(() => {
+            const rows = [["Bank balance (closing)", "₹" + inr0(s.balance ?? 0), "#6B7AFF"]]
+            if (s.bankLastMonthEnd != null && s.bankLastMonthEndLabel) {
+              rows.push([
+                `Bank @ ${s.bankLastMonthEndLabel} (month-end)`,
+                "₹" + inr0(s.bankLastMonthEnd),
+                "#0369a1",
+              ])
+            }
+            if (s.repFyOpen && s.bankFyOpeningLabel && s.bankFyOpening != null) {
+              rows.push([
+                `Bank before ${formatFyLabel(s.repFyOpen)} (${s.bankFyOpeningLabel})`,
+                "₹" + inr0(s.bankFyOpening),
+                "#0c4a6e",
+              ])
+            }
+            rows.push(
+              ["Top revenue cat", (s.topRevName || "—") + " · ₹" + inr0(s.topRevAmt ?? 0), "#10b981"],
+              ["Salary (DR)", "₹" + inr0(s.salaryDr ?? 0), "#f43f5e"],
+              ["Output GST (est.)", "₹" + inr0(s.gstEst ?? 0), "#f59e0b"],
+              ["IT refund (CR)", "₹" + inr0(s.itRefund ?? 0), "#10b981"],
+              ["Transactions", String(s.count ?? 0), "#94a3b8"]
+            )
+            return rows.map(([k, v, c]) => (
+              <div key={k} style={{ display: "flex", justifyContent: "space-between", padding: "5px 9px", background: "#ffffff", borderRadius: 7, marginBottom: 4, fontSize: 11 }}>
+                <span style={{ color: "#64748b" }}>{k}</span>
+                <span style={{ fontWeight: 700, color: c }}>{v}</span>
+              </div>
+            ))
+          })()}
+          <div style={{ fontSize: 9, color: "#94a3b8", marginTop: 8, lineHeight: 1.45 }}>
+            Month-end &amp; FY opening use the **Balance** column from your ledger (last txn on/before that date). Set header FY filter to see “before FY”.
+          </div>
         </div>
         <div style={{background:"#ffffff",border:"1px solid #bae6fd",borderRadius:12,padding:14}}>
           <div style={{fontSize:12,fontWeight:700,color:"#0c4a6e",marginBottom:9}}>📅 Compliance</div>
@@ -3336,6 +3367,10 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
       "DR"
     )
     const topDrCats = [...drByCat].sort((a, b) => b[1] - a[1]).slice(0, 8)
+    const lastMonthEnd = lastCalendarMonthEndDdMmYyyy()
+    const bankLastMonthEnd = bankBalanceOnOrBeforeDate(ledger, lastMonthEnd)
+    const fyEnd = repFy ? fyPrevYearEndDdMmYyyy(repFy) : null
+    const bankFyOpening = fyEnd ? bankBalanceOnOrBeforeDate(ledger, fyEnd) : null
     return {
       balance: stats.balance,
       topRevName: tr ? String(tr[0]).replace(/^Revenue -\s*/, "") : "—",
@@ -3346,8 +3381,22 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
       count: stats.count,
       recentLines,
       topDrCats,
+      bankLastMonthEnd,
+      bankLastMonthEndLabel: lastMonthEnd,
+      bankFyOpening,
+      bankFyOpeningLabel: fyEnd,
+      repFyOpen: repFy,
     }
-  }, [ledger, stats.balance, stats.count, chatRevenueCats, outputGstFullBook])
+  }, [ledger, stats.balance, stats.count, chatRevenueCats, outputGstFullBook, repFy])
+
+  /** Month-end & pre-FY bank figures from running balance column (same logic as AI sidebar). */
+  const bankSnapshotHints = useMemo(() => {
+    const lastMonthEnd = lastCalendarMonthEndDdMmYyyy()
+    const bankAtLastMonth = bankBalanceOnOrBeforeDate(ledger, lastMonthEnd)
+    const fyEnd = repFy ? fyPrevYearEndDdMmYyyy(repFy) : null
+    const bankAtFyOpen = fyEnd ? bankBalanceOnOrBeforeDate(ledger, fyEnd) : null
+    return { lastMonthEnd, bankAtLastMonth, fyEnd, bankAtFyOpen }
+  }, [ledger, repFy])
 
   const activeCompany = useMemo(() => {
     const c = companies.find(x => x.id === activeCompanyId)
@@ -5100,6 +5149,48 @@ ${buildInvoicePrintDocumentHtml({
           Period filter active — figures below are for the selected FY / month / dates. Sidebar bank balance is still your <strong>full</strong> book closing.
         </div>
       )}
+      <div
+        style={{
+          fontSize: 11,
+          color: "#475569",
+          marginBottom: 14,
+          padding: "12px 14px",
+          background: "#ffffff",
+          borderRadius: 10,
+          border: "1px solid #e0f2fe",
+          lineHeight: 1.55,
+        }}
+      >
+        <div style={{ fontWeight: 800, color: "#0c4a6e", marginBottom: 8 }}>Bank balance reference (from ledger running balance)</div>
+        <div>
+          <strong>Last calendar month-end</strong> ({bankSnapshotHints.lastMonthEnd}):{" "}
+          {bankSnapshotHints.bankAtLastMonth != null ? (
+            <strong style={{ color: "#0369a1" }}>₹{inr0(bankSnapshotHints.bankAtLastMonth)}</strong>
+          ) : (
+            <span style={{ color: "#94a3b8" }}>— (no transactions through that date yet)</span>
+          )}
+        </div>
+        {repFy ? (
+          <div style={{ marginTop: 6 }}>
+            <strong>End of previous FY</strong> ({bankSnapshotHints.fyEnd}, day before {formatFyLabel(repFy)}):{" "}
+            {bankSnapshotHints.bankAtFyOpen != null ? (
+              <strong style={{ color: "#0c4a6e" }}>₹{inr0(bankSnapshotHints.bankAtFyOpen)}</strong>
+            ) : (
+              <span style={{ color: "#94a3b8" }}>— (no rows on/before that date — post opening or import history)</span>
+            )}
+          </div>
+        ) : (
+          <div style={{ marginTop: 6, fontSize: 10, color: "#64748b" }}>
+            Select a <strong>Financial year</strong> in the header to see the bank figure at <strong>31 March</strong> before that FY (e.g. ₹21,840 on 31 Mar 2025 before FY 2025-26).
+          </div>
+        )}
+        <div style={{ fontSize: 10, color: "#64748b", marginTop: 10, paddingTop: 10, borderTop: "1px dashed #bae6fd" }}>
+          <strong>New FY from 1 Apr?</strong> If books start fresh but cash was ₹21,840 on 31 Mar, add one line dated{" "}
+          <strong>01/04/…</strong>: <strong>Credit</strong> that amount, narration e.g. &quot;Opening balance b/f 31 Mar&quot;, category{" "}
+          <strong>Capital Infusion - Cash</strong> (or your CA&apos;s mapping). That seeds the running balance; or keep importing bank CSV so the
+          balance column chains correctly.
+        </div>
+      </div>
       <div style={S.g4}>
         <Stat label="Total receipts (CR)" value={"₹"+inr0(reportStats.cr)} sub={periodActive?"Filtered period":"All dates in book"} color="#10b981" icon="💰"/>
         <Stat label="Total payments (DR)" value={"₹"+inr0(reportStats.dr)} sub={periodActive?"Filtered period":"All dates in book"} color="#f43f5e" icon="📤"/>
