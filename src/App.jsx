@@ -510,14 +510,57 @@ function normalizeInvoiceSeriesPrefix(raw) {
   return p
 }
 
-/** Next invoice # = prefix + 4-digit sequence (no extra hyphen — include hyphens in the prefix, e.g. JM-2026-). */
+/**
+ * Next invoice # = prefix + 4-digit sequence (include year etc. in the prefix if you want, e.g. JM-2026-).
+ * Prefix match is case-insensitive via RegExp (avoids slice bugs when casing differs from stored invoices).
+ * If the company prefix matches no invoice, infers prefix from the latest invoice # (by id) so series stays in sync.
+ */
+function inferInvoicePrefixFromLatestInvoice(list) {
+  const sorted = [...(list || [])]
+    .filter(x => String(x.num || "").trim())
+    .sort((a, b) => (Number(b.id) || 0) - (Number(a.id) || 0))
+  const raw = String(sorted[0]?.num || "").trim()
+  if (!raw) return null
+  const m = raw.match(/^(.*?)(\d{4,})$/) || raw.match(/^(.*?)(\d+)$/)
+  if (!m || m[1] == null) return null
+  return m[1]
+}
+
 function suggestNextInvoiceNum(list, seriesPrefix) {
-  const pfx = normalizeInvoiceSeriesPrefix(seriesPrefix)
-  const re = new RegExp(`^${escapeRegExp(pfx)}(\\d+)$`, "i")
-  let max = 0
-  for (const inv of list || []) {
-    const m = String(inv.num || "").trim().match(re)
-    if (m) max = Math.max(max, parseInt(m[1], 10))
+  const pfxConfigured = normalizeInvoiceSeriesPrefix(seriesPrefix)
+  const computeMax = pfx => {
+    let max = 0
+    let any = false
+    for (const inv of list || []) {
+      const raw = String(inv.num || "").trim()
+      if (!raw) continue
+      let re
+      try {
+        re = new RegExp(`^${escapeRegExp(pfx)}`, "i")
+      } catch {
+        continue
+      }
+      const m = raw.match(re)
+      if (!m) continue
+      any = true
+      const rest = raw.slice(m[0].length).trim()
+      const digitGroups = rest.match(/\d+/g)
+      if (!digitGroups?.length) continue
+      const n = parseInt(digitGroups[digitGroups.length - 1], 10)
+      if (Number.isFinite(n)) max = Math.max(max, n)
+    }
+    return { max, any }
+  }
+  let { max, any } = computeMax(pfxConfigured)
+  let pfx = pfxConfigured
+  if (!any && (list || []).length > 0) {
+    const inferred = inferInvoicePrefixFromLatestInvoice(list)
+    if (inferred) {
+      const p2 = normalizeInvoiceSeriesPrefix(inferred)
+      const r2 = computeMax(p2)
+      max = r2.max
+      pfx = p2
+    }
   }
   return `${pfx}${String(max + 1).padStart(4, "0")}`
 }
@@ -3114,9 +3157,6 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
   })
   const [acctRole, setAcctRole] = useState("Admin")
   const [periodLockIso, setPeriodLockIso] = useState("")
-  /** Opening bank balance carried from prior FY — drives recalculated running balance so closing = b/f + net (CR−DR) on bank lines. */
-  const [bankCarryForwardAmount, setBankCarryForwardAmount] = useState("")
-  const [bankCarryForwardDateIso, setBankCarryForwardDateIso] = useState("")
   const [automationSkills, setAutomationSkills] = useState(() => coerceAutomationSkills([]))
   /** Short free-text facts for the embedded assistant (per company; persisted in settings). */
   const [assistantMemory, setAssistantMemory] = useState([])
@@ -3190,11 +3230,6 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
         const st = payload.settings
         if (st?.acctRole) setAcctRole(st.acctRole)
         if (st?.periodLockIso != null) setPeriodLockIso(st.periodLockIso)
-        if (st?.bankCarryForwardAmount != null && st.bankCarryForwardAmount !== "")
-          setBankCarryForwardAmount(String(st.bankCarryForwardAmount))
-        else setBankCarryForwardAmount("")
-        if (st?.bankCarryForwardDateIso != null) setBankCarryForwardDateIso(st.bankCarryForwardDateIso || "")
-        else setBankCarryForwardDateIso("")
         setAutomationSkills(coerceAutomationSkills(st?.automationSkills))
         setAssistantMemory(normalizeAssistantMemory(st?.assistantMemory))
         setManualClients(normalizeManualClients(st?.manualClients))
@@ -3214,29 +3249,12 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
       settings: {
         acctRole,
         periodLockIso,
-        bankCarryForwardAmount: bankCarryForwardAmount.trim() === "" ? "" : bankCarryForwardAmount.trim(),
-        bankCarryForwardDateIso,
         automationSkills,
         assistantMemory: normalizeAssistantMemory(assistantMemory),
         manualClients: normalizeManualClients(manualClients),
       },
     })
-  }, [
-    txns,
-    invoices,
-    inventory,
-    importHistory,
-    acctRole,
-    periodLockIso,
-    bankCarryForwardAmount,
-    bankCarryForwardDateIso,
-    automationSkills,
-    assistantMemory,
-    manualClients,
-    activeCompanyId,
-    loading,
-    scopedStore,
-  ])
+  }, [txns, invoices, inventory, importHistory, acctRole, periodLockIso, automationSkills, assistantMemory, manualClients, activeCompanyId, loading, scopedStore])
 
   const addAssistantMemoryNote = useCallback(note => {
     const n = String(note || "").trim()
@@ -3284,20 +3302,7 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
     }
   }, [quickAddOpen])
 
-  const carryForwardNum = useMemo(() => {
-    const s = String(bankCarryForwardAmount ?? "")
-      .trim()
-      .replace(/,/g, "")
-    if (!s) return null
-    const n = Number(s)
-    return Number.isFinite(n) ? Math.round(n * 100) / 100 : null
-  }, [bankCarryForwardAmount])
-
-  const ledger = useMemo(() => {
-    if (!txns) return []
-    if (carryForwardNum != null) return withRecalculatedBalances(txns, { carryForwardAmount: carryForwardNum })
-    return txns
-  }, [txns, carryForwardNum])
+  const ledger = useMemo(() => (txns == null ? [] : txns), [txns])
 
   const stats = useMemo(() => {
     if (!txns) return { cr: 0, dr: 0, balance: 0, flowNet: 0, count: 0 }
@@ -3451,6 +3456,15 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
     return normalizeCompanyRecord(c) || null
   }, [companies, activeCompanyId])
 
+  /** New invoice modal: keep next # in sync when company prefix loads or invoices change (field stays empty until user types). */
+  useEffect(() => {
+    if (modal !== "inv" || invoiceModalEditId != null) return
+    setNi(p => {
+      if (p.num.trim()) return p
+      return { ...p, num: suggestNextInvoiceNum(invoices, activeCompany?.invoiceSeriesPrefix) }
+    })
+  }, [modal, invoiceModalEditId, invoices, activeCompany?.invoiceSeriesPrefix])
+
   useEffect(() => {
     if (modal !== "companies") return
     const c = companies.find(x => x.id === activeCompanyId)
@@ -3468,28 +3482,12 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
       settings: {
         acctRole,
         periodLockIso,
-        bankCarryForwardAmount: bankCarryForwardAmount.trim() === "" ? "" : bankCarryForwardAmount.trim(),
-        bankCarryForwardDateIso,
         automationSkills,
         assistantMemory: normalizeAssistantMemory(assistantMemory),
         manualClients: normalizeManualClients(manualClients),
       },
     })
-  }, [
-    activeCompanyId,
-    txns,
-    invoices,
-    inventory,
-    importHistory,
-    acctRole,
-    periodLockIso,
-    bankCarryForwardAmount,
-    bankCarryForwardDateIso,
-    automationSkills,
-    assistantMemory,
-    manualClients,
-    scopedStore,
-  ])
+  }, [activeCompanyId, txns, invoices, inventory, importHistory, acctRole, periodLockIso, automationSkills, assistantMemory, manualClients, scopedStore])
 
   const applyLoadedPayload = useCallback(payload => {
     const raw = (Array.isArray(payload.txns) ? payload.txns : []).map(t => ({ ...t, void: !!t.void }))
@@ -3503,11 +3501,6 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
     const st = payload.settings
     setAcctRole(st?.acctRole || "Admin")
     setPeriodLockIso(st?.periodLockIso != null ? st.periodLockIso : "")
-    if (st?.bankCarryForwardAmount != null && st.bankCarryForwardAmount !== "")
-      setBankCarryForwardAmount(String(st.bankCarryForwardAmount))
-    else setBankCarryForwardAmount("")
-    if (st?.bankCarryForwardDateIso != null) setBankCarryForwardDateIso(st.bankCarryForwardDateIso || "")
-    else setBankCarryForwardDateIso("")
     setAutomationSkills(coerceAutomationSkills(st?.automationSkills))
     setAssistantMemory(normalizeAssistantMemory(st?.assistantMemory))
     setManualClients(normalizeManualClients(st?.manualClients))
@@ -3556,15 +3549,7 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
         invoices: [],
         inventory: [],
         importHistory: [],
-        settings: {
-          acctRole: "Admin",
-          periodLockIso: "",
-          bankCarryForwardAmount: "",
-          bankCarryForwardDateIso: "",
-          automationSkills: coerceAutomationSkills([]),
-          assistantMemory: [],
-          manualClients: [],
-        },
+        settings: { acctRole: "Admin", periodLockIso: "", automationSkills: coerceAutomationSkills([]), assistantMemory: [], manualClients: [] },
       })
       const payload = await loadCompanyPayload(scopedStore, id)
       setActiveCompanyId(id)
@@ -5220,7 +5205,6 @@ ${buildInvoicePrintDocumentHtml({
     const crN = reportLedger.filter(t => t.drCr === "CR").length
     const drN = reportLedger.filter(t => t.drCr === "DR").length
     const bankClosingFig = periodActive ? reportStats.balance : bookBankBalance
-    const carryAligned = carryForwardNum != null
     return (
     <div>
       {periodActive && (
@@ -5277,13 +5261,9 @@ ${buildInvoicePrintDocumentHtml({
           label="Booked CR − DR"
           value={"₹" + inr0(reportStats.flowNet)}
           sub={
-            carryAligned && !periodActive
-              ? "Bank lines only — matches journal bank closing"
-              : carryAligned && periodActive
-                ? "Bank lines in filtered period only"
-                : !periodActive
-                  ? "Bank lines only — same net as Bank closing (full book)"
-                  : "Σ (credits − debits) on bank lines only"
+            !periodActive
+              ? "Bank lines only — same net as Bank closing (full book)"
+              : "Σ (credits − debits) on bank lines only"
           }
           color="#6B7AFF"
           icon="📈"
@@ -5297,11 +5277,8 @@ ${buildInvoicePrintDocumentHtml({
           value={"₹" + inr0(bankClosingFig)}
           sub={
             periodActive
-              ? carryAligned
-                ? (activeCompany?.bankAccountLabel?.slice(0, 36) || "Primary bank") +
-                  " · running balance through period end (b/f applied)"
-                : (activeCompany?.bankAccountLabel?.slice(0, 36) || "Primary bank") +
-                  " · last row in period (imported balance column)"
+              ? (activeCompany?.bankAccountLabel?.slice(0, 36) || "Primary bank") +
+                " · last row in period (imported balance column)"
               : (activeCompany?.bankAccountLabel?.slice(0, 36) || "Primary bank") +
                 " · journal net (Dr−Cr) — matches Chart of Accounts"
           }
@@ -8776,42 +8753,6 @@ ${buildInvoicePrintDocumentHtml({
                 ))}
               </select>
             </div>
-            <div style={hdrGroup}>
-              <span style={hdrLbl} title="Opening bank balance before the first transaction in this book (e.g. last FY closing). Recalculates running balance so closing = b/f + net (CR−DR) on bank lines.">
-                Bank b/f (₹)
-              </span>
-              <input
-                type="text"
-                inputMode="decimal"
-                placeholder="Optional"
-                value={bankCarryForwardAmount}
-                onChange={e => setBankCarryForwardAmount(e.target.value)}
-                disabled={acctRole === "Viewer"}
-                style={{ ...hdrInput, width: 104, opacity: acctRole === "Viewer" ? 0.65 : 1 }}
-              />
-              <span style={hdrLbl}>as of</span>
-              <input
-                type="date"
-                value={bankCarryForwardDateIso}
-                onChange={e => setBankCarryForwardDateIso(e.target.value)}
-                title="Optional reference date (e.g. 31 Mar prior FY)"
-                disabled={acctRole === "Viewer"}
-                style={{ ...hdrInput, width: 138, opacity: acctRole === "Viewer" ? 0.65 : 1 }}
-              />
-              {bankCarryForwardAmount.trim() !== "" || bankCarryForwardDateIso ? (
-                <button
-                  type="button"
-                  onClick={() => {
-                    setBankCarryForwardAmount("")
-                    setBankCarryForwardDateIso("")
-                  }}
-                  disabled={acctRole === "Viewer"}
-                  style={{ ...S.btnO, fontSize: 11, padding: "5px 10px", borderColor: "#475569", opacity: acctRole === "Viewer" ? 0.5 : 1 }}
-                >
-                  Clear b/f
-                </button>
-              ) : null}
-            </div>
           </div>
         </div>
         <div style={S.cnt}>
@@ -9857,6 +9798,15 @@ ${buildInvoicePrintDocumentHtml({
                 <input
                   value={ni.num}
                   onChange={e => setNi(p => ({ ...p, num: e.target.value }))}
+                  onFocus={e => {
+                    if (invoiceModalEditId != null) return
+                    if (!String(e.target.value || "").trim()) {
+                      setNi(p => ({
+                        ...p,
+                        num: suggestNextInvoiceNum(invoices, activeCompany?.invoiceSeriesPrefix),
+                      }))
+                    }
+                  }}
                   placeholder={suggestNextInvoiceNum(invoices, activeCompany?.invoiceSeriesPrefix)}
                   style={IS}
                 />
