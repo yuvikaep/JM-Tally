@@ -1420,7 +1420,7 @@ function Modal({ open, title, onClose, onSave, saveDisabled, saveLabel, children
           background: SKY.surface,
           border: `1px solid ${SKY.borderHi}`,
           borderRadius: 16,
-          width: wide ? "min(960px, 96vw)" : 560,
+          width: wide ? "min(960px, 96vw)" : "min(560px, 96vw)",
           maxWidth: "96vw",
           maxHeight: "88vh",
           overflowY: "auto",
@@ -3492,6 +3492,59 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
     }
   }, [quickAddOpen])
 
+  /** Mobile / narrow screens: drawer nav so main content stays full-width (sidebar no longer steals ~224px). */
+  const [isCompactLayout, setIsCompactLayout] = useState(() => {
+    if (typeof window === "undefined") return false
+    try {
+      return window.matchMedia("(max-width: 900px)").matches
+    } catch {
+      return false
+    }
+  })
+  const [mobileNavOpen, setMobileNavOpen] = useState(false)
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !window.matchMedia) return undefined
+    const mql = window.matchMedia("(max-width: 900px)")
+    const onChange = () => setIsCompactLayout(mql.matches)
+    if (typeof mql.addEventListener === "function") {
+      mql.addEventListener("change", onChange)
+    } else {
+      mql.addListener(onChange)
+    }
+    onChange()
+    return () => {
+      if (typeof mql.removeEventListener === "function") {
+        mql.removeEventListener("change", onChange)
+      } else {
+        mql.removeListener(onChange)
+      }
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!isCompactLayout) setMobileNavOpen(false)
+  }, [isCompactLayout])
+
+  useEffect(() => {
+    if (!isCompactLayout || !mobileNavOpen) return undefined
+    const onKey = e => {
+      if (e.key === "Escape") setMobileNavOpen(false)
+    }
+    window.addEventListener("keydown", onKey)
+    return () => window.removeEventListener("keydown", onKey)
+  }, [isCompactLayout, mobileNavOpen])
+
+  const goPage = useCallback(
+    k => {
+      setPage(k)
+      setFCat("")
+      setSearch("")
+      if (isCompactLayout) setMobileNavOpen(false)
+    },
+    [isCompactLayout]
+  )
+
   const ledger = useMemo(() => (txns == null ? [] : txns), [txns])
   const ledgerTxnVisible = useMemo(() => ledger.filter(t => !isClientInvoiceTdsTxn(t)), [ledger])
 
@@ -5514,26 +5567,85 @@ ${buildInvoicePrintDocumentHtml({
     </div>
   )
 
+  const sbBase = {
+    width: 224,
+    background: SKY.surface2,
+    borderRight: `1px solid ${SKY.borderHi}`,
+    display: "flex",
+    flexDirection: "column",
+    flexShrink: 0,
+  }
+
   const S = {
-    wrap: { display: "flex", height: "100vh", overflow: "hidden", background: SKY.page, fontFamily: "'DM Sans',system-ui,sans-serif", fontSize: 13, color: SKY.text },
-    sb: { width: 224, background: SKY.surface2, borderRight: `1px solid ${SKY.borderHi}`, display: "flex", flexDirection: "column", flexShrink: 0 },
-    main: { flex: 1, display: "flex", flexDirection: "column", overflow: "hidden", minWidth: 0 },
+    wrap: {
+      display: "flex",
+      height: "100vh",
+      minHeight: "100dvh",
+      overflow: "hidden",
+      background: SKY.page,
+      fontFamily: "'DM Sans',system-ui,sans-serif",
+      fontSize: 13,
+      color: SKY.text,
+    },
+    sb: isCompactLayout
+      ? {
+          ...sbBase,
+          position: "fixed",
+          left: 0,
+          top: 0,
+          bottom: 0,
+          width: "min(88vw, 288px)",
+          zIndex: 1200,
+          transform: mobileNavOpen ? "translateX(0)" : "translateX(-105%)",
+          transition: "transform 0.22s ease",
+          boxShadow: mobileNavOpen ? "8px 0 28px rgba(15,23,42,.18)" : "none",
+        }
+      : sbBase,
+    main: { flex: 1, display: "flex", flexDirection: "column", overflow: "hidden", minWidth: 0, width: "100%" },
     bar: {
       background: SKY.surface,
       borderBottom: `1px solid ${SKY.borderHi}`,
-      padding: "14px 20px 16px",
+      padding: isCompactLayout ? "10px 12px 12px" : "14px 20px 16px",
       display: "flex",
       flexDirection: "column",
       alignItems: "stretch",
-      gap: 14,
+      gap: isCompactLayout ? 10 : 14,
       flexShrink: 0,
       boxShadow: "0 1px 0 rgba(107,122,255,.06)",
     },
-    cnt: { flex: 1, overflowY: "auto", padding: 18, background: SKY.page },
-    g4: { display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 11, marginBottom: 13 },
-    g3: { display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 11, marginBottom: 13 },
-    g2: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 13, marginBottom: 13 },
-    card: { background: SKY.surface, border: `1px solid ${SKY.border}`, borderRadius: 12, padding: 16, marginBottom: 13, boxShadow: "0 1px 3px rgba(107,122,255,.06)" },
+    cnt: {
+      flex: 1,
+      overflowY: "auto",
+      WebkitOverflowScrolling: "touch",
+      padding: isCompactLayout ? 10 : 18,
+      background: SKY.page,
+    },
+    g4: {
+      display: "grid",
+      gridTemplateColumns: isCompactLayout ? "1fr" : "repeat(4,1fr)",
+      gap: 11,
+      marginBottom: 13,
+    },
+    g3: {
+      display: "grid",
+      gridTemplateColumns: isCompactLayout ? "1fr" : "repeat(3,1fr)",
+      gap: 11,
+      marginBottom: 13,
+    },
+    g2: {
+      display: "grid",
+      gridTemplateColumns: isCompactLayout ? "1fr" : "1fr 1fr",
+      gap: 13,
+      marginBottom: 13,
+    },
+    card: {
+      background: SKY.surface,
+      border: `1px solid ${SKY.border}`,
+      borderRadius: 12,
+      padding: isCompactLayout ? 12 : 16,
+      marginBottom: 13,
+      boxShadow: "0 1px 3px rgba(107,122,255,.06)",
+    },
     btn: { background: JM.p, border: "none", borderRadius: 8, padding: "6px 13px", fontSize: 12, fontWeight: 700, color: "#fff", cursor: "pointer" },
     btnO: { background: "transparent", border: `1px solid ${SKY.borderHi}`, borderRadius: 8, padding: "6px 11px", fontSize: 12, fontWeight: 600, color: SKY.text2, cursor: "pointer" },
     sel: { ...IS, height: 33, cursor: "pointer" },
@@ -5547,7 +5659,18 @@ ${buildInvoicePrintDocumentHtml({
       background: a ? SKY.surface2 : "transparent",
       border: "none",
     }),
-    tabs: { display: "flex", gap: 2, background: SKY.surface2, borderRadius: 8, padding: 3, marginBottom: 14, width: "fit-content", border: `1px solid ${SKY.border}` },
+    tabs: {
+      display: "flex",
+      gap: 2,
+      background: SKY.surface2,
+      borderRadius: 8,
+      padding: 3,
+      marginBottom: 14,
+      width: "fit-content",
+      maxWidth: "100%",
+      overflowX: "auto",
+      border: `1px solid ${SKY.border}`,
+    },
   }
 
   const hdrInput = {
@@ -9256,7 +9379,43 @@ ${buildInvoicePrintDocumentHtml({
     <div style={S.wrap} className="jm-app">
       <style>{`@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&display=swap');*{box-sizing:border-box;margin:0;padding:0}::-webkit-scrollbar{width:4px;height:4px}::-webkit-scrollbar-thumb{background:rgba(107,122,255,.45);border-radius:10px}select option{background:#ffffff;color:#0c4a6e}@keyframes spin{to{transform:rotate(360deg)}}`}</style>
 
-      {toast&&<div style={{position:"fixed",top:14,right:14,background:toast.c,color:"#fff",padding:"9px 16px",borderRadius:9,fontSize:12,fontWeight:700,zIndex:9999,boxShadow:"0 4px 20px rgba(0,0,0,.4)"}}>{toast.msg}</div>}
+      {toast && (
+        <div
+          style={{
+            position: "fixed",
+            top: isCompactLayout ? 12 : 14,
+            left: isCompactLayout ? 12 : "auto",
+            right: 14,
+            maxWidth: isCompactLayout ? "calc(100vw - 24px)" : 420,
+            background: toast.c,
+            color: "#fff",
+            padding: "9px 16px",
+            borderRadius: 9,
+            fontSize: 12,
+            fontWeight: 700,
+            zIndex: 9999,
+            boxShadow: "0 4px 20px rgba(0,0,0,.4)",
+          }}
+        >
+          {toast.msg}
+        </div>
+      )}
+
+      {isCompactLayout && mobileNavOpen && (
+        <div
+          role="button"
+          tabIndex={-1}
+          aria-label="Close menu"
+          onClick={() => setMobileNavOpen(false)}
+          onKeyDown={e => {
+            if (e.key === "Enter" || e.key === " ") {
+              e.preventDefault()
+              setMobileNavOpen(false)
+            }
+          }}
+          style={{ position: "fixed", inset: 0, background: "rgba(15,23,42,.38)", zIndex: 1150 }}
+        />
+      )}
 
       {/* SIDEBAR */}
       <div style={S.sb}>
@@ -9307,11 +9466,7 @@ ${buildInvoicePrintDocumentHtml({
                   <button
                     key={k}
                     type="button"
-                    onClick={() => {
-                      setPage(k)
-                      setFCat("")
-                      setSearch("")
-                    }}
+                    onClick={() => goPage(k)}
                     style={{
                       display: "flex",
                       alignItems: "center",
@@ -9362,11 +9517,7 @@ ${buildInvoicePrintDocumentHtml({
                   <button
                     key={k}
                     type="button"
-                    onClick={() => {
-                      setPage(k)
-                      setFCat("")
-                      setSearch("")
-                    }}
+                    onClick={() => goPage(k)}
                     style={{
                       display: "flex",
                       alignItems: "center",
@@ -9420,11 +9571,7 @@ ${buildInvoicePrintDocumentHtml({
                   <button
                     key={k}
                     type="button"
-                    onClick={() => {
-                      setPage(k)
-                      setFCat("")
-                      setSearch("")
-                    }}
+                    onClick={() => goPage(k)}
                     style={{
                       display: "flex",
                       alignItems: "center",
@@ -9531,6 +9678,26 @@ ${buildInvoicePrintDocumentHtml({
         <div style={S.bar}>
           <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 20, flexWrap: "wrap" }}>
             <div style={{ display: "flex", alignItems: "center", gap: 14, minWidth: 0, flex: "1 1 240px" }}>
+              {isCompactLayout && (
+                <button
+                  type="button"
+                  onClick={() => setMobileNavOpen(o => !o)}
+                  style={{
+                    ...S.btnO,
+                    flexShrink: 0,
+                    padding: "8px 11px",
+                    fontSize: 16,
+                    lineHeight: 1,
+                    borderRadius: 10,
+                    minWidth: 40,
+                    minHeight: 40,
+                  }}
+                  aria-expanded={mobileNavOpen}
+                  aria-label={mobileNavOpen ? "Close menu" : "Open menu"}
+                >
+                  ☰
+                </button>
+              )}
               <img src="/logo.png" alt="" width={40} height={40} style={{ objectFit: "contain", flexShrink: 0 }} />
               <div style={{ minWidth: 0 }}>
                 <div style={{ fontSize: 10, fontWeight: 800, color: JM.p, letterSpacing: "0.06em", textTransform: "uppercase" }}>JM Tally</div>
