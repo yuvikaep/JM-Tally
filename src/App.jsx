@@ -3337,6 +3337,8 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
     Finance: true,
     Intelligence: true,
   })
+  const [viewportW, setViewportW] = useState(typeof window !== "undefined" ? window.innerWidth : 1280)
+  const [mobileNavOpen, setMobileNavOpen] = useState(false)
   /** Header + Add dropdown: collapsible groups (mirrors sidebar behaviour) */
   const [quickAddMenuOpen, setQuickAddMenuOpen] = useState({
     ledger: true,
@@ -3491,6 +3493,19 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
       window.removeEventListener("keydown", onKey)
     }
   }, [quickAddOpen])
+
+  useEffect(() => {
+    const onResize = () => setViewportW(typeof window !== "undefined" ? window.innerWidth : 1280)
+    window.addEventListener("resize", onResize)
+    return () => window.removeEventListener("resize", onResize)
+  }, [])
+
+  const isMobile = viewportW <= 900
+  const isTablet = viewportW <= 1200
+
+  useEffect(() => {
+    if (!isMobile) setMobileNavOpen(false)
+  }, [isMobile])
 
   const ledger = useMemo(() => (txns == null ? [] : txns), [txns])
   const ledgerTxnVisible = useMemo(() => ledger.filter(t => !isClientInvoiceTdsTxn(t)), [ledger])
@@ -5516,7 +5531,23 @@ ${buildInvoicePrintDocumentHtml({
 
   const S = {
     wrap: { display: "flex", height: "100vh", overflow: "hidden", background: SKY.page, fontFamily: "'DM Sans',system-ui,sans-serif", fontSize: 13, color: SKY.text },
-    sb: { width: 224, background: SKY.surface2, borderRight: `1px solid ${SKY.borderHi}`, display: "flex", flexDirection: "column", flexShrink: 0 },
+    sb: isMobile
+      ? {
+          position: "fixed",
+          left: 0,
+          top: 0,
+          bottom: 0,
+          width: "min(84vw, 300px)",
+          background: SKY.surface2,
+          borderRight: `1px solid ${SKY.borderHi}`,
+          display: "flex",
+          flexDirection: "column",
+          transform: mobileNavOpen ? "translateX(0)" : "translateX(-108%)",
+          transition: "transform .2s ease",
+          zIndex: 1200,
+          boxShadow: "0 16px 40px rgba(2,8,23,.28)",
+        }
+      : { width: isTablet ? 198 : 224, background: SKY.surface2, borderRight: `1px solid ${SKY.borderHi}`, display: "flex", flexDirection: "column", flexShrink: 0 },
     main: { flex: 1, display: "flex", flexDirection: "column", overflow: "hidden", minWidth: 0 },
     bar: {
       background: SKY.surface,
@@ -5529,11 +5560,11 @@ ${buildInvoicePrintDocumentHtml({
       flexShrink: 0,
       boxShadow: "0 1px 0 rgba(107,122,255,.06)",
     },
-    cnt: { flex: 1, overflowY: "auto", padding: 18, background: SKY.page },
-    g4: { display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 11, marginBottom: 13 },
-    g3: { display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 11, marginBottom: 13 },
-    g2: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 13, marginBottom: 13 },
-    card: { background: SKY.surface, border: `1px solid ${SKY.border}`, borderRadius: 12, padding: 16, marginBottom: 13, boxShadow: "0 1px 3px rgba(107,122,255,.06)" },
+    cnt: { flex: 1, overflowY: "auto", padding: isMobile ? 10 : 18, background: SKY.page },
+    g4: { display: "grid", gridTemplateColumns: isMobile ? "1fr" : isTablet ? "repeat(2,1fr)" : "repeat(4,1fr)", gap: 11, marginBottom: 13 },
+    g3: { display: "grid", gridTemplateColumns: isMobile ? "1fr" : isTablet ? "repeat(2,1fr)" : "repeat(3,1fr)", gap: 11, marginBottom: 13 },
+    g2: { display: "grid", gridTemplateColumns: isMobile ? "1fr" : "1fr 1fr", gap: 13, marginBottom: 13 },
+    card: { background: SKY.surface, border: `1px solid ${SKY.border}`, borderRadius: 12, padding: isMobile ? 12 : 16, marginBottom: 13, boxShadow: "0 1px 3px rgba(107,122,255,.06)" },
     btn: { background: JM.p, border: "none", borderRadius: 8, padding: "6px 13px", fontSize: 12, fontWeight: 700, color: "#fff", cursor: "pointer" },
     btnO: { background: "transparent", border: `1px solid ${SKY.borderHi}`, borderRadius: 8, padding: "6px 11px", fontSize: 12, fontWeight: 600, color: SKY.text2, cursor: "pointer" },
     sel: { ...IS, height: 33, cursor: "pointer" },
@@ -5547,8 +5578,18 @@ ${buildInvoicePrintDocumentHtml({
       background: a ? SKY.surface2 : "transparent",
       border: "none",
     }),
-    tabs: { display: "flex", gap: 2, background: SKY.surface2, borderRadius: 8, padding: 3, marginBottom: 14, width: "fit-content", border: `1px solid ${SKY.border}` },
+    tabs: { display: "flex", gap: 2, background: SKY.surface2, borderRadius: 8, padding: 3, marginBottom: 14, width: "fit-content", maxWidth: "100%", overflowX: "auto", border: `1px solid ${SKY.border}` },
   }
+
+  const navigateTo = useCallback(
+    k => {
+      setPage(k)
+      setFCat("")
+      setSearch("")
+      if (isMobile) setMobileNavOpen(false)
+    },
+    [isMobile]
+  )
 
   const hdrInput = {
     background: SKY.surface,
@@ -9253,10 +9294,11 @@ ${buildInvoicePrintDocumentHtml({
   }
 
   return (
-    <div style={S.wrap}>
-      <style>{`@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&display=swap');*{box-sizing:border-box;margin:0;padding:0}::-webkit-scrollbar{width:4px;height:4px}::-webkit-scrollbar-thumb{background:rgba(107,122,255,.45);border-radius:10px}select option{background:#ffffff;color:#0c4a6e}@keyframes spin{to{transform:rotate(360deg)}}`}</style>
+    <div style={S.wrap} className="jm-app">
+      <style>{`@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&display=swap');*{box-sizing:border-box;margin:0;padding:0}::-webkit-scrollbar{width:4px;height:4px}::-webkit-scrollbar-thumb{background:rgba(107,122,255,.45);border-radius:10px}select option{background:#ffffff;color:#0c4a6e}@keyframes spin{to{transform:rotate(360deg)}}@media (max-width:900px){.jm-app [style*="grid-template-columns: 1fr 1fr"]{grid-template-columns:1fr !important}.jm-app [style*="grid-template-columns: 1fr 280px"]{grid-template-columns:1fr !important}.jm-app [style*="grid-template-columns: 160px 160px 140px 140px 1fr auto"]{grid-template-columns:1fr !important}.jm-app [style*="grid-template-columns: 1fr 1fr 1fr 1fr 1fr 1fr auto"]{grid-template-columns:1fr !important}.jm-app [style*="min-width: 720"]{min-width:640px !important}.jm-app table{font-size:11px !important}}`}</style>
 
       {toast&&<div style={{position:"fixed",top:14,right:14,background:toast.c,color:"#fff",padding:"9px 16px",borderRadius:9,fontSize:12,fontWeight:700,zIndex:9999,boxShadow:"0 4px 20px rgba(0,0,0,.4)"}}>{toast.msg}</div>}
+      {isMobile && mobileNavOpen && <div onClick={() => setMobileNavOpen(false)} style={{ position: "fixed", inset: 0, background: "rgba(2,8,23,.42)", zIndex: 1100 }} />}
 
       {/* SIDEBAR */}
       <div style={S.sb}>
@@ -9307,11 +9349,7 @@ ${buildInvoicePrintDocumentHtml({
                   <button
                     key={k}
                     type="button"
-                    onClick={() => {
-                      setPage(k)
-                      setFCat("")
-                      setSearch("")
-                    }}
+                    onClick={() => navigateTo(k)}
                     style={{
                       display: "flex",
                       alignItems: "center",
@@ -9362,11 +9400,7 @@ ${buildInvoicePrintDocumentHtml({
                   <button
                     key={k}
                     type="button"
-                    onClick={() => {
-                      setPage(k)
-                      setFCat("")
-                      setSearch("")
-                    }}
+                    onClick={() => navigateTo(k)}
                     style={{
                       display: "flex",
                       alignItems: "center",
@@ -9420,11 +9454,7 @@ ${buildInvoicePrintDocumentHtml({
                   <button
                     key={k}
                     type="button"
-                    onClick={() => {
-                      setPage(k)
-                      setFCat("")
-                      setSearch("")
-                    }}
+                    onClick={() => navigateTo(k)}
                     style={{
                       display: "flex",
                       alignItems: "center",
@@ -9531,6 +9561,16 @@ ${buildInvoicePrintDocumentHtml({
         <div style={S.bar}>
           <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 20, flexWrap: "wrap" }}>
             <div style={{ display: "flex", alignItems: "center", gap: 14, minWidth: 0, flex: "1 1 240px" }}>
+              {isMobile && (
+                <button
+                  type="button"
+                  onClick={() => setMobileNavOpen(true)}
+                  style={{ ...S.btnO, padding: "7px 10px", fontSize: 13, borderRadius: 10 }}
+                  aria-label="Open navigation menu"
+                >
+                  ☰
+                </button>
+              )}
               <img src="/logo.png" alt="" width={40} height={40} style={{ objectFit: "contain", flexShrink: 0 }} />
               <div style={{ minWidth: 0 }}>
                 <div style={{ fontSize: 10, fontWeight: 800, color: JM.p, letterSpacing: "0.06em", textTransform: "uppercase" }}>JM Tally</div>
