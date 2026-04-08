@@ -294,25 +294,9 @@ export function draftInvoiceSettlementTxns({ prevTxns, inv, incBank, incTds, dat
       audit: { ref: `invoice:${inv.id}:bank:${stamp}` },
     })
   }
-  if (td > 0.005) {
-    id += 1
-    const journalLines = buildInvoiceTdsJournalLines(td, cat)
-    const v = validateBalanced(journalLines)
-    if (!v.ok) return { error: v.errors[0] || "Unbalanced journal (TDS)" }
-    out.push({
-      id,
-      date: dateStr,
-      particulars: `TDS deducted by client — ${inv.num} — ${inv.client}`,
-      amount: td,
-      drCr: "CR",
-      category: cat,
-      fy: inferFY(dateStr),
-      journalLines,
-      void: false,
-      excludeFromBankRunning: true,
-      audit: { ref: `invoice:${inv.id}:tds:${stamp}` },
-    })
-  }
+  // Client-side TDS is tracked at invoice level and in the dedicated TDS page.
+  // Do not auto-post a transaction line for it so it does not appear in bank/cash transactions.
+  void td
   return { drafts: out }
 }
 

@@ -246,6 +246,12 @@ function syncLedgerWithInvoicePaymentState(txns, inv, opt) {
   return withRecalculatedBalances(applyLedgerCategoryNormalization([...stripped, ...stamped]))
 }
 
+function isClientInvoiceTdsTxn(t) {
+  const ref = t?.audit?.ref
+  if (typeof ref === "string" && ref.includes(":tds:")) return true
+  return /^TDS deducted by client\s*—/i.test(String(t?.particulars || ""))
+}
+
 function ledgerVisualChanged(prev, next) {
   if (!Array.isArray(prev) || !Array.isArray(next) || prev.length !== next.length) return true
   const pmap = Object.fromEntries(prev.map(t => [t.id, t]))
@@ -743,6 +749,21 @@ function normalizeManualClients(arr) {
       ifsc: String(x.ifsc || ""),
       creditLimit: String(x.creditLimit || ""),
     }))
+}
+
+function normalizeTdsPayments(arr) {
+  if (!Array.isArray(arr)) return []
+  return arr
+    .filter(x => x && typeof x === "object")
+    .map((x, i) => ({
+      id: Number(x.id) > 0 ? Number(x.id) : i + 1,
+      date: typeof x.date === "string" && x.date ? x.date : todayISO(),
+      amount: Math.max(0, Math.round((Number(x.amount) || 0) * 100) / 100),
+      section: String(x.section || "194C"),
+      remark: String(x.remark || "").trim(),
+      createdAt: x.createdAt || new Date().toISOString(),
+    }))
+    .filter(x => x.amount > 0.005)
 }
 
 function mergeManualClientsIntoPresets(manualClients, invoicePresets) {
@@ -3191,6 +3212,8 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
   const [inventory, setInventory] = useState([])
   const [importHistory, setImportHistory] = useState([])
   const [invoices, setInvoices] = useState([])
+  const [tdsPaidEntries, setTdsPaidEntries] = useState([])
+  const [tdsPayDraft, setTdsPayDraft] = useState({ date: todayISO(), amount: "", section: "194C", remark: "" })
   const [invListFilter, setInvListFilter] = useState("all")
   /** When set, invoice modal saves over this row instead of creating */
   const [invoiceModalEditId, setInvoiceModalEditId] = useState(null)
@@ -3244,6 +3267,7 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
         setAutomationSkills(coerceAutomationSkills(st?.automationSkills))
         setAssistantMemory(normalizeAssistantMemory(st?.assistantMemory))
         setManualClients(normalizeManualClients(st?.manualClients))
+        setTdsPaidEntries(normalizeTdsPayments(st?.tdsPaidEntries))
       } finally {
       setLoading(false)
       }
@@ -3263,9 +3287,10 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
         automationSkills,
         assistantMemory: normalizeAssistantMemory(assistantMemory),
         manualClients: normalizeManualClients(manualClients),
+        tdsPaidEntries: normalizeTdsPayments(tdsPaidEntries),
       },
     })
-  }, [txns, invoices, inventory, importHistory, acctRole, periodLockIso, automationSkills, assistantMemory, manualClients, activeCompanyId, loading, scopedStore])
+  }, [txns, invoices, inventory, importHistory, acctRole, periodLockIso, automationSkills, assistantMemory, manualClients, tdsPaidEntries, activeCompanyId, loading, scopedStore])
 
   const addAssistantMemoryNote = useCallback(note => {
     const n = String(note || "").trim()
@@ -3314,6 +3339,7 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
   }, [quickAddOpen])
 
   const ledger = useMemo(() => (txns == null ? [] : txns), [txns])
+  const ledgerTxnVisible = useMemo(() => ledger.filter(t => !isClientInvoiceTdsTxn(t)), [ledger])
 
   const stats = useMemo(() => {
     if (!txns) return { cr: 0, dr: 0, balance: 0, flowNet: 0, count: 0 }
@@ -3496,9 +3522,10 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
         automationSkills,
         assistantMemory: normalizeAssistantMemory(assistantMemory),
         manualClients: normalizeManualClients(manualClients),
+        tdsPaidEntries: normalizeTdsPayments(tdsPaidEntries),
       },
     })
-  }, [activeCompanyId, txns, invoices, inventory, importHistory, acctRole, periodLockIso, automationSkills, assistantMemory, manualClients, scopedStore])
+  }, [activeCompanyId, txns, invoices, inventory, importHistory, acctRole, periodLockIso, automationSkills, assistantMemory, manualClients, tdsPaidEntries, scopedStore])
 
   const applyLoadedPayload = useCallback(payload => {
     const raw = (Array.isArray(payload.txns) ? payload.txns : []).map(t => ({ ...t, void: !!t.void }))
@@ -3515,6 +3542,7 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
     setAutomationSkills(coerceAutomationSkills(st?.automationSkills))
     setAssistantMemory(normalizeAssistantMemory(st?.assistantMemory))
     setManualClients(normalizeManualClients(st?.manualClients))
+    setTdsPaidEntries(normalizeTdsPayments(st?.tdsPaidEntries))
   }, [])
 
   const switchCompany = useCallback(
@@ -4935,7 +4963,7 @@ ${buildInvoicePrintDocumentHtml({
 
   const filtered = useMemo(()=>{
     if(!txns) return []
-    let f = showVoid ? [...ledger] : ledger.filter(t=>!t.void)
+    let f = showVoid ? [...ledgerTxnVisible] : ledgerTxnVisible.filter(t=>!t.void)
     if (search) {
       const q = search.toLowerCase()
       f = f.filter(
@@ -4952,7 +4980,7 @@ ${buildInvoicePrintDocumentHtml({
     if(repFy) f = f.filter(t=>t.fy===repFy)
     if (miscRecatOnly) f = f.filter(t => t.category === "Misc Expense" || t.category === "Misc Income")
     return f
-  },[txns, ledger, search, fCat, fDC, repFy, showVoid, miscRecatOnly])
+  },[txns, ledgerTxnVisible, search, fCat, fDC, repFy, showVoid, miscRecatOnly])
 
   const sortedTxnRows = useMemo(() => {
     const arr = [...filtered]
@@ -5092,7 +5120,7 @@ ${buildInvoicePrintDocumentHtml({
     whiteSpace: "nowrap",
   }
 
-  const pages = {dash:"Dashboard",txn:"Transactions",inv:"Invoices",clients:"Clients",led:"General Ledger",coa:"Chart of Accounts",gst:"GST Compliance",pay:"Payroll & TDS",stock:"Inventory",rec:"Reconciliation",rep:"Reports & P&L",bulk:"Bulk Upload",ai:"AI Agent"}
+  const pages = {dash:"Dashboard",txn:"Transactions",inv:"Invoices",clients:"Clients",led:"General Ledger",coa:"Chart of Accounts",gst:"GST Compliance",tds:"TDS Deductions",pay:"Payroll & TDS",stock:"Inventory",rec:"Reconciliation",rep:"Reports & P&L",bulk:"Bulk Upload",ai:"AI Agent"}
 
   const overviewNavLinks = [
     ["⊞", "dash"],
@@ -5103,6 +5131,7 @@ ${buildInvoicePrintDocumentHtml({
   ]
   const financeNavLinks = [
     ["◈", "gst"],
+    ["⊡", "tds"],
     ["⊙", "pay"],
     ["▥", "coa"],
     ["▣", "stock"],
@@ -5495,7 +5524,7 @@ ${buildInvoicePrintDocumentHtml({
           >
             {acctRole === "Viewer" ? "View-only" : "+ Add"}
           </button>
-          <button type="button" onClick={()=>{const h="Date,Particulars,Category,Type,Amount,Balance,FY\n"+txns.map(t=>[t.date,'"'+t.particulars.replace(/"/g,"'")+'"',t.category,t.drCr,t.amount,t.balance,t.fy].join(",")).join("\n");const b=new Blob([h],{type:"text/csv"});const a=document.createElement("a");a.href=URL.createObjectURL(b);a.download="jm_tally_txns.csv";a.click()}} style={{...S.btnO,fontSize:11,padding:"5px 11px"}}>⬇ CSV</button>
+          <button type="button" onClick={()=>{const h="Date,Particulars,Category,Type,Amount,Balance,FY\n"+ledgerTxnVisible.map(t=>[t.date,'"'+t.particulars.replace(/"/g,"'")+'"',t.category,t.drCr,t.amount,t.balance,t.fy].join(",")).join("\n");const b=new Blob([h],{type:"text/csv"});const a=document.createElement("a");a.href=URL.createObjectURL(b);a.download="jm_tally_txns.csv";a.click()}} style={{...S.btnO,fontSize:11,padding:"5px 11px"}}>⬇ CSV</button>
         </div>
         <Tbl cols={[
           {h:"#",k:"id",cell:r=><span style={{color:"#475569",fontSize:11}}>{r.id}</span>},
@@ -8249,6 +8278,120 @@ ${buildInvoicePrintDocumentHtml({
       case "led": return <Led/>
       case "coa": return <Coa/>
       case "gst": return <GST/>
+      case "tds": {
+        const clientRows = invoices
+          .filter(inv => (Number(inv.paidTdsTotal) || 0) > 0.005)
+          .map(inv => ({
+            id: inv.id,
+            date: inv.paidAt || inv.date,
+            invoice: inv.num,
+            client: inv.client,
+            taxable: Number(inv.taxable) || 0,
+            tds: Number(inv.paidTdsTotal) || 0,
+          }))
+          .sort((a, b) => new Date(b.date) - new Date(a.date) || b.id - a.id)
+        const clientTotal = clientRows.reduce((s, r) => s + r.tds, 0)
+        const paidRows = normalizeTdsPayments(tdsPaidEntries).sort((a, b) => new Date(b.date) - new Date(a.date) || b.id - a.id)
+        const paidTotal = paidRows.reduce((s, r) => s + (Number(r.amount) || 0), 0)
+        const netPayable = Math.max(0, Math.round((clientTotal - paidTotal) * 100) / 100)
+
+        const addTdsPayment = () => {
+          if (acctRole === "Viewer") return
+          const amount = parseMoneyInput(tdsPayDraft.amount)
+          if (amount <= 0.005) {
+            toast_("Enter TDS paid amount", "#f43f5e")
+            return
+          }
+          const next = {
+            id: Math.max(0, ...tdsPaidEntries.map(x => Number(x.id) || 0)) + 1,
+            date: tdsPayDraft.date || todayISO(),
+            amount,
+            section: String(tdsPayDraft.section || "194C").trim() || "194C",
+            remark: String(tdsPayDraft.remark || "").trim(),
+            createdAt: new Date().toISOString(),
+          }
+          setTdsPaidEntries(prev => normalizeTdsPayments([...prev, next]))
+          setTdsPayDraft({ date: todayISO(), amount: "", section: "194C", remark: "" })
+          appendAudit({ action: "TDS_PAID_ADD", amount, section: next.section })
+          toast_("TDS paid entry added", "#10b981")
+        }
+
+        const removeTdsPayment = id => {
+          if (acctRole === "Viewer") return
+          setTdsPaidEntries(prev => prev.filter(x => x.id !== id))
+          appendAudit({ action: "TDS_PAID_REMOVE", id })
+          toast_("TDS paid entry removed", "#f59e0b")
+        }
+
+        return (
+          <div>
+            <div style={S.g4}>
+              <Stat label="TDS deducted by client" value={"₹" + inr0(clientTotal)} sub={String(clientRows.length) + " invoice(s)"} color="#0369a1" icon="⊡" />
+              <Stat label="TDS paid by me" value={"₹" + inr0(paidTotal)} sub={String(paidRows.length) + " payment(s)"} color="#10b981" icon="✓" />
+              <Stat label="Net TDS payable" value={"₹" + inr0(netPayable)} sub="Deducted minus paid" color={netPayable > 0.01 ? "#f59e0b" : "#10b981"} icon="⏳" />
+            </div>
+
+            <div style={{ ...S.card, marginBottom: 14 }}>
+              <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 10 }}>Add TDS paid by me</div>
+              <div style={{ display: "grid", gridTemplateColumns: "160px 140px 140px 1fr auto", gap: 8, alignItems: "end" }}>
+                <F label="Date">
+                  <input type="date" value={tdsPayDraft.date} onChange={e => setTdsPayDraft(p => ({ ...p, date: e.target.value }))} style={IS} />
+                </F>
+                <F label="Amount (₹)">
+                  <input type="number" value={tdsPayDraft.amount} onChange={e => setTdsPayDraft(p => ({ ...p, amount: e.target.value }))} style={IS} placeholder="0" />
+                </F>
+                <F label="Section">
+                  <input value={tdsPayDraft.section} onChange={e => setTdsPayDraft(p => ({ ...p, section: e.target.value }))} style={IS} placeholder="194C / 194J / 192" />
+                </F>
+                <F label="Remark">
+                  <input value={tdsPayDraft.remark} onChange={e => setTdsPayDraft(p => ({ ...p, remark: e.target.value }))} style={IS} placeholder="Challan no / month / note" />
+                </F>
+                <button type="button" onClick={addTdsPayment} disabled={acctRole === "Viewer"} style={{ ...S.btn, fontSize: 11, padding: "7px 12px", opacity: acctRole === "Viewer" ? 0.45 : 1 }}>
+                  + Add
+                </button>
+              </div>
+            </div>
+
+            <div style={S.g2}>
+              <div style={S.card}>
+                <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 10 }}>TDS deducted by client (from invoices)</div>
+                <Tbl
+                  cols={[
+                    { h: "Date", cell: r => formatIsoNice(r.date) },
+                    { h: "Invoice", k: "invoice" },
+                    { h: "Client", k: "client" },
+                    { h: "Taxable", r: true, cell: r => "₹" + inr(r.taxable) },
+                    { h: "TDS", r: true, cell: r => <span style={{ color: "#0369a1", fontFamily: "monospace" }}>₹{inr(r.tds)}</span> },
+                  ]}
+                  rows={clientRows}
+                  empty="No client TDS deductions recorded yet."
+                />
+              </div>
+              <div style={S.card}>
+                <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 10 }}>TDS paid by me</div>
+                <Tbl
+                  cols={[
+                    { h: "Date", cell: r => formatIsoNice(r.date) },
+                    { h: "Section", k: "section" },
+                    { h: "Remark", k: "remark" },
+                    { h: "Amount", r: true, cell: r => <span style={{ color: "#10b981", fontFamily: "monospace" }}>₹{inr(r.amount)}</span> },
+                    {
+                      h: "Action",
+                      cell: r => (
+                        <button type="button" disabled={acctRole === "Viewer"} onClick={() => removeTdsPayment(r.id)} style={{ ...S.btnO, fontSize: 10, padding: "3px 8px", color: "#f43f5e", borderColor: "rgba(244,63,94,.4)", opacity: acctRole === "Viewer" ? 0.45 : 1 }}>
+                          Remove
+                        </button>
+                      ),
+                    },
+                  ]}
+                  rows={paidRows}
+                  empty="No TDS payments added yet."
+                />
+              </div>
+            </div>
+          </div>
+        )
+      }
       case "pay": return <Pay/>
       case "rep": return <Rep/>
       case "ai":
@@ -9765,7 +9908,7 @@ ${buildInvoicePrintDocumentHtml({
         </div>
         ) : (
           <div style={{ fontSize: 12, color: "#f43f5e", lineHeight: 1.6, marginBottom: 14 }}>
-            This <strong>removes</strong> the invoice from the register and <strong>removes auto-posted bank/TDS lines</strong> for this invoice from the ledger (matched by invoice link). Other manual entries are unchanged.
+            This <strong>removes</strong> the invoice from the register and <strong>removes auto-posted settlement lines</strong> for this invoice from the ledger (matched by invoice link). Other manual entries are unchanged.
           </div>
         )}
         {dangerFlow?.kind === "void" &&
