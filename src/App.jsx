@@ -122,6 +122,7 @@ const CATS = [
 const REVENUE_CATS = CATS.filter(c => c.startsWith("Revenue"))
 const ONE_TIME_WIPE_EMAILS = new Set(["hr@jobsmato.com"])
 const ONE_TIME_WIPE_MARK = "one_time_data_wipe_done_v1"
+const EMPLOYEE_PAYROLL_CATS = new Set(["Salary", "Payroll Salary"])
 
 /** Map Add Transaction UI (Debit/Credit) to bank journal side. */
 function ntDrCrToBank(ntDrCr) {
@@ -765,6 +766,23 @@ function normalizeTdsPayments(arr) {
       kind: String(x.kind || "paid").toLowerCase() === "deducted" ? "deducted" : "paid",
       section: String(x.section || "194C"),
       remark: String(x.remark || "").trim(),
+      createdAt: x.createdAt || new Date().toISOString(),
+    }))
+    .filter(x => x.amount > 0.005)
+}
+
+function normalizePfEsicChallans(arr) {
+  if (!Array.isArray(arr)) return []
+  return arr
+    .filter(x => x && typeof x === "object")
+    .map((x, i) => ({
+      id: Number(x.id) > 0 ? Number(x.id) : i + 1,
+      type: String(x.type || "").toUpperCase() === "ESIC" ? "ESIC" : "PF",
+      period: String(x.period || "").trim(),
+      date: typeof x.date === "string" && x.date ? x.date : todayISO(),
+      amount: Math.max(0, Math.round((Number(x.amount) || 0) * 100) / 100),
+      challanNo: String(x.challanNo || "").trim(),
+      fileName: String(x.fileName || "").trim(),
       createdAt: x.createdAt || new Date().toISOString(),
     }))
     .filter(x => x.amount > 0.005)
@@ -3276,6 +3294,8 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
   const [invoices, setInvoices] = useState([])
   const [tdsPaidEntries, setTdsPaidEntries] = useState([])
   const [tdsPayDraft, setTdsPayDraft] = useState({ date: todayISO(), kind: "paid", amount: "", section: "194C", remark: "" })
+  const [pfEsicChallans, setPfEsicChallans] = useState([])
+  const [pfEsicDraft, setPfEsicDraft] = useState({ type: "PF", period: "", date: todayISO(), amount: "", challanNo: "", fileName: "" })
   const [invListFilter, setInvListFilter] = useState("all")
   /** When set, invoice modal saves over this row instead of creating */
   const [invoiceModalEditId, setInvoiceModalEditId] = useState(null)
@@ -3331,6 +3351,7 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
         setAssistantMemory(normalizeAssistantMemory(st?.assistantMemory))
         setManualClients(normalizeManualClients(st?.manualClients))
         setTdsPaidEntries(normalizeTdsPayments(st?.tdsPaidEntries))
+        setPfEsicChallans(normalizePfEsicChallans(st?.pfEsicChallans))
       } finally {
       setLoading(false)
       }
@@ -3351,9 +3372,10 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
         assistantMemory: normalizeAssistantMemory(assistantMemory),
         manualClients: normalizeManualClients(manualClients),
         tdsPaidEntries: normalizeTdsPayments(tdsPaidEntries),
+        pfEsicChallans: normalizePfEsicChallans(pfEsicChallans),
       },
     })
-  }, [txns, invoices, inventory, importHistory, acctRole, periodLockIso, automationSkills, assistantMemory, manualClients, tdsPaidEntries, activeCompanyId, loading, scopedStore])
+  }, [txns, invoices, inventory, importHistory, acctRole, periodLockIso, automationSkills, assistantMemory, manualClients, tdsPaidEntries, pfEsicChallans, activeCompanyId, loading, scopedStore])
 
   const addAssistantMemoryNote = useCallback(note => {
     const n = String(note || "").trim()
@@ -3427,6 +3449,7 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
         setImportHistory([])
         setAssistantMemory([])
         setManualClients([])
+        setPfEsicChallans([])
         toast_("One-time data wipe completed for this user", "#f59e0b")
       } catch (e) {
         toast_(String(e?.message || e), "#f43f5e")
@@ -3488,7 +3511,7 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
 
   const ledFilteredData = useMemo(() => {
     const act = reportLedger
-    if (ledAcc.includes("Salary")) return act.filter(t => t.category.startsWith("Salary") && t.drCr === "DR")
+    if (ledAcc.includes("Salary")) return act.filter(t => EMPLOYEE_PAYROLL_CATS.has(String(t.category || "")) && t.drCr === "DR")
     if (ledAcc.includes("Director")) return act.filter(t => t.category === "Director Payment" && t.drCr === "DR")
     if (ledAcc.includes("Revenue")) return act.filter(t => t.category.startsWith("Revenue") && t.drCr === "CR")
     if (ledAcc.includes("Vendor"))
@@ -3534,7 +3557,7 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
     const dr = S(t => t.drCr === "DR")
     const cap = S(t => t.drCr === "CR" && String(t.category || "").startsWith("Capital"))
     const revSvc = S(t => t.drCr === "CR" && String(t.category || "").startsWith("Revenue"))
-    const salRem = S(t => t.drCr === "DR" && (t.category === "Salary" || t.category === "Director Payment"))
+    const salRem = S(t => t.drCr === "DR" && (EMPLOYEE_PAYROLL_CATS.has(String(t.category || "")) || t.category === "Director Payment"))
     const vendor = S(
       t => t.drCr === "DR" && (String(t.category || "").startsWith("Vendor") || String(t.category || "").startsWith("Recruitment"))
     )
@@ -3579,7 +3602,7 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
       balance: bookBankBalance,
       topRevName: tr ? String(tr[0]).replace(/^Revenue -\s*/, "") : "—",
       topRevAmt: tr ? tr[1] : 0,
-      salaryDr: ledger.filter(t => !t.void && t.drCr === "DR" && t.category === "Salary").reduce((s, t) => s + (Number(t.amount) || 0), 0),
+      salaryDr: ledger.filter(t => !t.void && t.drCr === "DR" && EMPLOYEE_PAYROLL_CATS.has(String(t.category || ""))).reduce((s, t) => s + (Number(t.amount) || 0), 0),
       gstEst: outputGstFullBook,
       itRefund: ledger.filter(t => !t.void && t.drCr === "CR" && t.category === "Income Tax Refund").reduce((s, t) => s + (Number(t.amount) || 0), 0),
       count: stats.count,
@@ -3637,9 +3660,10 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
         assistantMemory: normalizeAssistantMemory(assistantMemory),
         manualClients: normalizeManualClients(manualClients),
         tdsPaidEntries: normalizeTdsPayments(tdsPaidEntries),
+        pfEsicChallans: normalizePfEsicChallans(pfEsicChallans),
       },
     })
-  }, [activeCompanyId, txns, invoices, inventory, importHistory, acctRole, periodLockIso, automationSkills, assistantMemory, manualClients, tdsPaidEntries, scopedStore])
+  }, [activeCompanyId, txns, invoices, inventory, importHistory, acctRole, periodLockIso, automationSkills, assistantMemory, manualClients, tdsPaidEntries, pfEsicChallans, scopedStore])
 
   const applyLoadedPayload = useCallback(payload => {
     const raw = (Array.isArray(payload.txns) ? payload.txns : []).map(t => ({ ...t, void: !!t.void }))
@@ -3657,6 +3681,7 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
     setAssistantMemory(normalizeAssistantMemory(st?.assistantMemory))
     setManualClients(normalizeManualClients(st?.manualClients))
     setTdsPaidEntries(normalizeTdsPayments(st?.tdsPaidEntries))
+    setPfEsicChallans(normalizePfEsicChallans(st?.pfEsicChallans))
   }, [])
 
   const switchCompany = useCallback(
@@ -3702,7 +3727,7 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
         invoices: [],
         inventory: [],
         importHistory: [],
-        settings: { acctRole: "Admin", periodLockIso: "", automationSkills: coerceAutomationSkills([]), assistantMemory: [], manualClients: [] },
+        settings: { acctRole: "Admin", periodLockIso: "", automationSkills: coerceAutomationSkills([]), assistantMemory: [], manualClients: [], pfEsicChallans: [] },
       })
       const payload = await loadCompanyPayload(scopedStore, id)
       setActiveCompanyId(id)
@@ -3848,7 +3873,7 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
   },[txns,nt,acctRole,periodLockIso,appendAudit])
 
   const updateTxnCategory = useCallback(
-    (id, newCategory) => {
+    (id, newCategory, opt) => {
       if (acctRole === "Viewer") {
         toast_("Viewer role — cannot edit categories", "#f43f5e")
         return
@@ -3865,6 +3890,11 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
         return
       }
       if (newCategory === t.category) return
+      const askConfirm = opt?.confirm !== false
+      if (askConfirm) {
+        const msg = `Change category for txn #${id}?\n\nFrom: ${t.category}\nTo: ${newCategory}\n${t.particulars ? `\nNarration: ${String(t.particulars).slice(0, 80)}` : ""}`
+        if (!confirm(msg)) return
+      }
       const jl = buildJournalLines({ amount: t.amount, drCr: t.drCr, category: newCategory })
       const v = validateBalanced(jl)
       if (!v.ok) {
@@ -8195,7 +8225,6 @@ ${buildInvoicePrintDocumentHtml({
         }
       })
     const itVendorDr = reportLedger.filter(t => t.drCr === "DR" && t.category === "Vendor - IT Solutions")
-    const itVendorGross = itVendorDr.reduce((s, t) => s + t.amount, 0)
     const itcItVendor = itVendorDr.reduce((s, t) => s + gst18InclusiveSplit(t.amount).gst, 0)
     const bankDr = reportLedger.filter(t => t.drCr === "DR" && t.category === "Bank Charges")
     const itcBank = bankDr.reduce((s, t) => s + gst18InclusiveSplit(t.amount).gst, 0)
@@ -8246,7 +8275,7 @@ ${buildInvoicePrintDocumentHtml({
             sub={totalGstPaid > 0 ? "Books snapshot — not filed return" : "Reduce when you record GST payments"}
             color="#f43f5e"
           />
-          <Stat label="IT vendor (DR)" value={"₹" + inr0(itVendorGross)} sub={String(itVendorDr.length) + " payments"} color="#5563E8" />
+          <Stat label="IT expense entries" value={String(itVendorDr.length)} sub="Used only for ITC estimate" color="#5563E8" />
         </div>
         <div
           style={{
@@ -8355,16 +8384,59 @@ ${buildInvoicePrintDocumentHtml({
   }
 
   const Pay = () => {
-    const sal = reportLedger.filter(t=>t.drCr==="DR"&&(t.category==="Director Payment"||t.category==="Salary"))
-    const salDr = reportLedger.filter(t=>t.drCr==="DR"&&t.category==="Salary")
+    const sal = reportLedger.filter(t=>t.drCr==="DR"&&(t.category==="Director Payment"||EMPLOYEE_PAYROLL_CATS.has(String(t.category||""))))
+    const salDr = reportLedger.filter(t=>t.drCr==="DR"&&EMPLOYEE_PAYROLL_CATS.has(String(t.category||"")))
     const salTotal = salDr.reduce((s,t)=>s+t.amount,0)
     const fltr = sal.filter(t=>!fCat||t.category===fCat)
+    const payrollDr = reportLedger.filter(t => t.drCr === "DR" && (t.category === "Employer PF Contribution" || t.category === "ESI Expense"))
+    const payrollDrTotal = payrollDr.reduce((s, t) => s + (Number(t.amount) || 0), 0)
+    const challans = normalizePfEsicChallans(pfEsicChallans)
+    const challanPaidTotal = challans.reduce((s, x) => s + (Number(x.amount) || 0), 0)
+    const netPayrollPayable = Math.max(0, Math.round((payrollDrTotal - challanPaidTotal) * 100) / 100)
+    const addPfEsicChallan = () => {
+      const amt = Math.round((Number(pfEsicDraft.amount) || 0) * 100) / 100
+      const period = String(pfEsicDraft.period || "").trim()
+      if (!period) return toast_("Enter payroll month/period", "#f59e0b")
+      if (!(amt > 0)) return toast_("Enter valid challan amount", "#f59e0b")
+      const next = {
+        id: Date.now(),
+        type: String(pfEsicDraft.type || "").toUpperCase() === "ESIC" ? "ESIC" : "PF",
+        period,
+        date: pfEsicDraft.date || todayISO(),
+        amount: amt,
+        challanNo: String(pfEsicDraft.challanNo || "").trim(),
+        fileName: String(pfEsicDraft.fileName || "").trim(),
+        createdAt: new Date().toISOString(),
+      }
+      setPfEsicChallans(prev => normalizePfEsicChallans([...prev, next]))
+      appendAudit({ action: "ADD_PAYROLL_CHALLAN", amount: amt, category: next.type, particulars: `${next.type} challan ${next.period}${next.challanNo ? " · " + next.challanNo : ""}` })
+      setPfEsicDraft({ type: next.type, period: "", date: todayISO(), amount: "", challanNo: "", fileName: "" })
+      toast_("Challan uploaded to payroll register", "#10b981")
+    }
+    const removePfEsicChallan = id => {
+      setPfEsicChallans(prev => prev.filter(x => x.id !== id))
+      appendAudit({ action: "REMOVE_PAYROLL_CHALLAN", amount: 0, category: "Payroll", particulars: "Removed PF/ESIC challan from register" })
+      toast_("Challan removed", "#f59e0b")
+    }
+    const downloadPfEsicReportCsv = () => {
+      const rows = normalizePfEsicChallans(pfEsicChallans)
+      const head = "Type,Period,Date,Amount,Challan No,File Name\n"
+      const body = rows
+        .map(x => [x.type, `"${String(x.period).replace(/"/g, "'")}"`, x.date, x.amount, `"${String(x.challanNo || "").replace(/"/g, "'")}"`, `"${String(x.fileName || "").replace(/"/g, "'")}"`].join(","))
+        .join("\n")
+      const b = new Blob([head + body], { type: "text/csv" })
+      const a = document.createElement("a")
+      a.href = URL.createObjectURL(b)
+      a.download = `jm_payroll_pf_esic_report_${todayISO()}.csv`
+      a.click()
+      URL.revokeObjectURL(a.href)
+    }
     return (
       <div>
         <div style={S.g4}>
-          <Stat label="Salary (employees)" value={"₹"+inr0(salTotal)} sub="Category: Salary" color="#f43f5e"/>
+          <Stat label="Salary (employees)" value={"₹"+inr0(salTotal)} sub="Salary + Payroll Salary" color="#f43f5e"/>
           <Stat label="Director payment (DR)" value={"₹"+inr0(sal.filter(t=>t.category==="Director Payment").reduce((s,t)=>s+t.amount,0))} color="#f43f5e"/>
-          <Stat label="Salary payouts" value={String(salDr.length)} sub="Debit transactions" color="#94a3b8"/>
+          <Stat label="Salary payouts" value={String(salDr.length)} sub="Salary + Payroll Salary txns" color="#94a3b8"/>
           <Stat label="Salary + Director (DR)" value={"₹"+inr0(sal.reduce((s,t)=>s+t.amount,0))} color="#f59e0b"/>
         </div>
         <div style={S.tabs}>
@@ -8372,13 +8444,46 @@ ${buildInvoicePrintDocumentHtml({
         </div>
         {pTab==="all"&&<>
           <div style={{display:"flex",gap:7,marginBottom:13}}>
-            <select value={fCat} onChange={e=>setFCat(e.target.value)} style={{...S.sel,width:190}}><option value="">All Categories</option><option>Director Payment</option><option>Salary</option></select>
+            <select value={fCat} onChange={e=>setFCat(e.target.value)} style={{...S.sel,width:190}}><option value="">All Categories</option><option>Director Payment</option><option>Salary</option><option>Payroll Salary</option></select>
             <button onClick={()=>setModal("emp")} style={{...S.btn,fontSize:11,padding:"5px 11px"}}>+ Add Employee</button>
           </div>
           <Tbl cols={[{h:"Date",k:"date"},{h:"Narration",cell:r=><span style={{fontSize:11,color:"#94a3b8"}}>{r.particulars.substring(0,48)}</span>},{h:"Category",cell:r=><Chip cat={r.category}/>},{h:"Amount",r:true,cell:r=><span style={{color:"#f43f5e",fontFamily:"monospace",fontWeight:700}}>₹{inr(r.amount)}</span>},{h:"FY",cell:r=><Chip cat="Bank Charges" label={r.fy}/>}]} rows={fltr}/>
         </>}
         {pTab==="tds"&&<div style={S.card}><div style={{background:"rgba(245,158,11,.08)",border:"1px solid rgba(245,158,11,.2)",borderRadius:9,padding:"9px 13px",marginBottom:12,fontSize:11.5,color:"#fcd34d"}}>TDS u/s 192 (illustrative): ledger shows Director Payment DR <strong>₹{inr0(sal.filter(t=>t.category==="Director Payment").reduce((s,t)=>s+t.amount,0))}</strong> · Salary DR <strong>₹{inr0(salTotal)}</strong>. Replace with payee-wise payroll registers for filing. Challan 281 by 7th.</div><Tbl cols={[{h:"Payee / bucket",k:"p"},{h:"Ledger total (DR)",k:"t"},{h:"Std Deduction",k:"s"},{h:"Taxable (illustr.)",k:"x"},{h:"Slab",k:"sl"},{h:"Est. TDS",r:true,k:"e"}]} rows={[{p:"Director Payment (sum)",t:"₹"+inr0(sal.filter(t=>t.category==="Director Payment").reduce((s,t)=>s+t.amount,0)),s:"—",x:"—",sl:"Per return",e:"—"},{p:"Salary (sum)",t:"₹"+inr0(salTotal),s:"—",x:"—",sl:"Per return",e:"—"},{p:"All other payroll DR",t:"₹0",s:"—",x:"—",sl:"—",e:"—"}]}/></div>}
-        {pTab==="pf"&&<div style={S.card}><div style={{background:"rgba(107,122,255,.08)",border:"1px solid rgba(107,122,255,.2)",borderRadius:9,padding:"9px 13px",marginBottom:12,fontSize:11.5,color:"#0369a1"}}>PF applicable when ≥20 employees. ESI for salary ≤₹21,000/month. Register on epfindia.gov.in and esic.in.</div><Tbl cols={[{h:"Contribution",k:"c"},{h:"When Applicable",k:"w"},{h:"Employer",k:"er"},{h:"Employee",k:"ee"},{h:"Due",k:"d"}]} rows={[{c:"EPF",w:"≥20 employees",er:"13% Basic",ee:"12% Basic",d:"15th next month"},{c:"ESI",w:"Salary ≤₹21k",er:"3.25%",ee:"0.75%",d:"15th next month"},{c:"Prof Tax (UP)",w:"All salaried",er:"—",ee:"₹200/mo",d:"Monthly"}]}/></div>}
+        {pTab==="pf"&&<div style={S.card}>
+          <div style={S.g4}>
+            <Stat label="PF/ESIC expense (ledger DR)" value={"₹"+inr0(payrollDrTotal)} sub="Employer PF + ESI Expense" color="#6B7AFF"/>
+            <Stat label="Challan paid (uploaded)" value={"₹"+inr0(challanPaidTotal)} sub={String(challans.length)+" entries"} color="#10b981"/>
+            <Stat label="Payable (books)" value={"₹"+inr0(netPayrollPayable)} sub="Expense minus challan paid" color="#f43f5e"/>
+            <Stat label="Last upload" value={challans.length?challans[challans.length-1].date:"—"} sub={challans.length?(challans[challans.length-1].fileName||challans[challans.length-1].type):"No challan yet"} color="#94a3b8"/>
+          </div>
+          <div style={{background:"rgba(107,122,255,.08)",border:"1px solid rgba(107,122,255,.2)",borderRadius:9,padding:"9px 13px",marginBottom:12,fontSize:11.5,color:"#0369a1"}}>Upload PF and ESIC challans here. This section keeps a payroll compliance register and report export. Keep booking actual payment transaction in ledger for bank reconciliation.</div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr 1fr 1fr auto",gap:8,alignItems:"end",marginBottom:12}}>
+            <F label="Type"><select value={pfEsicDraft.type} onChange={e=>setPfEsicDraft(d=>({...d,type:e.target.value==="ESIC"?"ESIC":"PF"}))} style={S.sel}><option value="PF">PF</option><option value="ESIC">ESIC</option></select></F>
+            <F label="Payroll month / period"><input value={pfEsicDraft.period} onChange={e=>setPfEsicDraft(d=>({...d,period:e.target.value}))} placeholder="Apr-2026" style={S.in}/></F>
+            <F label="Challan date"><input type="date" value={pfEsicDraft.date} onChange={e=>setPfEsicDraft(d=>({...d,date:e.target.value}))} style={S.in}/></F>
+            <F label="Amount"><input value={pfEsicDraft.amount} onChange={e=>setPfEsicDraft(d=>({...d,amount:e.target.value}))} placeholder="0" style={S.in}/></F>
+            <F label="Challan no."><input value={pfEsicDraft.challanNo} onChange={e=>setPfEsicDraft(d=>({...d,challanNo:e.target.value}))} placeholder="TRRN / CIN" style={S.in}/></F>
+            <F label="Upload challan"><input type="file" onChange={e=>setPfEsicDraft(d=>({...d,fileName:e.target.files?.[0]?.name||""}))} style={{...S.in,padding:"6px 8px"}}/></F>
+            <button type="button" onClick={addPfEsicChallan} style={{...S.btn,height:34}}>Add</button>
+          </div>
+          <div style={{display:"flex",gap:8,marginBottom:10}}>
+            <button type="button" onClick={downloadPfEsicReportCsv} style={{...S.btnO,fontSize:11,padding:"5px 11px"}}>⬇ PF/ESIC Report CSV</button>
+          </div>
+          <Tbl
+            cols={[
+              {h:"Type",cell:r=><Chip cat={r.type==="PF"?"Salary":"Vendor - IT Solutions"} label={r.type}/>},
+              {h:"Period",k:"period"},
+              {h:"Date",k:"date"},
+              {h:"Amount",r:true,cell:r=><span style={{fontFamily:"monospace",fontWeight:700}}>₹{inr(r.amount)}</span>},
+              {h:"Challan",cell:r=><span>{r.challanNo||"—"}</span>},
+              {h:"File",cell:r=><span style={{color:"#64748b",fontSize:11}}>{r.fileName||"—"}</span>},
+              {h:"",r:true,cell:r=><button type="button" onClick={()=>removePfEsicChallan(r.id)} style={{...S.btnO,fontSize:10,padding:"3px 7px"}}>Remove</button>},
+            ]}
+            rows={[...challans].sort((a,b)=>String(b.date||"").localeCompare(String(a.date||"")))}
+            empty="No PF/ESIC challan uploaded yet."
+          />
+        </div>}
       </div>
     )
   }
@@ -8773,7 +8878,7 @@ ${buildInvoicePrintDocumentHtml({
             onBankStatementFile={handleBankStatementFile}
             onOpenInvoiceModal={openCreateInvoiceModal}
             ledgerTxns={ledger}
-            onRecategorizeTxn={updateTxnCategory}
+            onRecategorizeTxn={(id, cat) => updateTxnCategory(id, cat, { confirm: false })}
             assistantMemory={assistantMemory}
             onAssistantMemoryAdd={addAssistantMemoryNote}
             onRemoveAssistantNote={removeAssistantNote}
