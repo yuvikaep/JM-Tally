@@ -45,6 +45,7 @@ import {
   companyStorageKey,
 } from "./companyStorage.js"
 import { createScopedStore } from "./authStorage.js"
+import { getWorkspace, putWorkspace, getStoredToken } from "./auth/api.js"
 import { useAuth } from "./auth/AuthContext.jsx"
 import { AuthRouter } from "./auth/AuthRouter.jsx"
 import authStyles from "./auth/auth.module.css"
@@ -3230,6 +3231,108 @@ function AssistantRulesPanel({ skills, setSkills, acctRole, cats, onRunOnLedger,
   )
 }
 
+function isValidWorkspaceSnapshotShape(s) {
+  return (
+    s?.app === "jm-tally" &&
+    Array.isArray(s?.registry?.companies) &&
+    s.registry.companies.length > 0 &&
+    s.payloadsByCompanyId &&
+    typeof s.payloadsByCompanyId === "object"
+  )
+}
+
+/** True if any company has a non-void txn or at least one invoice. */
+function workspaceSnapshotHasLedgerData(snap) {
+  if (!snap?.registry?.companies?.length || !snap?.payloadsByCompanyId) return false
+  for (const c of snap.registry.companies) {
+    const p = snap.payloadsByCompanyId[c.id]
+    if (!p) continue
+    const txns = Array.isArray(p.txns) ? p.txns : []
+    if (txns.some(t => !t.void)) return true
+    if (Array.isArray(p.invoices) && p.invoices.length > 0) return true
+  }
+  return false
+}
+
+function ledgerActivityCount(snap) {
+  if (!snap?.registry?.companies?.length || !snap?.payloadsByCompanyId) return 0
+  let n = 0
+  for (const c of snap.registry.companies) {
+    const p = snap.payloadsByCompanyId[c.id]
+    if (!p) continue
+    const txns = Array.isArray(p.txns) ? p.txns : []
+    n += txns.filter(t => !t.void).length
+    n += Array.isArray(p.invoices) ? p.invoices.length : 0
+  }
+  return n
+}
+
+async function buildWorkspaceSnapshotDoc(scopedStore, email) {
+  const reg = await readRegistry(scopedStore)
+  const payloadsByCompanyId = {}
+  for (const c of reg.companies || []) {
+    if (!c?.id) continue
+    payloadsByCompanyId[c.id] = await loadCompanyPayload(scopedStore, c.id)
+  }
+  return {
+    version: 1,
+    app: "jm-tally",
+    epoch: STORAGE_EPOCH,
+    exportedAt: new Date().toISOString(),
+    email,
+    registry: reg,
+    payloadsByCompanyId,
+  }
+}
+
+/**
+ * Replace scoped local books with a snapshot (server backup or JSON import).
+ * @param {{ auditEntry?: { action: string, particulars?: string } }} opts
+ */
+/** Tracks last server `updatedAt` we merged or pushed — avoids overwriting fresh local/import with stale cloud. */
+const WORKSPACE_CLOUD_META_KEY = "workspace_cloud_meta_v1"
+
+async function applyWorkspaceSnapshotToScopedStore(scopedStore, data, opts = {}) {
+  if (!isValidWorkspaceSnapshotShape(data)) {
+    throw new Error("Invalid workspace snapshot")
+  }
+  const prevReg = await readRegistry(scopedStore)
+  const newIds = new Set((data.registry.companies || []).map(c => c.id).filter(Boolean))
+  for (const c of prevReg?.companies || []) {
+    if (c?.id && !newIds.has(c.id)) await removeCompanyData(scopedStore, c.id)
+  }
+  await writeRegistry(scopedStore, data.registry)
+  await scopedStore.set("hisaab_epoch", typeof data.epoch === "number" ? data.epoch : STORAGE_EPOCH)
+  for (const c of data.registry.companies) {
+    if (!c?.id) continue
+    const p = data.payloadsByCompanyId[c.id]
+    if (!p) continue
+    await persistCompanyPayload(scopedStore, c.id, {
+      txns: Array.isArray(p.txns) ? p.txns : [],
+      invoices: Array.isArray(p.invoices) ? p.invoices : [],
+      inventory: Array.isArray(p.inventory) ? p.inventory : [],
+      importHistory: Array.isArray(p.importHistory) ? p.importHistory : [],
+      settings:
+        p.settings && typeof p.settings === "object"
+          ? p.settings
+          : { acctRole: "Admin", periodLockIso: "" },
+    })
+    if (Array.isArray(p.audit)) {
+      await scopedStore.set(companyStorageKey(c.id, "audit_v1"), p.audit)
+    }
+  }
+  const auditEntry = opts.auditEntry
+  if (auditEntry) {
+    const auditCo =
+      data.registry.activeCompanyId && newIds.has(data.registry.activeCompanyId)
+        ? data.registry.activeCompanyId
+        : data.registry.companies[0]?.id
+    if (auditCo) {
+      await appendCompanyAudit(scopedStore, auditCo, auditEntry)
+    }
+  }
+}
+
 // ═══════════════ MAIN APP (requires login) ═══════════════
 function BooksApp({ authUser, onLogout, onChangePassword }) {
   const scopedStore = useMemo(() => createScopedStore(authUser.id, store), [authUser.id])
@@ -3330,6 +3433,8 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
   const [companies, setCompanies] = useState([])
   const [activeCompanyId, setActiveCompanyId] = useState("")
   const skipPersistRef = useRef(false)
+  /** Server `updatedAt` ISO after last successful GET/PUT sync (for conflict detection). */
+  const lastRemoteSyncRef = useRef(null)
   const [quickAddOpen, setQuickAddOpen] = useState(false)
   const quickAddRef = useRef(null)
   /** Sidebar: Overview · Finance · Intelligence */
@@ -3349,9 +3454,50 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
     ;(async () => {
       try {
         // Auth-backed accounts should never inherit pre-auth legacy browser books.
-        // Skipping this migration prevents new signups from seeing old/demo data
-        // that may exist in shared localStorage on the same device.
-        const { registry, activeCompanyId: aid, payload } = await bootstrapCompanies(scopedStore, STORAGE_EPOCH)
+        const boot = await bootstrapCompanies(scopedStore, STORAGE_EPOCH)
+        let registry = boot.registry
+        let aid = boot.activeCompanyId
+        let payload = boot.payload
+
+        // Merge server snapshot when logged in (same account on phone + desktop). Never overwrite
+        // non-empty local books with stale cloud unless we previously recorded a newer server time.
+        if (getStoredToken()) {
+          try {
+            const localDoc = await buildWorkspaceSnapshotDoc(scopedStore, authUser.email)
+            const hasLocal = workspaceSnapshotHasLedgerData(localDoc)
+            const meta = (await scopedStore.get(WORKSPACE_CLOUD_META_KEY)) || {}
+            const remote = await getWorkspace()
+            if (remote?.snapshot && isValidWorkspaceSnapshotShape(remote.snapshot)) {
+              const hasRemote = workspaceSnapshotHasLedgerData(remote.snapshot)
+              const remoteT = remote.updatedAt ? Date.parse(remote.updatedAt) : 0
+              const lastSeen = meta.serverUpdatedAt ? Date.parse(meta.serverUpdatedAt) : 0
+              const remoteN = ledgerActivityCount(remote.snapshot)
+              const localN = ledgerActivityCount(localDoc)
+              const takeRemote =
+                (hasRemote && !hasLocal) ||
+                (hasRemote && Boolean(meta.serverUpdatedAt) && remoteT > lastSeen) ||
+                (hasRemote && hasLocal && !meta.serverUpdatedAt && remoteN > localN)
+              if (takeRemote) {
+                await applyWorkspaceSnapshotToScopedStore(scopedStore, remote.snapshot, {})
+                await scopedStore.set(WORKSPACE_CLOUD_META_KEY, { serverUpdatedAt: remote.updatedAt })
+                lastRemoteSyncRef.current = remote.updatedAt || null
+                registry = await readRegistry(scopedStore)
+                aid = registry.activeCompanyId
+                if (!registry.companies.some(c => c.id === aid)) aid = registry.companies[0]?.id
+                if (aid && aid !== registry.activeCompanyId) {
+                  registry = { ...registry, activeCompanyId: aid }
+                  await writeRegistry(scopedStore, registry)
+                }
+                payload = await loadCompanyPayload(scopedStore, aid)
+              } else {
+                lastRemoteSyncRef.current = meta.serverUpdatedAt || remote.updatedAt || null
+              }
+            }
+          } catch (e) {
+            void e /* offline — keep bootstrapped local only */
+          }
+        }
+
         setCompanies((registry.companies || []).map(c => normalizeCompanyRecord(c)).filter(Boolean))
         setActiveCompanyId(aid)
         const raw = (Array.isArray(payload.txns) ? payload.txns : []).map(t => ({ ...t, void: !!t.void }))
@@ -3371,10 +3517,10 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
         setTdsPaidEntries(normalizeTdsPayments(st?.tdsPaidEntries))
         setPfEsicChallans(normalizePfEsicChallans(st?.pfEsicChallans))
       } finally {
-      setLoading(false)
+        setLoading(false)
       }
     })()
-  }, [scopedStore])
+  }, [scopedStore, authUser.email])
 
   useEffect(() => {
     if (loading || !activeCompanyId || txns === null || skipPersistRef.current) return
@@ -3394,6 +3540,67 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
       },
     })
   }, [txns, invoices, inventory, importHistory, acctRole, periodLockIso, automationSkills, assistantMemory, manualClients, tdsPaidEntries, pfEsicChallans, activeCompanyId, loading, scopedStore])
+
+  /** Debounced upload of full workspace to API so every device sees the same books (when online). */
+  useEffect(() => {
+    if (loading || !activeCompanyId || txns === null || skipPersistRef.current) return
+    if (!getStoredToken()) return
+    if (acctRole === "Viewer") return
+    const t = window.setTimeout(async () => {
+      try {
+        const remote = await getWorkspace()
+        const remoteT = remote?.updatedAt ? Date.parse(remote.updatedAt) : 0
+        const lastSync = lastRemoteSyncRef.current ? Date.parse(lastRemoteSyncRef.current) : 0
+        if (
+          remote?.snapshot &&
+          isValidWorkspaceSnapshotShape(remote.snapshot) &&
+          lastRemoteSyncRef.current != null &&
+          !Number.isNaN(lastSync) &&
+          remoteT > lastSync &&
+          workspaceSnapshotHasLedgerData(remote.snapshot)
+        ) {
+          await applyWorkspaceSnapshotToScopedStore(scopedStore, remote.snapshot, {})
+          await scopedStore.set(WORKSPACE_CLOUD_META_KEY, { serverUpdatedAt: remote.updatedAt })
+          lastRemoteSyncRef.current = remote.updatedAt
+          window.location.reload()
+          return
+        }
+        const localSnap = await buildWorkspaceSnapshotDoc(scopedStore, authUser.email)
+        if (
+          !workspaceSnapshotHasLedgerData(localSnap) &&
+          remote?.snapshot &&
+          workspaceSnapshotHasLedgerData(remote.snapshot)
+        ) {
+          return
+        }
+        const put = await putWorkspace(localSnap)
+        if (put?.updatedAt) {
+          lastRemoteSyncRef.current = put.updatedAt
+          await scopedStore.set(WORKSPACE_CLOUD_META_KEY, { serverUpdatedAt: put.updatedAt })
+        }
+      } catch (e) {
+        void e /* offline */
+      }
+    }, 3000)
+    return () => clearTimeout(t)
+  }, [
+    loading,
+    activeCompanyId,
+    txns,
+    invoices,
+    inventory,
+    importHistory,
+    acctRole,
+    periodLockIso,
+    automationSkills,
+    assistantMemory,
+    manualClients,
+    tdsPaidEntries,
+    pfEsicChallans,
+    companies,
+    scopedStore,
+    authUser.email,
+  ])
 
   const addAssistantMemoryNote = useCallback(note => {
     const n = String(note || "").trim()
@@ -3431,20 +3638,7 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
         toast_("No workspace to export", "#f59e0b")
         return
       }
-      const payloadsByCompanyId = {}
-      for (const c of reg.companies) {
-        if (!c?.id) continue
-        payloadsByCompanyId[c.id] = await loadCompanyPayload(scopedStore, c.id)
-      }
-      const doc = {
-        version: 1,
-        app: "jm-tally",
-        epoch: STORAGE_EPOCH,
-        exportedAt: new Date().toISOString(),
-        email: authUser.email,
-        registry: reg,
-        payloadsByCompanyId,
-      }
+      const doc = await buildWorkspaceSnapshotDoc(scopedStore, authUser.email)
       const blob = new Blob([JSON.stringify(doc, null, 2)], { type: "application/json;charset=utf-8" })
       const a = document.createElement("a")
       const url = URL.createObjectURL(blob)
@@ -3493,41 +3687,9 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
         return
       }
       try {
-        const prevReg = await readRegistry(scopedStore)
-        const newIds = new Set((data.registry.companies || []).map(c => c.id).filter(Boolean))
-        for (const c of prevReg?.companies || []) {
-          if (c?.id && !newIds.has(c.id)) await removeCompanyData(scopedStore, c.id)
-        }
-        await writeRegistry(scopedStore, data.registry)
-        await scopedStore.set("hisaab_epoch", typeof data.epoch === "number" ? data.epoch : STORAGE_EPOCH)
-        for (const c of data.registry.companies) {
-          if (!c?.id) continue
-          const p = data.payloadsByCompanyId[c.id]
-          if (!p) continue
-          await persistCompanyPayload(scopedStore, c.id, {
-            txns: Array.isArray(p.txns) ? p.txns : [],
-            invoices: Array.isArray(p.invoices) ? p.invoices : [],
-            inventory: Array.isArray(p.inventory) ? p.inventory : [],
-            importHistory: Array.isArray(p.importHistory) ? p.importHistory : [],
-            settings:
-              p.settings && typeof p.settings === "object"
-                ? p.settings
-                : { acctRole: "Admin", periodLockIso: "" },
-          })
-          if (Array.isArray(p.audit)) {
-            await scopedStore.set(companyStorageKey(c.id, "audit_v1"), p.audit)
-          }
-        }
-        const auditCo =
-          data.registry.activeCompanyId && newIds.has(data.registry.activeCompanyId)
-            ? data.registry.activeCompanyId
-            : data.registry.companies[0]?.id
-        if (auditCo) {
-          await appendCompanyAudit(scopedStore, auditCo, {
-            action: "WORKSPACE_IMPORT",
-            particulars: `Restored from ${file.name}`,
-          })
-        }
+        await applyWorkspaceSnapshotToScopedStore(scopedStore, data, {
+          auditEntry: { action: "WORKSPACE_IMPORT", particulars: `Restored from ${file.name}` },
+        })
         toast_("Backup restored — reloading…", "#10b981")
         window.setTimeout(() => {
           window.location.reload()
@@ -6003,14 +6165,20 @@ ${buildInvoicePrintDocumentHtml({
             lineHeight: 1.55,
           }}
         >
-          <div style={{ fontWeight: 800, marginBottom: 8 }}>This device has no ledger yet (₹0 is normal here)</div>
+          <div style={{ fontWeight: 800, marginBottom: 8 }}>No transactions or invoices yet (₹0 is normal here)</div>
           <div style={{ color: "#475569", marginBottom: 10 }}>
-            JM Tally stores books in <strong>this browser only</strong> — not on the server. Logging in on your phone uses the same account but a{" "}
-            <strong>separate empty workspace</strong> until you add data here.
+            {getStoredToken() ? (
+              <>
+                With the <strong>cloud API</strong> enabled, your books sync to your login while you are online. If you still see empty data on this device, wait a few seconds after opening the app, or add a transaction on another device and refresh — the server may still be catching up.
+              </>
+            ) : (
+              <>
+                Books are stored in <strong>this browser</strong>. The same email on another device does not load data unless you use a backup file or cloud sync (API).
+              </>
+            )}
           </div>
           <div style={{ color: "#475569", marginBottom: 12 }}>
-            To match your computer: on the PC where your data lives, open <strong>Settings → Export workspace backup</strong>, then on this phone use{" "}
-            <strong>Settings → Import workspace backup</strong>. Or import bank CSV / add transactions here.
+            You can always use <strong>Settings → Export / Import workspace backup</strong> to move a JSON file between devices, or import a bank CSV here.
           </div>
           <button
             type="button"
@@ -10448,8 +10616,15 @@ ${buildInvoicePrintDocumentHtml({
         <div style={{ marginTop: 14, background: "#fff7ed", border: "1px solid rgba(245,158,11,.45)", borderRadius: 10, padding: 12 }}>
           <div style={{ fontSize: 12, fontWeight: 700, color: "#9a3412", marginBottom: 8 }}>Workspace backup (move data between devices)</div>
           <div style={{ fontSize: 11, color: "#78350f", lineHeight: 1.55, marginBottom: 12 }}>
-            Your ledger, invoices, and settings are saved in <strong>this browser&apos;s storage</strong>. Other phones or browsers start empty until you import a
-            backup from a machine that already has data.
+            {getStoredToken() ? (
+              <>
+                Your books are <strong>cached in this browser</strong> and <strong>synced to your account on the server</strong> when online (same data on desktop and mobile). Use JSON export if you need a manual backup file.
+              </>
+            ) : (
+              <>
+                Your ledger, invoices, and settings are saved in <strong>this browser&apos;s storage</strong>. Other phones or browsers start empty until you import a backup from a machine that already has data.
+              </>
+            )}
           </div>
           <div style={{ display: "flex", flexWrap: "wrap", gap: 10, alignItems: "center" }}>
             <button

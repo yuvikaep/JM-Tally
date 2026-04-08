@@ -111,3 +111,12 @@ export async function resetPassword(payload) {
 export async function changePassword(payload) {
   return request("/api/auth/change-password", { method: "POST", body: payload, auth: true })
 }
+
+/** Full JM Tally books snapshot for the logged-in user (same shape as exported JSON). */
+export async function getWorkspace() {
+  return request("/api/workspace", { auth: true })
+}
+
+export async function putWorkspace(snapshotDoc) {
+  return request("/api/workspace", { method: "PUT", body: snapshotDoc, auth: true })
+}

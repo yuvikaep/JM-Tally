@@ -246,6 +246,13 @@ async function initDb() {
       used BOOLEAN DEFAULT FALSE
     )
   `)
+  await p.query(`
+    CREATE TABLE IF NOT EXISTS user_workspaces (
+      user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      snapshot JSONB NOT NULL DEFAULT '{}',
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `)
   console.log("Database tables ready")
 }
 
@@ -369,6 +376,16 @@ async function assertCompanyAccess(p, userId, companyId) {
     [userId, companyId]
   )
   return r.rows[0] || null
+}
+
+function isValidWorkspaceSnapshot(s) {
+  if (!s || typeof s !== "object") return false
+  if (s.app !== "jm-tally") return false
+  const reg = s.registry
+  if (!reg || !Array.isArray(reg.companies) || reg.companies.length === 0) return false
+  const payloads = s.payloadsByCompanyId
+  if (!payloads || typeof payloads !== "object") return false
+  return true
 }
 
 async function handleApi(req, res) {
@@ -684,6 +701,51 @@ async function handleApi(req, res) {
         return
       }
       sendJson(res, 200, { ok: true })
+      return
+    }
+
+    if (method === "GET" && pathname === "/api/workspace") {
+      const userId = await getUserIdFromAuth(req)
+      if (!userId) {
+        sendJson(res, 401, { error: "UNAUTHORIZED", message: "Unauthorized." })
+        return
+      }
+      const r = await p.query(`SELECT snapshot, updated_at FROM user_workspaces WHERE user_id = $1`, [userId])
+      if (!r.rows.length) {
+        sendJson(res, 200, { snapshot: null, updatedAt: null })
+        return
+      }
+      const row = r.rows[0]
+      sendJson(res, 200, {
+        snapshot: row.snapshot,
+        updatedAt: row.updated_at ? new Date(row.updated_at).toISOString() : null,
+      })
+      return
+    }
+
+    if (method === "PUT" && pathname === "/api/workspace") {
+      const userId = await getUserIdFromAuth(req)
+      if (!userId) {
+        sendJson(res, 401, { error: "UNAUTHORIZED", message: "Unauthorized." })
+        return
+      }
+      const body = await readBody(req)
+      if (!isValidWorkspaceSnapshot(body)) {
+        sendJson(res, 400, { error: "VALIDATION", message: "Invalid workspace snapshot." })
+        return
+      }
+      const ins = await p.query(
+        `INSERT INTO user_workspaces (user_id, snapshot, updated_at)
+         VALUES ($1, $2::jsonb, NOW())
+         ON CONFLICT (user_id) DO UPDATE SET snapshot = EXCLUDED.snapshot, updated_at = NOW()
+         RETURNING updated_at`,
+        [userId, body]
+      )
+      const uat = ins.rows[0]?.updated_at
+      sendJson(res, 200, {
+        ok: true,
+        updatedAt: uat ? new Date(uat).toISOString() : new Date().toISOString(),
+      })
       return
     }
 
