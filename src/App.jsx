@@ -97,6 +97,7 @@ const CATS = [
   "Revenue - Other",
   "Director Payment",
   "Salary",
+  "Payroll Salary",
   "Employer PF / ESI Expense",
   "Rent Expense",
   "Electricity Expense",
@@ -119,6 +120,8 @@ const CATS = [
   "Payment Gateway",
 ]
 const REVENUE_CATS = CATS.filter(c => c.startsWith("Revenue"))
+const ONE_TIME_WIPE_EMAILS = new Set(["hr@jobsmato.com"])
+const ONE_TIME_WIPE_MARK = "one_time_data_wipe_done_v1"
 
 /** Map Add Transaction UI (Debit/Credit) to bank journal side. */
 function ntDrCrToBank(ntDrCr) {
@@ -3321,6 +3324,57 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
   }, [activeCompanyId, scopedStore])
 
   const toast_ = (msg, c="#10b981") => { setToast({msg,c}); setTimeout(()=>setToast(null),2800) }
+
+  useEffect(() => {
+    ;(async () => {
+      if (loading) return
+      const email = String(authUser?.email || "").trim().toLowerCase()
+      if (!ONE_TIME_WIPE_EMAILS.has(email)) return
+      const markKey = `${ONE_TIME_WIPE_MARK}:${email}`
+      const alreadyDone = await scopedStore.get(markKey)
+      if (alreadyDone) return
+
+      skipPersistRef.current = true
+      try {
+        const reg = await readRegistry(scopedStore)
+        const companiesToWipe = Array.isArray(reg?.companies) ? reg.companies : []
+        for (const c of companiesToWipe) {
+          if (c?.id) await removeCompanyData(scopedStore, c.id)
+        }
+
+        const freshId = newCompanyId()
+        const freshReg = {
+          version: 1,
+          companies: [{ id: freshId, name: "My company", legalName: "", bankAccountLabel: "" }],
+          activeCompanyId: freshId,
+        }
+        await writeRegistry(scopedStore, freshReg)
+        await scopedStore.set("hisaab_epoch", STORAGE_EPOCH)
+        await persistCompanyPayload(scopedStore, freshId, {
+          txns: [],
+          invoices: [],
+          inventory: [],
+          importHistory: [],
+          settings: { acctRole: "Admin", periodLockIso: "" },
+        })
+        await scopedStore.set(markKey, { at: new Date().toISOString() })
+
+        setCompanies(freshReg.companies.map(c => normalizeCompanyRecord(c)).filter(Boolean))
+        setActiveCompanyId(freshId)
+        setTxns(withRecalculatedBalances(applyLedgerCategoryNormalization([])))
+        setInvoices([])
+        setInventory([])
+        setImportHistory([])
+        setAssistantMemory([])
+        setManualClients([])
+        toast_("One-time data wipe completed for this user", "#f59e0b")
+      } catch (e) {
+        toast_(String(e?.message || e), "#f43f5e")
+      } finally {
+        skipPersistRef.current = false
+      }
+    })()
+  }, [loading, authUser?.email, scopedStore])
 
   useEffect(() => {
     if (!quickAddOpen) return

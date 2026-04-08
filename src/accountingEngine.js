@@ -211,7 +211,7 @@ export function categoryToNominalAccount(category) {
   if (category === "Food Expense") return "Staff Welfare & Benefits"
   if (category === "Travel Expense") return "Travel & Conveyance"
   if (/rent/i.test(category)) return "Rent Expense"
-  if (category === "Salary") return "Salary Expense"
+  if (category === "Salary" || category === "Payroll Salary") return "Salary Expense"
   if (category === "Employer PF / ESI Expense") return "Employer PF / ESI Expense"
   if (category === "GST Payment (Output Tax)") return "GST Payment – Output Tax (GSTR-3B)"
   if (category === "Director Payment") return "Director Remuneration"
