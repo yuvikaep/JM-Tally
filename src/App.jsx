@@ -1288,6 +1288,11 @@ function parseMoneyInput(v) {
   return Math.round((parseFloat(String(v).replace(/,/g, "")) || 0) * 100) / 100
 }
 
+function safeViewportWidth() {
+  if (typeof globalThis !== "undefined" && Number.isFinite(globalThis.innerWidth)) return Number(globalThis.innerWidth)
+  return 1280
+}
+
 function tdsPayableAccountForSection(sectionRaw) {
   const section = String(sectionRaw || "").trim().toUpperCase()
   if (section === "192") return "TDS Payable – 192 Salary"
@@ -3337,7 +3342,7 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
     Finance: true,
     Intelligence: true,
   })
-  const [viewportW, setViewportW] = useState(typeof window !== "undefined" ? window.innerWidth : 1280)
+  const [viewportW, setViewportW] = useState(safeViewportWidth())
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
   /** Header + Add dropdown: collapsible groups (mirrors sidebar behaviour) */
   const [quickAddMenuOpen, setQuickAddMenuOpen] = useState({
@@ -3495,7 +3500,8 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
   }, [quickAddOpen])
 
   useEffect(() => {
-    const onResize = () => setViewportW(typeof window !== "undefined" ? window.innerWidth : 1280)
+    if (typeof window === "undefined") return undefined
+    const onResize = () => setViewportW(safeViewportWidth())
     window.addEventListener("resize", onResize)
     return () => window.removeEventListener("resize", onResize)
   }, [])
@@ -9295,7 +9301,7 @@ ${buildInvoicePrintDocumentHtml({
 
   return (
     <div style={S.wrap} className="jm-app">
-      <style>{`@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&display=swap');*{box-sizing:border-box;margin:0;padding:0}::-webkit-scrollbar{width:4px;height:4px}::-webkit-scrollbar-thumb{background:rgba(107,122,255,.45);border-radius:10px}select option{background:#ffffff;color:#0c4a6e}@keyframes spin{to{transform:rotate(360deg)}}@media (max-width:900px){.jm-app [style*="grid-template-columns: 1fr 1fr"]{grid-template-columns:1fr !important}.jm-app [style*="grid-template-columns: 1fr 280px"]{grid-template-columns:1fr !important}.jm-app [style*="grid-template-columns: 160px 160px 140px 140px 1fr auto"]{grid-template-columns:1fr !important}.jm-app [style*="grid-template-columns: 1fr 1fr 1fr 1fr 1fr 1fr auto"]{grid-template-columns:1fr !important}.jm-app [style*="min-width: 720"]{min-width:640px !important}.jm-app table{font-size:11px !important}}`}</style>
+      <style>{`@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&display=swap');*{box-sizing:border-box;margin:0;padding:0}::-webkit-scrollbar{width:4px;height:4px}::-webkit-scrollbar-thumb{background:rgba(107,122,255,.45);border-radius:10px}select option{background:#ffffff;color:#0c4a6e}@keyframes spin{to{transform:rotate(360deg)}}`}</style>
 
       {toast&&<div style={{position:"fixed",top:14,right:14,background:toast.c,color:"#fff",padding:"9px 16px",borderRadius:9,fontSize:12,fontWeight:700,zIndex:9999,boxShadow:"0 4px 20px rgba(0,0,0,.4)"}}>{toast.msg}</div>}
       {isMobile && mobileNavOpen && <div onClick={() => setMobileNavOpen(false)} style={{ position: "fixed", inset: 0, background: "rgba(2,8,23,.42)", zIndex: 1100 }} />}
