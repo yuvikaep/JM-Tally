@@ -3195,6 +3195,7 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
   /** When set, invoice modal saves over this row instead of creating */
   const [invoiceModalEditId, setInvoiceModalEditId] = useState(null)
   const [invPayId, setInvPayId] = useState(null)
+  const [invPayMode, setInvPayMode] = useState("add")
   const [invPayAmt, setInvPayAmt] = useState("")
   const [invPayTdsPct, setInvPayTdsPct] = useState("")
   const [dangerFlow, setDangerFlow] = useState(null)
@@ -4736,10 +4737,48 @@ ${buildInvoicePrintDocumentHtml({
         return
       }
       setInvPayId(id)
+      setInvPayMode("add")
       setInvPayAmt(String(rem))
       setInvPayTdsPct("")
     },
     [acctRole, invoices]
+  )
+
+  const openInvoicePaymentModal = useCallback((inv, mode = "add") => {
+    if (!inv) return
+    const taxable = Math.max(0, Number(inv.taxable) || 0)
+    const bankNow = invoiceBankReceived(inv)
+    const tdsNow = Math.max(0, Number(inv.paidTdsTotal) || 0)
+    const pctNow = taxable > 0 ? Math.round((tdsNow * 10000) / taxable) / 100 : 0
+    setInvPayId(inv.id)
+    setInvPayMode(mode)
+    setInvPayAmt(String(mode === "replace" ? bankNow : Math.max(0, invoiceBalance(inv))))
+    setInvPayTdsPct(pctNow > 0 ? String(pctNow) : "")
+  }, [])
+
+  const markInvoiceUnpaid = useCallback(
+    id => {
+      if (acctRole === "Viewer") return
+      const inv0 = invoices.find(i => i.id === id)
+      if (!inv0) return
+      if ((Number(inv0.paidAmount) || 0) <= 0.005 && (Number(inv0.paidTdsTotal) || 0) <= 0.005) {
+        toast_("Invoice is already unpaid", "#f59e0b")
+        return
+      }
+      const nextInv = {
+        ...inv0,
+        paidAmount: 0,
+        paidBankTotal: 0,
+        paidTdsTotal: 0,
+        paidAt: "",
+        status: "sent",
+      }
+      setInvoices(list => list.map(inv => (inv.id === id ? nextInv : inv)))
+      setTxns(prev => syncLedgerWithInvoicePaymentState(prev, nextInv, { createdBy: acctRole }))
+      appendAudit({ action: "INVOICE_MARK_UNPAID", invoiceId: id })
+      toast_("Invoice marked unpaid · settlement entries cleared", "#f59e0b")
+    },
+    [acctRole, invoices, appendAudit]
   )
 
   const exportInvoicesCsv = (list = invoices) => {
@@ -4787,79 +4826,112 @@ ${buildInvoicePrintDocumentHtml({
     const received = parseMoneyInput(invPayAmt)
     const tdsPctRaw = parseFloat(String(invPayTdsPct).replace(/,/g, ""))
     const tdsPct = Number.isFinite(tdsPctRaw) ? Math.max(0, Math.min(99.99, tdsPctRaw)) : 0
-    const tds = tdsPct > 0 ? Math.round((received * tdsPct) / (100 - tdsPct) * 100) / 100 : 0
-    if (received <= 0 && tds <= 0) {
+    const taxable = Math.max(0, Number(inv0.taxable) || 0)
+    const tdsFromTaxable = tdsPct > 0 ? Math.round((taxable * tdsPct) / 100 * 100) / 100 : 0
+    if (received <= 0 && tdsFromTaxable <= 0) {
       toast_("Enter bank receipt (₹) or TDS % greater than zero", "#f43f5e")
       return
     }
     const tot = Number(inv0.total) || 0
-    const bal = invoiceBalance(inv0)
-    const settlement = Math.round((received + tds) * 100) / 100
-    let incBank = received
-    let incTds = tds
-    let increment = settlement
-    if (settlement > bal + 0.001 && settlement > 0) {
-      increment = Math.round(bal * 100) / 100
-      incBank = Math.round((received * bal) / settlement * 100) / 100
-      incTds = Math.round((increment - incBank) * 100) / 100
-    }
-    const capped = Math.round((Number(inv0.paidAmount) + increment) * 100) / 100
-    const paid = capped >= tot - 0.01
-    const pb0 = Number(inv0.paidBankTotal)
-    const pt0 = Number(inv0.paidTdsTotal)
-    const baseBank = Number.isFinite(pb0) ? pb0 : Number(inv0.paidAmount) || 0
-    const baseTds = Number.isFinite(pt0) ? pt0 : 0
-    const nextInv = {
-      ...inv0,
-      paidAmount: Math.min(capped, tot),
-      paidBankTotal: Math.round((baseBank + incBank) * 100) / 100,
-      paidTdsTotal: Math.round((baseTds + incTds) * 100) / 100,
-      status: paid ? "paid" : "partial",
-      paidAt: paid ? todayISO() : inv0.paidAt,
-    }
     const paymentDateIso = todayISO()
     const dateDdMmYyyy = isoToDdMmYyyy(paymentDateIso)
     if (periodLockIso && isPeriodLocked(dateDdMmYyyy, periodLockIso)) {
       toast_("Date falls in a locked period — posting blocked", "#f43f5e")
       return
     }
-    const res = draftInvoiceSettlementTxns({
-      prevTxns: txns,
-      inv: nextInv,
-      incBank,
-      incTds,
-      dateDdMmYyyy,
-    })
-    if (res.error) {
-      toast_(res.error, "#f43f5e")
-      return
+
+    let nextInv = inv0
+    let bankDelta = 0
+    let tdsDelta = 0
+
+    if (invPayMode === "replace") {
+      const wantedSettlement = Math.round((received + tdsFromTaxable) * 100) / 100
+      const finalSettlement = Math.min(Math.max(0, wantedSettlement), tot)
+      let finalBank = received
+      let finalTds = tdsFromTaxable
+      if (wantedSettlement > finalSettlement + 0.001 && wantedSettlement > 0) {
+        finalBank = Math.round((received * finalSettlement) / wantedSettlement * 100) / 100
+        finalTds = Math.round((finalSettlement - finalBank) * 100) / 100
+      }
+      const paid = finalSettlement >= tot - 0.01
+      nextInv = {
+        ...inv0,
+        paidAmount: finalSettlement,
+        paidBankTotal: Math.max(0, finalBank),
+        paidTdsTotal: Math.max(0, finalTds),
+        status: finalSettlement <= 0.005 ? "sent" : paid ? "paid" : "partial",
+        paidAt: finalSettlement <= 0.005 ? "" : paymentDateIso,
+      }
+      bankDelta = Math.round((Number(nextInv.paidBankTotal) - invoiceBankReceived(inv0)) * 100) / 100
+      tdsDelta = Math.round((Number(nextInv.paidTdsTotal) - (Number(inv0.paidTdsTotal) || 0)) * 100) / 100
+      setTxns(prev => syncLedgerWithInvoicePaymentState(prev, nextInv, { createdBy: acctRole }))
+    } else {
+      const bal = invoiceBalance(inv0)
+      const pb0 = Number(inv0.paidBankTotal)
+      const pt0 = Number(inv0.paidTdsTotal)
+      const baseBank = Number.isFinite(pb0) ? pb0 : Number(inv0.paidAmount) || 0
+      const baseTds = Number.isFinite(pt0) ? pt0 : 0
+      let incBank = Math.max(0, received)
+      let incTds = Math.max(0, Math.round((tdsFromTaxable - baseTds) * 100) / 100)
+      let increment = Math.round((incBank + incTds) * 100) / 100
+      if (increment > bal + 0.001 && increment > 0) {
+        increment = Math.round(bal * 100) / 100
+        incBank = Math.round((incBank * bal) / (incBank + incTds) * 100) / 100
+        incTds = Math.round((increment - incBank) * 100) / 100
+      }
+      const capped = Math.round((Number(inv0.paidAmount) + increment) * 100) / 100
+      const paid = capped >= tot - 0.01
+      nextInv = {
+        ...inv0,
+        paidAmount: Math.min(capped, tot),
+        paidBankTotal: Math.round((baseBank + incBank) * 100) / 100,
+        paidTdsTotal: Math.round((baseTds + incTds) * 100) / 100,
+        status: paid ? "paid" : "partial",
+        paidAt: paid ? paymentDateIso : inv0.paidAt,
+      }
+      const res = draftInvoiceSettlementTxns({
+        prevTxns: txns,
+        inv: nextInv,
+        incBank,
+        incTds,
+        dateDdMmYyyy,
+      })
+      if (res.error) {
+        toast_(res.error, "#f43f5e")
+        return
+      }
+      if (res.drafts?.length) {
+        const createdAt = new Date().toISOString()
+        const stamped = res.drafts.map(d => ({
+          ...d,
+          audit: { ...d.audit, createdAt, createdBy: acctRole },
+        }))
+        setTxns(prev => withRecalculatedBalances(applyLedgerCategoryNormalization([...prev, ...stamped])))
+      }
+      bankDelta = Math.round((Number(nextInv.paidBankTotal) - baseBank) * 100) / 100
+      tdsDelta = Math.round((Number(nextInv.paidTdsTotal) - baseTds) * 100) / 100
     }
+
     setInvoices(list => list.map(inv => (inv.id === invPayId ? nextInv : inv)))
-    if (res.drafts?.length) {
-      const createdAt = new Date().toISOString()
-      const stamped = res.drafts.map(d => ({
-        ...d,
-        audit: { ...d.audit, createdAt, createdBy: acctRole },
-      }))
-      setTxns(prev => withRecalculatedBalances(applyLedgerCategoryNormalization([...prev, ...stamped])))
-    }
     appendAudit({
       action: "INVOICE_PAYMENT",
       invoiceId: invPayId,
-      bank: received,
-      tds,
+      mode: invPayMode,
+      bank: bankDelta,
+      tds: tdsDelta,
       tdsPct,
-      settlement: received + tds,
+      settlement: bankDelta + tdsDelta,
     })
     const sumMsg =
-      tds > 0
-        ? `Posted to ledger · Bank ₹${inr(received)} + TDS ₹${inr(tds)} = ₹${inr(received + tds)}`
-        : `Posted to ledger · Bank ₹${inr(received)}`
+      Math.abs(tdsDelta) > 0.005
+        ? `Saved · Bank ₹${inr(bankDelta)} and TDS ₹${inr(tdsDelta)} ${invPayMode === "replace" ? "updated" : "posted"}`
+        : `Saved · Bank ₹${inr(bankDelta)} ${invPayMode === "replace" ? "updated" : "posted"}`
     toast_(sumMsg, "#10b981")
     setInvPayId(null)
+    setInvPayMode("add")
     setInvPayAmt("")
     setInvPayTdsPct("")
-  }, [acctRole, invPayId, invPayAmt, invPayTdsPct, invoices, txns, periodLockIso, appendAudit])
+  }, [acctRole, invPayId, invPayMode, invPayAmt, invPayTdsPct, invoices, txns, periodLockIso, appendAudit])
 
   const filtered = useMemo(()=>{
     if(!txns) return []
@@ -6056,7 +6128,7 @@ ${buildInvoicePrintDocumentHtml({
             </div>
 
             <div style={{ background: "rgba(107,122,255,.08)", border: "1px solid rgba(107,122,255,.22)", borderRadius: 10, padding: "10px 14px", marginBottom: 13, fontSize: 11, color: "#0369a1", lineHeight: 1.55 }}>
-              <strong>Sales register</strong> — Taxable + GST (intra-state CGST+SGST or inter-state IGST). <strong>Pay…</strong>: enter <strong>actual bank credit</strong> and optional <strong>TDS %</strong>; the app auto-calculates deducted TDS amount and settlement (₹ in bank + ₹ TDS = settlement). <strong>Paid</strong> opens the same payment dialog so you can record TDS% while settling the balance. Ledger posts only the actual bank credit; TDS is reconciled via Form 26AS / TDS certificates.
+              <strong>Sales register</strong> — Taxable + GST (intra-state CGST+SGST or inter-state IGST). <strong>Pay…</strong>: enter <strong>actual bank credit</strong> and optional <strong>TDS % on taxable</strong>; the app auto-calculates deducted TDS amount and settlement (₹ in bank + ₹ TDS = settlement). <strong>Paid</strong> opens the same payment dialog so you can record TDS% while settling the balance. Ledger posts only the actual bank credit; TDS is reconciled via Form 26AS / TDS certificates.
             </div>
             <div style={{ display: "flex", gap: 7, flexWrap: "wrap", alignItems: "center", marginBottom: 10 }}>
               <button type="button" onClick={openCreateInvoiceModal} style={{ ...S.btn, fontSize: 11, padding: "5px 11px" }}>
@@ -6459,9 +6531,7 @@ ${buildInvoicePrintDocumentHtml({
                                     type="button"
                                     disabled={acctRole === "Viewer"}
                                     onClick={() => {
-                                      setInvPayId(r.id)
-                                      setInvPayAmt(String(invoiceBalance(r)))
-                                      setInvPayTdsPct("")
+                                      openInvoicePaymentModal(r, "add")
                                       setInvMoreMenuId(null)
                                     }}
                                     style={{
@@ -6478,6 +6548,54 @@ ${buildInvoicePrintDocumentHtml({
                                   >
                                     Record payment…
                                   </button>
+                                  {invoiceUiStatus(r) === "paid" ? (
+                                    <button
+                                      type="button"
+                                      disabled={acctRole === "Viewer"}
+                                      onClick={() => {
+                                        openInvoicePaymentModal(r, "replace")
+                                        setInvMoreMenuId(null)
+                                      }}
+                                      style={{
+                                        display: "block",
+                                        width: "100%",
+                                        padding: "8px 12px",
+                                        border: "none",
+                                        borderTop: `1px solid ${SKY.border}`,
+                                        background: "none",
+                                        textAlign: "left",
+                                        fontSize: 12,
+                                        cursor: acctRole === "Viewer" ? "default" : "pointer",
+                                        color: SKY.text,
+                                      }}
+                                    >
+                                      Change to partial…
+                                    </button>
+                                  ) : null}
+                                  {(Number(r.paidAmount) || 0) > 0.005 ? (
+                                    <button
+                                      type="button"
+                                      disabled={acctRole === "Viewer"}
+                                      onClick={() => {
+                                        markInvoiceUnpaid(r.id)
+                                        setInvMoreMenuId(null)
+                                      }}
+                                      style={{
+                                        display: "block",
+                                        width: "100%",
+                                        padding: "8px 12px",
+                                        border: "none",
+                                        borderTop: `1px solid ${SKY.border}`,
+                                        background: "none",
+                                        textAlign: "left",
+                                        fontSize: 12,
+                                        cursor: acctRole === "Viewer" ? "default" : "pointer",
+                                        color: "#b45309",
+                                      }}
+                                    >
+                                      Mark as unpaid
+                                    </button>
+                                  ) : null}
                                   <button
                                     type="button"
                                     disabled={acctRole === "Viewer"}
@@ -10203,15 +10321,16 @@ ${buildInvoicePrintDocumentHtml({
 
       <Modal
         open={invPayId != null}
-        title="Record payment"
+        title={invPayMode === "replace" ? "Edit payment/status" : "Record payment"}
         onClose={() => {
           setInvPayId(null)
+          setInvPayMode("add")
           setInvPayAmt("")
           setInvPayTdsPct("")
         }}
         onSave={applyInvoicePaymentModal}
         saveDisabled={acctRole === "Viewer"}
-        saveLabel="Apply payment"
+        saveLabel={invPayMode === "replace" ? "Save changes" : "Apply payment"}
       >
         <div style={{ fontSize: 12, color: "#94a3b8", marginBottom: 12 }}>
           {(() => {
@@ -10224,29 +10343,33 @@ ${buildInvoicePrintDocumentHtml({
             )
           })()}
         </div>
-        <F label="Credited to bank (₹)">
-          <input type="number" value={invPayAmt} onChange={e => setInvPayAmt(e.target.value)} style={IS} placeholder="Net received in CA" />
+        <F label={invPayMode === "replace" ? "Total credited to bank (₹)" : "Credited to bank now (₹)"}>
+          <input type="number" value={invPayAmt} onChange={e => setInvPayAmt(e.target.value)} style={IS} placeholder={invPayMode === "replace" ? "Total bank received for this invoice" : "Net received in CA"} />
         </F>
-        <F label="TDS deducted by client (%) — optional">
+        <F label="TDS deducted by client (%) on taxable — optional">
           <input type="number" value={invPayTdsPct} onChange={e => setInvPayTdsPct(e.target.value)} style={IS} placeholder="0 if none" min="0" max="99.99" step="0.01" />
         </F>
         {(() => {
           const t = invoices.find(i => i.id === invPayId)
           if (!t) return null
           const bal = invoiceBalance(t)
+          const taxable = Math.max(0, Number(t.taxable) || 0)
+          const baseTds = Math.max(0, Number(t.paidTdsTotal) || 0)
           const recv = parseMoneyInput(invPayAmt)
           const pRaw = parseFloat(String(invPayTdsPct).replace(/,/g, ""))
           const pct = Number.isFinite(pRaw) ? Math.max(0, Math.min(99.99, pRaw)) : 0
-          const tds = pct > 0 ? Math.round((recv * pct) / (100 - pct) * 100) / 100 : 0
+          const tdsFromTaxable = pct > 0 ? Math.round((taxable * pct) / 100 * 100) / 100 : 0
+          const tds = invPayMode === "replace" ? tdsFromTaxable : Math.max(0, Math.round((tdsFromTaxable - baseTds) * 100) / 100)
           const settle = Math.round((recv + tds) * 100) / 100
-          const rem = Math.round((bal - settle) * 100) / 100
+          const refBal = invPayMode === "replace" ? Number(t.total) || 0 : bal
+          const rem = Math.round((refBal - settle) * 100) / 100
           return (
             <div style={{ fontSize: 11, color: "#64748b", marginTop: 4, padding: "8px 10px", background: "#ffffff", borderRadius: 8, border: "1px solid #bae6fd", lineHeight: 1.5 }}>
-              <strong style={{ color: "#94a3b8" }}>Settlement toward invoice:</strong> ₹{inr(recv)} bank + ₹{inr(tds)} TDS ({pct.toFixed(2)}%) ={" "}
+              <strong style={{ color: "#94a3b8" }}>Settlement toward invoice:</strong> ₹{inr(recv)} bank + ₹{inr(tds)} TDS ({pct.toFixed(2)}% of taxable ₹{inr(taxable)}) ={" "}
               <strong style={{ color: "#0c4a6e" }}>₹{inr(settle)}</strong>
               <br />
-              After apply, balance due ≈ ₹{inr(Math.max(0, rem))}
-              {settle > bal + 0.01 ? <span style={{ color: "#f59e0b" }}> · Excess is trimmed to match open balance.</span> : null}
+              {invPayMode === "replace" ? "After save, total balance due" : "After apply, balance due"} ≈ ₹{inr(Math.max(0, rem))}
+              {settle > refBal + 0.01 ? <span style={{ color: "#f59e0b" }}> · Excess is trimmed to match allowed balance.</span> : null}
             </div>
           )
         })()}
