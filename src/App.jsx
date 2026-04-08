@@ -1177,6 +1177,16 @@ function invoiceBalance(inv) {
   return Math.round((tot - paid) * 100) / 100
 }
 
+function invoiceBankReceived(inv) {
+  const bank = Number(inv?.paidBankTotal)
+  if (Number.isFinite(bank)) return Math.round(bank * 100) / 100
+  return Math.round((Number(inv?.paidAmount) || 0) * 100) / 100
+}
+
+function parseMoneyInput(v) {
+  return Math.round((parseFloat(String(v).replace(/,/g, "")) || 0) * 100) / 100
+}
+
 function invoiceUiStatus(inv) {
   const bal = invoiceBalance(inv)
   if (bal <= 0.01) return "paid"
@@ -3186,7 +3196,7 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
   const [invoiceModalEditId, setInvoiceModalEditId] = useState(null)
   const [invPayId, setInvPayId] = useState(null)
   const [invPayAmt, setInvPayAmt] = useState("")
-  const [invPayTds, setInvPayTds] = useState("")
+  const [invPayTdsPct, setInvPayTdsPct] = useState("")
   const [dangerFlow, setDangerFlow] = useState(null)
   const [dangerRemark, setDangerRemark] = useState("")
   const [dangerAck, setDangerAck] = useState(false)
@@ -4720,53 +4730,16 @@ ${buildInvoicePrintDocumentHtml({
       if (acctRole === "Viewer") return
       const inv = invoices.find(i => i.id === id)
       if (!inv) return
-      const tot = Number(inv.total) || 0
-      const cur = Number(inv.paidAmount) || 0
-      const rem = Math.round((tot - cur) * 100) / 100
+      const rem = Math.round(invoiceBalance(inv) * 100) / 100
       if (rem <= 0.005) {
         toast_("Invoice already fully paid", "#f59e0b")
         return
       }
-      const pb0 = Number(inv.paidBankTotal)
-      const bankBase = Number.isFinite(pb0) ? pb0 : cur
-      const paidAt = todayISO()
-      const dateDdMmYyyy = isoToDdMmYyyy(paidAt)
-      if (periodLockIso && isPeriodLocked(dateDdMmYyyy, periodLockIso)) {
-        toast_("Date falls in a locked period — posting blocked", "#f43f5e")
-        return
-      }
-      const nextInv = {
-        ...inv,
-        status: "paid",
-        paidAmount: tot,
-        paidBankTotal: rem > 0.01 ? Math.round((bankBase + rem) * 100) / 100 : Math.round(bankBase * 100) / 100,
-        paidTdsTotal: Number(inv.paidTdsTotal) || 0,
-        paidAt,
-      }
-      const res = draftInvoiceSettlementTxns({
-        prevTxns: txns,
-        inv: nextInv,
-        incBank: rem,
-        incTds: 0,
-        dateDdMmYyyy,
-      })
-      if (res.error) {
-        toast_(res.error, "#f43f5e")
-        return
-      }
-      setInvoices(list => list.map(i => (i.id === id ? nextInv : i)))
-      if (res.drafts?.length) {
-        const createdAt = new Date().toISOString()
-        const stamped = res.drafts.map(d => ({
-          ...d,
-          audit: { ...d.audit, createdAt, createdBy: acctRole },
-        }))
-        setTxns(prev => withRecalculatedBalances(applyLedgerCategoryNormalization([...prev, ...stamped])))
-      }
-      appendAudit({ action: "INVOICE_PAID", invoiceId: id })
-      toast_("Marked paid · bank receipt posted to ledger", "#10b981")
+      setInvPayId(id)
+      setInvPayAmt(String(rem))
+      setInvPayTdsPct("")
     },
-    [invoices, txns, acctRole, periodLockIso, appendAudit]
+    [acctRole, invoices]
   )
 
   const exportInvoicesCsv = (list = invoices) => {
@@ -4811,10 +4784,12 @@ ${buildInvoicePrintDocumentHtml({
     if (acctRole === "Viewer" || invPayId == null) return
     const inv0 = invoices.find(i => i.id === invPayId)
     if (!inv0) return
-    const received = Math.round((parseFloat(String(invPayAmt).replace(/,/g, "")) || 0) * 100) / 100
-    const tds = Math.round((parseFloat(String(invPayTds).replace(/,/g, "")) || 0) * 100) / 100
+    const received = parseMoneyInput(invPayAmt)
+    const tdsPctRaw = parseFloat(String(invPayTdsPct).replace(/,/g, ""))
+    const tdsPct = Number.isFinite(tdsPctRaw) ? Math.max(0, Math.min(99.99, tdsPctRaw)) : 0
+    const tds = tdsPct > 0 ? Math.round((received * tdsPct) / (100 - tdsPct) * 100) / 100 : 0
     if (received <= 0 && tds <= 0) {
-      toast_("Enter bank receipt and/or TDS deducted by client (₹)", "#f43f5e")
+      toast_("Enter bank receipt (₹) or TDS % greater than zero", "#f43f5e")
       return
     }
     const tot = Number(inv0.total) || 0
@@ -4873,6 +4848,7 @@ ${buildInvoicePrintDocumentHtml({
       invoiceId: invPayId,
       bank: received,
       tds,
+      tdsPct,
       settlement: received + tds,
     })
     const sumMsg =
@@ -4882,8 +4858,8 @@ ${buildInvoicePrintDocumentHtml({
     toast_(sumMsg, "#10b981")
     setInvPayId(null)
     setInvPayAmt("")
-    setInvPayTds("")
-  }, [acctRole, invPayId, invPayAmt, invPayTds, invoices, txns, periodLockIso, appendAudit])
+    setInvPayTdsPct("")
+  }, [acctRole, invPayId, invPayAmt, invPayTdsPct, invoices, txns, periodLockIso, appendAudit])
 
   const filtered = useMemo(()=>{
     if(!txns) return []
@@ -5600,7 +5576,7 @@ ${buildInvoicePrintDocumentHtml({
       const n = list.length
       const totalAmt = list.reduce((s, x) => s + (Number(x.total) || 0), 0)
       const dueAmt = list.reduce((s, x) => s + Math.max(0, invoiceBalance(x)), 0)
-      const paidAmt = list.reduce((s, x) => s + (Number(x.paidAmount) || 0), 0)
+      const paidAmt = list.reduce((s, x) => s + invoiceBankReceived(x), 0)
       const gstAmt = list.reduce((s, x) => s + (Number(x.cgst) || 0) + (Number(x.sgst) || 0) + (Number(x.igst) || 0), 0)
       const tdsAmt = list.reduce((s, x) => s + (Number(x.paidTdsTotal) || 0), 0)
       return { n, totalAmt, dueAmt, paidAmt, gstAmt, tdsAmt }
@@ -5625,7 +5601,7 @@ ${buildInvoicePrintDocumentHtml({
       for (const inv of list) {
         const mk = keyOf(inv.date)
         if (mk) invoicedMap.set(mk, (invoicedMap.get(mk) || 0) + (Number(inv.total) || 0))
-        const paid = Number(inv.paidAmount) || 0
+        const paid = invoiceBankReceived(inv)
         if (paid > 0.005) {
           const pk = keyOf(inv.paidAt || inv.date)
           if (pk) paidMap.set(pk, (paidMap.get(pk) || 0) + paid)
@@ -5775,7 +5751,7 @@ ${buildInvoicePrintDocumentHtml({
                   <div>
                     <strong style={{ color: "#0c4a6e" }}>Totals</strong>
                     <div>Invoice value (lifetime): ₹{inr0(invoices.reduce((s, i) => s + (Number(i.total) || 0), 0))}</div>
-                    <div>Collected (est.): ₹{inr0(invoices.reduce((s, i) => s + (Number(i.paidAmount) || 0), 0))}</div>
+                    <div>Collected (bank): ₹{inr0(invoices.reduce((s, i) => s + invoiceBankReceived(i), 0))}</div>
                   </div>
                   <div>
                     <strong style={{ color: "#0c4a6e" }}>Open pipeline</strong>
@@ -5958,7 +5934,7 @@ ${buildInvoicePrintDocumentHtml({
                 <Stat label="Invoices" value={String(invMetrics.n)} sub="In current filter" color="#0369a1" icon="📄" />
                 <Stat label="Total amount" value={"₹" + inr0(invMetrics.totalAmt)} sub="Sum of invoice totals" color="#0c4a6e" icon="₹" />
                 <Stat label="Amount due" value={"₹" + inr0(invMetrics.dueAmt)} sub="Outstanding balance" color="#f59e0b" icon="⏳" />
-                <Stat label="Payment received" value={"₹" + inr0(invMetrics.paidAmt)} sub="Settled in books" color="#10b981" icon="✓" />
+                <Stat label="Payment received" value={"₹" + inr0(invMetrics.paidAmt)} sub="Credited in bank" color="#10b981" icon="✓" />
                 <Stat label="GST amount" value={"₹" + inr0(invMetrics.gstAmt)} sub="CGST+SGST+IGST on list" color="#5563E8" icon="◎" />
                 <Stat label="TDS" value={"₹" + inr0(invMetrics.tdsAmt)} sub="Withheld (recorded)" color="#0369a1" icon="⊡" />
               </div>
@@ -6080,7 +6056,7 @@ ${buildInvoicePrintDocumentHtml({
             </div>
 
             <div style={{ background: "rgba(107,122,255,.08)", border: "1px solid rgba(107,122,255,.22)", borderRadius: 10, padding: "10px 14px", marginBottom: 13, fontSize: 11, color: "#0369a1", lineHeight: 1.55 }}>
-              <strong>Sales register</strong> — Taxable + GST (intra-state CGST+SGST or inter-state IGST). <strong>Pay…</strong>: enter <strong>bank receipt</strong> and optional <strong>TDS</strong> withheld by the client — both count toward clearing the invoice (₹ in bank + ₹ TDS = settlement). Use <strong>Paid</strong> only when the full balance arrived in the bank with <strong>no</strong> TDS on that bill. Ledger: post the <strong>actual credit</strong> in Transactions; TDS is reconciled via Form 26AS / TDS certificates.
+              <strong>Sales register</strong> — Taxable + GST (intra-state CGST+SGST or inter-state IGST). <strong>Pay…</strong>: enter <strong>actual bank credit</strong> and optional <strong>TDS %</strong>; the app auto-calculates deducted TDS amount and settlement (₹ in bank + ₹ TDS = settlement). <strong>Paid</strong> opens the same payment dialog so you can record TDS% while settling the balance. Ledger posts only the actual bank credit; TDS is reconciled via Form 26AS / TDS certificates.
             </div>
             <div style={{ display: "flex", gap: 7, flexWrap: "wrap", alignItems: "center", marginBottom: 10 }}>
               <button type="button" onClick={openCreateInvoiceModal} style={{ ...S.btn, fontSize: 11, padding: "5px 11px" }}>
@@ -6485,7 +6461,7 @@ ${buildInvoicePrintDocumentHtml({
                                     onClick={() => {
                                       setInvPayId(r.id)
                                       setInvPayAmt(String(invoiceBalance(r)))
-                                      setInvPayTds("")
+                                      setInvPayTdsPct("")
                                       setInvMoreMenuId(null)
                                     }}
                                     style={{
@@ -6962,7 +6938,7 @@ ${buildInvoicePrintDocumentHtml({
                   <th style={{ padding: 6, textAlign: "left", fontSize: 9, color: SKY.text2 }}>Date</th>
                   <th style={{ padding: 6, textAlign: "left", fontSize: 9, color: SKY.text2 }}>Invoice</th>
                   <th style={{ padding: 6, textAlign: "right", fontSize: 9, color: SKY.text2 }}>Total</th>
-                  <th style={{ padding: 6, textAlign: "right", fontSize: 9, color: SKY.text2 }}>Paid</th>
+                  <th style={{ padding: 6, textAlign: "right", fontSize: 9, color: SKY.text2 }}>Bank</th>
                   <th style={{ padding: 6, textAlign: "right", fontSize: 9, color: SKY.text2 }}>Balance</th>
                   <th style={{ padding: 6, textAlign: "left", fontSize: 9, color: SKY.text2 }}>Status</th>
                 </tr>
@@ -6975,7 +6951,7 @@ ${buildInvoicePrintDocumentHtml({
                       <td style={{ padding: 6, whiteSpace: "nowrap" }}>{formatIsoNice(inv.date)}</td>
                       <td style={{ padding: 6, fontWeight: 600 }}>{inv.num}</td>
                       <td style={{ padding: 6, textAlign: "right", fontFamily: "monospace" }}>₹{inr(inv.total)}</td>
-                      <td style={{ padding: 6, textAlign: "right", fontFamily: "monospace", color: "#64748b" }}>₹{inr(inv.paidAmount)}</td>
+                      <td style={{ padding: 6, textAlign: "right", fontFamily: "monospace", color: "#64748b" }}>₹{inr(invoiceBankReceived(inv))}</td>
                       <td style={{ padding: 6, textAlign: "right", fontFamily: "monospace", color: invoiceBalance(inv) > 0 ? "#f59e0b" : "#94a3b8" }}>₹{inr(invoiceBalance(inv))}</td>
                       <td style={{ padding: 6 }}>
                         <Chip cat={st === "paid" ? "Revenue" : st === "overdue" ? "Director Payment" : "Misc Expense"} label={st} />
@@ -7356,7 +7332,7 @@ ${buildInvoicePrintDocumentHtml({
                         <th style={{ padding: 8, textAlign: "left", fontSize: 10, fontWeight: 700, color: SKY.text2 }}>Date</th>
                         <th style={{ padding: 8, textAlign: "left", fontSize: 10, fontWeight: 700, color: SKY.text2 }}>Invoice</th>
                         <th style={{ padding: 8, textAlign: "right", fontSize: 10, fontWeight: 700, color: SKY.text2 }}>Total</th>
-                        <th style={{ padding: 8, textAlign: "right", fontSize: 10, fontWeight: 700, color: SKY.text2 }}>Paid</th>
+                        <th style={{ padding: 8, textAlign: "right", fontSize: 10, fontWeight: 700, color: SKY.text2 }}>Bank</th>
                         <th style={{ padding: 8, textAlign: "right", fontSize: 10, fontWeight: 700, color: SKY.text2 }}>Balance</th>
                         <th style={{ padding: 8, textAlign: "left", fontSize: 10, fontWeight: 700, color: SKY.text2 }}>Status</th>
                       </tr>
@@ -7376,7 +7352,7 @@ ${buildInvoicePrintDocumentHtml({
                               <td style={{ padding: 8, whiteSpace: "nowrap" }}>{formatIsoNice(inv.date)}</td>
                               <td style={{ padding: 8, fontWeight: 600 }}>{inv.num}</td>
                               <td style={{ padding: 8, textAlign: "right", fontFamily: "monospace" }}>₹{inr(inv.total)}</td>
-                              <td style={{ padding: 8, textAlign: "right", fontFamily: "monospace", color: "#64748b" }}>₹{inr(inv.paidAmount)}</td>
+                              <td style={{ padding: 8, textAlign: "right", fontFamily: "monospace", color: "#64748b" }}>₹{inr(invoiceBankReceived(inv))}</td>
                               <td style={{ padding: 8, textAlign: "right", fontFamily: "monospace", color: invoiceBalance(inv) > 0 ? "#f59e0b" : "#94a3b8" }}>₹{inr(invoiceBalance(inv))}</td>
                               <td style={{ padding: 8 }}>
                                 <Chip cat={st === "paid" ? "Revenue" : st === "overdue" ? "Director Payment" : "Misc Expense"} label={st} />
@@ -10231,7 +10207,7 @@ ${buildInvoicePrintDocumentHtml({
         onClose={() => {
           setInvPayId(null)
           setInvPayAmt("")
-          setInvPayTds("")
+          setInvPayTdsPct("")
         }}
         onSave={applyInvoicePaymentModal}
         saveDisabled={acctRole === "Viewer"}
@@ -10251,20 +10227,22 @@ ${buildInvoicePrintDocumentHtml({
         <F label="Credited to bank (₹)">
           <input type="number" value={invPayAmt} onChange={e => setInvPayAmt(e.target.value)} style={IS} placeholder="Net received in CA" />
         </F>
-        <F label="TDS deducted by client (₹) — optional">
-          <input type="number" value={invPayTds} onChange={e => setInvPayTds(e.target.value)} style={IS} placeholder="0 if none" />
+        <F label="TDS deducted by client (%) — optional">
+          <input type="number" value={invPayTdsPct} onChange={e => setInvPayTdsPct(e.target.value)} style={IS} placeholder="0 if none" min="0" max="99.99" step="0.01" />
         </F>
         {(() => {
           const t = invoices.find(i => i.id === invPayId)
           if (!t) return null
           const bal = invoiceBalance(t)
-          const recv = Math.round((parseFloat(String(invPayAmt).replace(/,/g, "")) || 0) * 100) / 100
-          const tds = Math.round((parseFloat(String(invPayTds).replace(/,/g, "")) || 0) * 100) / 100
+          const recv = parseMoneyInput(invPayAmt)
+          const pRaw = parseFloat(String(invPayTdsPct).replace(/,/g, ""))
+          const pct = Number.isFinite(pRaw) ? Math.max(0, Math.min(99.99, pRaw)) : 0
+          const tds = pct > 0 ? Math.round((recv * pct) / (100 - pct) * 100) / 100 : 0
           const settle = Math.round((recv + tds) * 100) / 100
           const rem = Math.round((bal - settle) * 100) / 100
           return (
             <div style={{ fontSize: 11, color: "#64748b", marginTop: 4, padding: "8px 10px", background: "#ffffff", borderRadius: 8, border: "1px solid #bae6fd", lineHeight: 1.5 }}>
-              <strong style={{ color: "#94a3b8" }}>Settlement toward invoice:</strong> ₹{inr(recv)} bank + ₹{inr(tds)} TDS ={" "}
+              <strong style={{ color: "#94a3b8" }}>Settlement toward invoice:</strong> ₹{inr(recv)} bank + ₹{inr(tds)} TDS ({pct.toFixed(2)}%) ={" "}
               <strong style={{ color: "#0c4a6e" }}>₹{inr(settle)}</strong>
               <br />
               After apply, balance due ≈ ₹{inr(Math.max(0, rem))}
