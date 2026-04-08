@@ -1288,6 +1288,14 @@ function parseMoneyInput(v) {
   return Math.round((parseFloat(String(v).replace(/,/g, "")) || 0) * 100) / 100
 }
 
+function tdsPayableAccountForSection(sectionRaw) {
+  const section = String(sectionRaw || "").trim().toUpperCase()
+  if (section === "192") return "TDS Payable – 192 Salary"
+  if (section === "194J") return "TDS Payable – 194J Professional"
+  if (section === "194C") return "TDS Payable – 194C Contractor"
+  return "TDS Payable – Other"
+}
+
 function invoiceUiStatus(inv) {
   const bal = invoiceBalance(inv)
   if (bal <= 0.01) return "paid"
@@ -3244,7 +3252,16 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
   const [pTab, setPTab] = useState("all")
   const [rTab, setRTab] = useState("pl")
   const [iTab, setITab] = useState("rev")
-  const [nt, setNt] = useState({date:todayISO(),particulars:"",amount:"",drCr:"Debit",category:"Misc Expense",ref:""})
+  const [nt, setNt] = useState({
+    date: todayISO(),
+    particulars: "",
+    amount: "",
+    drCr: "Debit",
+    category: "Misc Expense",
+    ref: "",
+    tdsPct: "",
+    tdsSection: "194C",
+  })
   const [ni, setNi] = useState({
     num: "INV-0001",
     date: todayISO(),
@@ -3838,15 +3855,27 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
     const drCr = (data.drCr||"Debit").startsWith("C")?"CR":"DR"
     const dateStr = isoToDdMmYyyy(data.date||todayISO())
     const cat = data.category||"Misc Expense"
+    const tdsPctRaw = parseFloat(String(data.tdsPct ?? "").replace(/,/g, ""))
+    const tdsPct = Number.isFinite(tdsPctRaw) ? Math.max(0, Math.min(99.99, tdsPctRaw)) : 0
     if (periodLockIso && isPeriodLocked(dateStr, periodLockIso)){
       toast_("Date falls in a locked period — posting blocked","#f43f5e")
       return
     }
+    if (drCr !== "DR" && tdsPct > 0) {
+      toast_("TDS deduction is allowed only for Debit (payment) entries", "#f43f5e")
+      return
+    }
+    const tdsAmount = drCr === "DR" && tdsPct > 0 ? Math.round((amount * tdsPct) * 100) / 10000 : 0
+    const bankPaid = Math.round((amount - tdsAmount) * 100) / 100
+    if (drCr === "DR" && tdsAmount > 0.005 && bankPaid <= 0.005) {
+      toast_("TDS cannot be 100% or more. Enter lower TDS %.", "#f43f5e")
+      return
+    }
     const active = txns.filter(t=>!t.void)
-    if (isDuplicateTxn(active,{date:dateStr,amount,particulars:data.particulars})){
+    if (isDuplicateTxn(active,{date:dateStr,amount:bankPaid > 0 ? bankPaid : amount,particulars:data.particulars})){
       if (!confirm("Possible duplicate (same date, amount & narration). Post anyway?")) return
     }
-    const journalLines = buildJournalLines({ amount, drCr, category: cat })
+    const journalLines = buildJournalLines({ amount: bankPaid > 0 ? bankPaid : amount, drCr, category: cat })
     const v = validateBalanced(journalLines)
     if (!v.ok){toast_(v.errors[0]||"Unbalanced journal","#f43f5e");return}
     const newId = Math.max(...txns.map(t=>t.id),0)+1
@@ -3854,7 +3883,7 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
       id:newId,
       date:dateStr,
       particulars:data.particulars,
-      amount,
+      amount: bankPaid > 0 ? bankPaid : amount,
       drCr,
       category:cat,
       fy:inferFY(dateStr),
@@ -3862,14 +3891,64 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
       void:false,
       audit:{createdAt:new Date().toISOString(),createdBy:acctRole,ref:data.ref||""},
     }
-    const next = withRecalculatedBalances([...txns,t])
+    let toPost = [t]
+    if (drCr === "DR" && tdsAmount > 0.005) {
+      const nominal = categoryToNominalAccount(cat)
+      const tdsPayableAcc = tdsPayableAccountForSection(data.tdsSection)
+      const tdsJournal = [
+        { account: nominal, debit: tdsAmount, credit: 0 },
+        { account: tdsPayableAcc, debit: 0, credit: tdsAmount },
+      ]
+      const tdsValid = validateBalanced(tdsJournal)
+      if (!tdsValid.ok) {
+        toast_(tdsValid.errors[0] || "Unbalanced TDS journal", "#f43f5e")
+        return
+      }
+      toPost.push({
+        id: newId + 1,
+        date: dateStr,
+        particulars: `TDS deducted @${tdsPct}% — ${String(data.particulars || "").slice(0, 120)}`,
+        amount: tdsAmount,
+        drCr: "DR",
+        category: cat,
+        fy: inferFY(dateStr),
+        journalLines: tdsJournal,
+        excludeFromBankRunning: true,
+        void: false,
+        audit: {
+          createdAt: new Date().toISOString(),
+          createdBy: acctRole,
+          ref: data.ref || "",
+          tdsLinkedTxnId: newId,
+          tdsSection: String(data.tdsSection || "194C"),
+        },
+      })
+    }
+    const next = withRecalculatedBalances([...txns, ...toPost])
     const lastBal = [...next].filter(x=>!x.void).sort((a,b)=>parseDdMmYyyy(a.date)-parseDdMmYyyy(b.date)||a.id-b.id).pop()?.balance
     if (lastBal!=null && lastBal<0) toast_("Warning: bank balance negative after posting","#f59e0b")
     setTxns(next)
-    appendAudit({action:"POST",txnId:newId,by:acctRole,particulars:t.particulars,amount,drCr,category:cat})
+    appendAudit({
+      action: tdsAmount > 0.005 ? "POST_WITH_TDS" : "POST",
+      txnId: newId,
+      tdsTxnId: tdsAmount > 0.005 ? newId + 1 : undefined,
+      by: acctRole,
+      particulars: t.particulars,
+      amount,
+      bankPaid: bankPaid > 0 ? bankPaid : amount,
+      tdsAmount,
+      tdsPct,
+      tdsSection: String(data.tdsSection || "194C"),
+      drCr,
+      category: cat,
+    })
     setModal(null)
-    setNt({date:todayISO(),particulars:"",amount:"",drCr:"Debit",category:"Misc Expense",ref:""})
-    toast_("✓ Posted — ₹"+inr(amount)+" (Dr=Cr · "+journalLines.length+" lines)")
+    setNt({date:todayISO(),particulars:"",amount:"",drCr:"Debit",category:"Misc Expense",ref:"",tdsPct:"",tdsSection:"194C"})
+    toast_(
+      tdsAmount > 0.005
+        ? `✓ Posted — Gross ₹${inr(amount)} · Bank ₹${inr(bankPaid)} · TDS ₹${inr(tdsAmount)}`
+        : "✓ Posted — ₹"+inr(amount)+" (Dr=Cr · "+journalLines.length+" lines)"
+    )
   },[txns,nt,acctRole,periodLockIso,appendAudit])
 
   const updateTxnCategory = useCallback(
@@ -4610,6 +4689,8 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
       drCr: "Debit",
       category: "Misc Expense",
       ref: "",
+      tdsPct: "",
+      tdsSection: "194C",
     })
     setPage("txn")
     setModal("txn")
@@ -4629,6 +4710,8 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
       drCr: "Debit",
       category: "Vendor - Other",
       ref: "",
+      tdsPct: "",
+      tdsSection: "194C",
     })
     setPage("txn")
     setModal("txn")
@@ -5888,6 +5971,8 @@ ${buildInvoicePrintDocumentHtml({
                 drCr: "Debit",
                 category: "Misc Expense",
                 ref: "",
+                tdsPct: "",
+                tdsSection: "194C",
               })
               setModal("txn")
             }}
@@ -8053,6 +8138,54 @@ ${buildInvoicePrintDocumentHtml({
       n.Unmapped = orphans.length
       return n
     }, [merged, orphans])
+    const fyPlRows = useMemo(() => {
+      const m = {}
+      for (const t of reportLedger) {
+        const fy = String(t.fy || "Unknown")
+        if (!m[fy]) m[fy] = { fy, income: 0, expense: 0 }
+        if (t.drCr === "CR") m[fy].income += Number(t.amount) || 0
+        if (t.drCr === "DR") m[fy].expense += Number(t.amount) || 0
+      }
+      return Object.values(m)
+        .map(r => ({ ...r, net: Math.round((r.income - r.expense) * 100) / 100 }))
+        .sort((a, b) => String(a.fy).localeCompare(String(b.fy)))
+    }, [reportLedger])
+    const catPlRows = useMemo(() => {
+      const byCat = new Map()
+      for (const t of reportLedger) {
+        const cat = String(t.category || "Uncategorised")
+        const prev = byCat.get(cat) || { category: cat, income: 0, expense: 0 }
+        if (t.drCr === "CR") prev.income += Number(t.amount) || 0
+        if (t.drCr === "DR") prev.expense += Number(t.amount) || 0
+        byCat.set(cat, prev)
+      }
+      return [...byCat.values()]
+        .map(r => ({ ...r, net: Math.round((r.income - r.expense) * 100) / 100 }))
+        .sort((a, b) => Math.abs(b.net) - Math.abs(a.net))
+    }, [reportLedger])
+    const incomeAccountRows = useMemo(() => {
+      return flatWithBalances
+        .filter(r => r.type === "Income" && (Math.abs(r.debit) > 0.005 || Math.abs(r.credit) > 0.005))
+        .map(r => ({
+          account: r.name,
+          code: r.code,
+          income: Math.max(0, Math.round((r.credit - r.debit) * 100) / 100),
+        }))
+        .sort((a, b) => b.income - a.income)
+    }, [flatWithBalances])
+    const expenseAccountRows = useMemo(() => {
+      return flatWithBalances
+        .filter(r => r.type === "Expense" && (Math.abs(r.debit) > 0.005 || Math.abs(r.credit) > 0.005))
+        .map(r => ({
+          account: r.name,
+          code: r.code,
+          expense: Math.max(0, Math.round((r.debit - r.credit) * 100) / 100),
+        }))
+        .sort((a, b) => b.expense - a.expense)
+    }, [flatWithBalances])
+    const incomeTotal = incomeAccountRows.reduce((s, r) => s + r.income, 0)
+    const expenseTotal = expenseAccountRows.reduce((s, r) => s + r.expense, 0)
+    const netPl = Math.round((incomeTotal - expenseTotal) * 100) / 100
     const fmtDc = v => (Math.abs(v) < 0.005 ? "—" : `₹${inr(v)}`)
     const fmtNet = netDr => {
       if (Math.abs(netDr) < 0.005) return "—"
@@ -8093,6 +8226,17 @@ ${buildInvoicePrintDocumentHtml({
             <Stat label="Equity" value={String(typeCount.Equity)} color="#5563E8" />
             <Stat label="Income / Expense" value={`${typeCount.Income} / ${typeCount.Expense}`} sub="P&amp;L heads" color="#10b981" />
           </div>
+          <div style={{ ...S.g4, marginTop: 10 }}>
+            <Stat label="Income (P&L)" value={`₹${inr0(incomeTotal)}`} color="#10b981" />
+            <Stat label="Expenses (P&L)" value={`₹${inr0(expenseTotal)}`} color="#f43f5e" />
+            <Stat
+              label="Net P&L"
+              value={`${netPl >= 0 ? "+" : "-"}₹${inr0(Math.abs(netPl))}`}
+              color={netPl >= 0 ? "#10b981" : "#f43f5e"}
+              sub="For selected report period"
+            />
+            <Stat label="FY in scope" value={String(fyPlRows.length)} color="#0ea5e9" />
+          </div>
           {typeCount.Unmapped > 0 && (
             <div style={{ fontSize: 10.5, color: "#fbbf24", marginTop: 8 }}>
               {typeCount.Unmapped} journal account{typeCount.Unmapped === 1 ? "" : "s"} not on the static chart — see group <strong>Journal only (not on chart)</strong>.
@@ -8121,6 +8265,66 @@ ${buildInvoicePrintDocumentHtml({
             <span style={{ fontSize: 10, color: "#64748b" }}>
               {filteredFlat.length} of {flatWithBalances.length} rows
             </span>
+          </div>
+        </div>
+        <div style={{ ...S.card, marginBottom: 11 }}>
+          <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 8 }}>FY-wise P&amp;L</div>
+          <Tbl
+            cols={[
+              { h: "FY", cell: r => <span style={{ fontFamily: "monospace", fontWeight: 700 }}>{r.fy}</span> },
+              { h: "Income (CR)", r: true, cell: r => <span style={{ color: "#10b981", fontFamily: "monospace" }}>₹{inr0(r.income)}</span> },
+              { h: "Expense (DR)", r: true, cell: r => <span style={{ color: "#f43f5e", fontFamily: "monospace" }}>₹{inr0(r.expense)}</span> },
+              {
+                h: "Net P&L",
+                r: true,
+                cell: r => <span style={{ color: r.net >= 0 ? "#10b981" : "#f43f5e", fontFamily: "monospace", fontWeight: 700 }}>{r.net >= 0 ? "+" : "-"}₹{inr0(Math.abs(r.net))}</span>,
+              },
+            ]}
+            rows={fyPlRows}
+            empty="No FY data for this period."
+          />
+        </div>
+        <div style={{ ...S.card, marginBottom: 11 }}>
+          <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 8 }}>Category-wise P&amp;L</div>
+          <Tbl
+            cols={[
+              { h: "Category", k: "category" },
+              { h: "Income (CR)", r: true, cell: r => <span style={{ color: "#10b981", fontFamily: "monospace" }}>₹{inr0(r.income)}</span> },
+              { h: "Expense (DR)", r: true, cell: r => <span style={{ color: "#f43f5e", fontFamily: "monospace" }}>₹{inr0(r.expense)}</span> },
+              {
+                h: "Net",
+                r: true,
+                cell: r => <span style={{ color: r.net >= 0 ? "#10b981" : "#f43f5e", fontFamily: "monospace", fontWeight: 700 }}>{r.net >= 0 ? "+" : "-"}₹{inr0(Math.abs(r.net))}</span>,
+              },
+            ]}
+            rows={catPlRows}
+            empty="No category movement for this period."
+          />
+        </div>
+        <div style={S.g2}>
+          <div style={S.card}>
+            <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 8, color: "#10b981" }}>Income Accounts (COA)</div>
+            <Tbl
+              cols={[
+                { h: "Code", k: "code" },
+                { h: "Account", k: "account" },
+                { h: "Amount", r: true, cell: r => <span style={{ color: "#10b981", fontFamily: "monospace", fontWeight: 700 }}>₹{inr0(r.income)}</span> },
+              ]}
+              rows={incomeAccountRows}
+              empty="No income accounts with movement."
+            />
+          </div>
+          <div style={S.card}>
+            <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 8, color: "#f43f5e" }}>Expense Accounts (COA)</div>
+            <Tbl
+              cols={[
+                { h: "Code", k: "code" },
+                { h: "Account", k: "account" },
+                { h: "Amount", r: true, cell: r => <span style={{ color: "#f43f5e", fontFamily: "monospace", fontWeight: 700 }}>₹{inr0(r.expense)}</span> },
+              ]}
+              rows={expenseAccountRows}
+              empty="No expense accounts with movement."
+            />
           </div>
         </div>
         {orderedGroups.map(group => {
@@ -10341,6 +10545,10 @@ ${buildInvoicePrintDocumentHtml({
                 setNt(p => {
                   const next = { ...p, drCr }
                   if (!String(p.particulars || "").trim()) next.particulars = pickSuggestedParticulars(txns, p.category, drCr)
+                  if (drCr !== "Debit") {
+                    next.tdsPct = ""
+                    next.tdsSection = "194C"
+                  }
                   return next
                 })
               }}
@@ -10388,6 +10596,54 @@ ${buildInvoicePrintDocumentHtml({
               ))}
             </select>
           </F>
+          {nt.drCr === "Debit" && (
+            <>
+              <F label="TDS % (optional)">
+                <input
+                  type="number"
+                  value={nt.tdsPct || ""}
+                  onChange={e => setNt(p => ({ ...p, tdsPct: e.target.value }))}
+                  placeholder="e.g. 1 / 2 / 10"
+                  style={IS}
+                />
+              </F>
+              <F label="TDS Section">
+                <select
+                  value={nt.tdsSection || "194C"}
+                  onChange={e => setNt(p => ({ ...p, tdsSection: e.target.value }))}
+                  style={IS}
+                >
+                  <option value="194C">194C Contractor</option>
+                  <option value="194J">194J Professional</option>
+                  <option value="192">192 Salary</option>
+                  <option value="OTHER">Other</option>
+                </select>
+              </F>
+              {(() => {
+                const gross = parseMoneyInput(nt.amount)
+                const pct = Math.max(0, Math.min(99.99, parseMoneyInput(nt.tdsPct)))
+                const tds = Math.round((gross * pct) / 100 * 100) / 100
+                const bank = Math.round((gross - tds) * 100) / 100
+                if (!(pct > 0) || !(gross > 0)) return null
+                return (
+                  <div
+                    style={{
+                      gridColumn: "1/-1",
+                      fontSize: 11,
+                      color: "#0369a1",
+                      lineHeight: 1.5,
+                      padding: "8px 10px",
+                      background: "rgba(14,165,233,.08)",
+                      borderRadius: 8,
+                      border: "1px solid rgba(14,165,233,.25)",
+                    }}
+                  >
+                    Gross payment ₹{inr0(gross)} · TDS ₹{inr0(tds)} · Net bank payment ₹{inr0(Math.max(0, bank))}
+                  </div>
+                )
+              })()}
+            </>
+          )}
           <F label="Reference No."><input value={nt.ref} onChange={e=>setNt(p=>({...p,ref:e.target.value}))} placeholder="NEFT/IMPS/UPI ref · vendor invoice #" style={IS}/></F>
           {nt.category==="Vendor - IT Solutions"&&<div style={{gridColumn:"1/-1",fontSize:11,color:"#0369a1",lineHeight:1.5,padding:"8px 10px",background:"rgba(107,122,255,.1)",borderRadius:8,border:"1px solid rgba(107,122,255,.25)"}}>Payments to <strong>IT Solutions</strong> are <strong>expenses</strong> (P&amp;L / vendor ledger). For GST, use <strong>GST → ITC</strong>: splits use 18% inclusive CGST+SGST — reconcile with their invoice &amp; GSTR-2B.</div>}
         </div>
