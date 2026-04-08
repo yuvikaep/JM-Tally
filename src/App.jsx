@@ -42,6 +42,7 @@ import {
   appendCompanyAudit,
   removeCompanyData,
   newCompanyId,
+  companyStorageKey,
 } from "./companyStorage.js"
 import { createScopedStore } from "./authStorage.js"
 import { useAuth } from "./auth/AuthContext.jsx"
@@ -3422,6 +3423,122 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
     await appendCompanyAudit(scopedStore, activeCompanyId, entry)
   }, [activeCompanyId, scopedStore])
 
+  /** Full workspace JSON (all companies) — use to copy books from desktop browser to phone. */
+  const exportWorkspaceBackup = useCallback(async () => {
+    try {
+      const reg = await readRegistry(scopedStore)
+      if (!reg?.companies?.length) {
+        toast_("No workspace to export", "#f59e0b")
+        return
+      }
+      const payloadsByCompanyId = {}
+      for (const c of reg.companies) {
+        if (!c?.id) continue
+        payloadsByCompanyId[c.id] = await loadCompanyPayload(scopedStore, c.id)
+      }
+      const doc = {
+        version: 1,
+        app: "jm-tally",
+        epoch: STORAGE_EPOCH,
+        exportedAt: new Date().toISOString(),
+        email: authUser.email,
+        registry: reg,
+        payloadsByCompanyId,
+      }
+      const blob = new Blob([JSON.stringify(doc, null, 2)], { type: "application/json;charset=utf-8" })
+      const a = document.createElement("a")
+      const url = URL.createObjectURL(blob)
+      a.href = url
+      const safe = String(authUser.email || "user")
+        .replace(/[^a-z0-9]+/gi, "-")
+        .replace(/^-|-$/g, "")
+      a.download = `jm_tally_workspace_${safe}_${todayISO()}.json`
+      a.click()
+      URL.revokeObjectURL(url)
+      toast_("Workspace backup downloaded — use Import on another device", "#10b981")
+    } catch (e) {
+      toast_(String(e?.message || e), "#f43f5e")
+    }
+  }, [scopedStore, authUser.email])
+
+  const importWorkspaceBackupFile = useCallback(
+    async file => {
+      if (!file || acctRole === "Viewer") {
+        toast_("View-only — cannot import", "#f43f5e")
+        return
+      }
+      let text
+      try {
+        text = await file.text()
+      } catch (e) {
+        toast_(String(e?.message || e), "#f43f5e")
+        return
+      }
+      let data
+      try {
+        data = JSON.parse(text)
+      } catch {
+        toast_("Could not read backup file (invalid JSON)", "#f43f5e")
+        return
+      }
+      if (data?.app !== "jm-tally" || !data?.registry?.companies?.length || !data?.payloadsByCompanyId) {
+        toast_("Not a valid JM Tally workspace backup", "#f43f5e")
+        return
+      }
+      if (
+        !confirm(
+          "Replace ALL books in this browser with this backup? You cannot undo this. Continue?"
+        )
+      ) {
+        return
+      }
+      try {
+        const prevReg = await readRegistry(scopedStore)
+        const newIds = new Set((data.registry.companies || []).map(c => c.id).filter(Boolean))
+        for (const c of prevReg?.companies || []) {
+          if (c?.id && !newIds.has(c.id)) await removeCompanyData(scopedStore, c.id)
+        }
+        await writeRegistry(scopedStore, data.registry)
+        await scopedStore.set("hisaab_epoch", typeof data.epoch === "number" ? data.epoch : STORAGE_EPOCH)
+        for (const c of data.registry.companies) {
+          if (!c?.id) continue
+          const p = data.payloadsByCompanyId[c.id]
+          if (!p) continue
+          await persistCompanyPayload(scopedStore, c.id, {
+            txns: Array.isArray(p.txns) ? p.txns : [],
+            invoices: Array.isArray(p.invoices) ? p.invoices : [],
+            inventory: Array.isArray(p.inventory) ? p.inventory : [],
+            importHistory: Array.isArray(p.importHistory) ? p.importHistory : [],
+            settings:
+              p.settings && typeof p.settings === "object"
+                ? p.settings
+                : { acctRole: "Admin", periodLockIso: "" },
+          })
+          if (Array.isArray(p.audit)) {
+            await scopedStore.set(companyStorageKey(c.id, "audit_v1"), p.audit)
+          }
+        }
+        const auditCo =
+          data.registry.activeCompanyId && newIds.has(data.registry.activeCompanyId)
+            ? data.registry.activeCompanyId
+            : data.registry.companies[0]?.id
+        if (auditCo) {
+          await appendCompanyAudit(scopedStore, auditCo, {
+            action: "WORKSPACE_IMPORT",
+            particulars: `Restored from ${file.name}`,
+          })
+        }
+        toast_("Backup restored — reloading…", "#10b981")
+        window.setTimeout(() => {
+          window.location.reload()
+        }, 400)
+      } catch (e) {
+        toast_(String(e?.message || e), "#f43f5e")
+      }
+    },
+    [scopedStore, acctRole]
+  )
+
   const toast_ = (msg, c="#10b981") => { setToast({msg,c}); setTimeout(()=>setToast(null),2800) }
 
   useEffect(() => {
@@ -5866,8 +5983,44 @@ ${buildInvoicePrintDocumentHtml({
     const crN = reportLedger.filter(t => t.drCr === "CR").length
     const drN = reportLedger.filter(t => t.drCr === "DR").length
     const bankClosingFig = periodActive ? reportStats.balance : bookBankBalance
+    const booksLookEmpty =
+      !loading &&
+      txns !== null &&
+      ledger.filter(t => !t.void).length === 0 &&
+      (!invoices || invoices.length === 0)
     return (
     <div>
+      {booksLookEmpty && (
+        <div
+          style={{
+            fontSize: isCompactLayout ? 11.5 : 11,
+            color: "#0c4a6e",
+            marginBottom: 14,
+            padding: isCompactLayout ? "14px 14px" : "12px 14px",
+            background: "linear-gradient(135deg, rgba(107,122,255,.14), #ffffff)",
+            borderRadius: 12,
+            border: "1px solid rgba(107,122,255,.35)",
+            lineHeight: 1.55,
+          }}
+        >
+          <div style={{ fontWeight: 800, marginBottom: 8 }}>This device has no ledger yet (₹0 is normal here)</div>
+          <div style={{ color: "#475569", marginBottom: 10 }}>
+            JM Tally stores books in <strong>this browser only</strong> — not on the server. Logging in on your phone uses the same account but a{" "}
+            <strong>separate empty workspace</strong> until you add data here.
+          </div>
+          <div style={{ color: "#475569", marginBottom: 12 }}>
+            To match your computer: on the PC where your data lives, open <strong>Settings → Export workspace backup</strong>, then on this phone use{" "}
+            <strong>Settings → Import workspace backup</strong>. Or import bank CSV / add transactions here.
+          </div>
+          <button
+            type="button"
+            onClick={() => setModal("settings")}
+            style={{ ...S.btn, fontSize: 12, padding: "8px 16px" }}
+          >
+            Open Settings — backup / import
+          </button>
+        </div>
+      )}
       {periodActive && (
         <div style={{ fontSize: 11, color: "#0369a1", marginBottom: 12, padding: "8px 11px", background: "rgba(107,122,255,.1)", borderRadius: 8, border: "1px solid rgba(107,122,255,.25)" }}>
           Period filter active — figures below are for the selected FY / month / dates. Sidebar bank balance is still your <strong>full</strong> book closing.
@@ -10289,6 +10442,46 @@ ${buildInvoicePrintDocumentHtml({
             >
               Open company settings
             </button>
+          </div>
+        </div>
+
+        <div style={{ marginTop: 14, background: "#fff7ed", border: "1px solid rgba(245,158,11,.45)", borderRadius: 10, padding: 12 }}>
+          <div style={{ fontSize: 12, fontWeight: 700, color: "#9a3412", marginBottom: 8 }}>Workspace backup (move data between devices)</div>
+          <div style={{ fontSize: 11, color: "#78350f", lineHeight: 1.55, marginBottom: 12 }}>
+            Your ledger, invoices, and settings are saved in <strong>this browser&apos;s storage</strong>. Other phones or browsers start empty until you import a
+            backup from a machine that already has data.
+          </div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 10, alignItems: "center" }}>
+            <button
+              type="button"
+              onClick={() => void exportWorkspaceBackup()}
+              style={{ ...S.btnO, fontSize: 12, padding: "8px 14px", borderColor: "#ea580c", color: "#c2410c" }}
+            >
+              Export workspace (.json)
+            </button>
+            <label
+              style={{
+                ...S.btn,
+                fontSize: 12,
+                padding: "8px 14px",
+                cursor: acctRole === "Viewer" ? "not-allowed" : "pointer",
+                opacity: acctRole === "Viewer" ? 0.55 : 1,
+                marginBottom: 0,
+              }}
+            >
+              Import workspace (.json)
+              <input
+                type="file"
+                accept="application/json,.json"
+                disabled={acctRole === "Viewer"}
+                style={{ display: "none" }}
+                onChange={e => {
+                  const f = e.target.files?.[0]
+                  if (f) void importWorkspaceBackupFile(f)
+                  e.target.value = ""
+                }}
+              />
+            </label>
           </div>
         </div>
 
