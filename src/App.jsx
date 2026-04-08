@@ -762,11 +762,70 @@ function normalizeTdsPayments(arr) {
       id: Number(x.id) > 0 ? Number(x.id) : i + 1,
       date: typeof x.date === "string" && x.date ? x.date : todayISO(),
       amount: Math.max(0, Math.round((Number(x.amount) || 0) * 100) / 100),
+      kind: String(x.kind || "paid").toLowerCase() === "deducted" ? "deducted" : "paid",
       section: String(x.section || "194C"),
       remark: String(x.remark || "").trim(),
       createdAt: x.createdAt || new Date().toISOString(),
     }))
     .filter(x => x.amount > 0.005)
+}
+
+function parseCsvLine(line) {
+  const out = []
+  let cur = ""
+  let q = false
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i]
+    if (ch === '"') {
+      if (q && line[i + 1] === '"') {
+        cur += '"'
+        i += 1
+      } else {
+        q = !q
+      }
+      continue
+    }
+    if (ch === "," && !q) {
+      out.push(cur.trim())
+      cur = ""
+      continue
+    }
+    cur += ch
+  }
+  out.push(cur.trim())
+  return out
+}
+
+function parseCsvTable(text) {
+  const rows = String(text || "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .split("\n")
+    .map(s => s.trim())
+    .filter(Boolean)
+  if (!rows.length) return { headers: [], rows: [] }
+  const headers = parseCsvLine(rows[0]).map(h => String(h || "").trim().toLowerCase())
+  const body = rows.slice(1).map(r => parseCsvLine(r))
+  return { headers, rows: body }
+}
+
+function parseFlexibleIsoDate(raw, fallbackIso = todayISO()) {
+  const s = String(raw || "").trim()
+  if (!s) return fallbackIso
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s
+  const m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/)
+  if (m) {
+    const dd = String(Number(m[1])).padStart(2, "0")
+    const mm = String(Number(m[2])).padStart(2, "0")
+    const yy = String(Number(m[3]))
+    return `${yy}-${mm}-${dd}`
+  }
+  const t = Date.parse(s)
+  if (Number.isFinite(t)) {
+    const d = new Date(t)
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`
+  }
+  return fallbackIso
 }
 
 function mergeManualClientsIntoPresets(manualClients, invoicePresets) {
@@ -3216,7 +3275,7 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
   const [importHistory, setImportHistory] = useState([])
   const [invoices, setInvoices] = useState([])
   const [tdsPaidEntries, setTdsPaidEntries] = useState([])
-  const [tdsPayDraft, setTdsPayDraft] = useState({ date: todayISO(), amount: "", section: "194C", remark: "" })
+  const [tdsPayDraft, setTdsPayDraft] = useState({ date: todayISO(), kind: "paid", amount: "", section: "194C", remark: "" })
   const [invListFilter, setInvListFilter] = useState("all")
   /** When set, invoice modal saves over this row instead of creating */
   const [invoiceModalEditId, setInvoiceModalEditId] = useState(null)
@@ -3229,6 +3288,7 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
   const [dangerAck, setDangerAck] = useState(false)
   /** { count: number } when user asked to remove all bank-import txns — confirm in modal */
   const [bankImportClearModal, setBankImportClearModal] = useState(null)
+  const [bankImportClearRemark, setBankImportClearRemark] = useState("")
   const [companies, setCompanies] = useState([])
   const [activeCompanyId, setActiveCompanyId] = useState("")
   const skipPersistRef = useRef(false)
@@ -3787,7 +3847,7 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
     toast_("✓ Posted — ₹"+inr(amount)+" (Dr=Cr · "+journalLines.length+" lines)")
   },[txns,nt,acctRole,periodLockIso,appendAudit])
 
-  const updateTxnCategoryFromMisc = useCallback(
+  const updateTxnCategory = useCallback(
     (id, newCategory) => {
       if (acctRole === "Viewer") {
         toast_("Viewer role — cannot edit categories", "#f43f5e")
@@ -3798,10 +3858,6 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
       if (!t) return
       if (t.void) {
         toast_("Voided rows cannot be recategorised", "#f59e0b")
-        return
-      }
-      if (t.category !== "Misc Expense" && t.category !== "Misc Income") {
-        toast_("Only rows still on Misc Expense / Misc Income can be changed here", "#94a3b8")
         return
       }
       if (periodLockIso && isPeriodLocked(t.date, periodLockIso)) {
@@ -3818,7 +3874,7 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
       const patched = enrichTxnJournal({ ...t, category: newCategory, journalLines: undefined })
       setTxns(withRecalculatedBalances(txns.map(x => (x.id === id ? patched : x))))
       appendAudit({
-        action: "RECATEGORY_MISC",
+        action: "RECATEGORY",
         txnId: id,
         from: t.category,
         to: newCategory,
@@ -4061,21 +4117,259 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
       toast_("No tagged bank-import rows found. Older data may not have import tags.", "#94a3b8")
       return
     }
+    setBankImportClearRemark("")
     setBankImportClearModal({ count: n })
   }, [txns, acctRole])
 
   const confirmRemoveBankImportTransactions = useCallback(() => {
-    setBankImportClearModal(null)
     if (acctRole === "Viewer") return
     if (!txns?.length) return
+    const remark = String(bankImportClearRemark || "").trim()
+    if (remark.length < 3) {
+      toast_("Enter a remark (at least 3 characters) before deletion", "#f43f5e")
+      return
+    }
     const toRemove = txns.filter(t => isTxnFromBankFileImport(t))
     if (!toRemove.length) return
+    const backupHeader = "Date,Particulars,Category,Type,Amount,Balance,FY,Remark\n"
+    const backupBody = toRemove
+      .map(t =>
+        [
+          t.date,
+          `"${String(t.particulars || "").replace(/"/g, "'")}"`,
+          t.category,
+          t.drCr,
+          t.amount,
+          t.balance ?? "",
+          t.fy || "",
+          `"${String(t.bankRemark || "").replace(/"/g, "'")}"`,
+        ].join(",")
+      )
+      .join("\n")
+    const backupBlob = new Blob([backupHeader + backupBody], { type: "text/csv" })
+    const backupLink = document.createElement("a")
+    backupLink.href = URL.createObjectURL(backupBlob)
+    backupLink.download = `jm_bank_import_backup_${todayISO()}.csv`
+    backupLink.click()
+
     const kept = txns.filter(t => !isTxnFromBankFileImport(t))
     setTxns(withRecalculatedBalances(kept))
     setImportHistory([])
-    appendAudit({ action: "CLEAR_BANK_IMPORTS", by: acctRole, removed: toRemove.length })
-    toast_(`Removed ${toRemove.length} bank-import line(s). You can upload the statement again.`, "#10b981")
-  }, [txns, acctRole, appendAudit])
+    appendAudit({ action: "CLEAR_BANK_IMPORTS", by: acctRole, removed: toRemove.length, remark })
+    setBankImportClearModal(null)
+    setBankImportClearRemark("")
+    toast_(`Backup downloaded + removed ${toRemove.length} bank-import line(s).`, "#10b981")
+  }, [txns, acctRole, appendAudit, bankImportClearRemark])
+
+  const handleClientBulkCsvFile = useCallback(
+    file => {
+      if (!file) return
+      if (acctRole === "Viewer") {
+        toast_("Viewer role — cannot import clients", "#f43f5e")
+        return
+      }
+      const reader = new FileReader()
+      reader.onload = () => {
+        try {
+          const text = String(reader.result || "")
+          const { headers, rows } = parseCsvTable(text)
+          if (!headers.length || !rows.length) {
+            toast_("CSV is empty or invalid", "#f43f5e")
+            return
+          }
+          const idx = name => headers.indexOf(name)
+          const pick = (cols, row) => {
+            for (const c of cols) {
+              const i = idx(c)
+              if (i >= 0) return String(row[i] || "").trim()
+            }
+            return ""
+          }
+          const parsed = rows
+            .map((r, i) => {
+              const client = pick(["client", "name", "business name", "client name"], r)
+              if (!client) return null
+              const gstin = pick(["gstin", "gst"], r).toUpperCase()
+              const placeRaw = pick(["place", "place of supply", "supply"], r).toLowerCase()
+              const place = placeRaw.startsWith("inter") ? "inter" : "intra"
+              return {
+                id: Date.now() + i,
+                client,
+                gstin,
+                place,
+                createdAt: new Date().toISOString(),
+                clientIndustry: pick(["industry", "client industry"], r),
+                country: pick(["country"], r) || "India",
+                city: pick(["city", "town"], r),
+                logoDataUrl: "",
+                pan: pick(["pan"], r).toUpperCase(),
+                addrLine1: pick(["address line1", "address1", "address", "addrline1"], r),
+                addrLine2: pick(["address line2", "address2", "addrline2"], r),
+                state: pick(["state"], r),
+                pin: pick(["pin", "zip", "pincode"], r),
+                shipLine1: "",
+                shipLine2: "",
+                shipState: "",
+                shipPin: "",
+                shipSame: true,
+                additionalNotes: pick(["notes", "remark", "remarks"], r),
+                bankName: "",
+                accountNumber: "",
+                ifsc: "",
+                creditLimit: pick(["credit limit", "creditlimit"], r),
+              }
+            })
+            .filter(Boolean)
+
+          if (!parsed.length) {
+            toast_("No valid client rows found. Add at least a 'client' or 'name' column.", "#f43f5e")
+            return
+          }
+
+          const current = normalizeManualClients(manualClients)
+          const map = new Map(current.map(c => [manualClientKey(c), c]))
+          let added = 0
+          let updated = 0
+          for (const c of normalizeManualClients(parsed)) {
+            const k = manualClientKey(c)
+            const prev = map.get(k)
+            if (prev) {
+              map.set(k, { ...prev, ...c, id: prev.id, createdAt: prev.createdAt || c.createdAt })
+              updated += 1
+            } else {
+              map.set(k, c)
+              added += 1
+            }
+          }
+          setManualClients(normalizeManualClients([...map.values()]))
+          appendAudit({ action: "CLIENT_BULK_IMPORT", added, updated, file: file.name })
+          toast_(`Clients imported · added ${added}, updated ${updated}`, "#10b981")
+        } catch (e) {
+          toast_(String(e?.message || e), "#f43f5e")
+        }
+      }
+      reader.onerror = () => toast_("Could not read CSV file", "#f43f5e")
+      reader.readAsText(file)
+    },
+    [acctRole, manualClients, appendAudit]
+  )
+
+  const handleInvoiceBulkCsvFile = useCallback(
+    file => {
+      if (!file) return
+      if (acctRole === "Viewer") {
+        toast_("Viewer role — cannot import invoices", "#f43f5e")
+        return
+      }
+      const reader = new FileReader()
+      reader.onload = () => {
+        try {
+          const text = String(reader.result || "")
+          const { headers, rows } = parseCsvTable(text)
+          if (!headers.length || !rows.length) {
+            toast_("CSV is empty or invalid", "#f43f5e")
+            return
+          }
+          const idx = name => headers.indexOf(name)
+          const pick = (cols, row) => {
+            for (const c of cols) {
+              const i = idx(c)
+              if (i >= 0) return String(row[i] || "").trim()
+            }
+            return ""
+          }
+
+          const existingNums = new Set(invoices.map(x => String(x.num || "").trim().toLowerCase()).filter(Boolean))
+          let nextId = Math.max(0, ...invoices.map(x => Number(x.id) || 0))
+          const out = []
+          let skipped = 0
+          let autoNumList = [...invoices]
+
+          for (const r of rows) {
+            const client = pick(["client", "billed to", "customer", "name"], r)
+            if (!client) {
+              skipped += 1
+              continue
+            }
+            const gstin = pick(["gstin", "gst"], r).toUpperCase()
+            const rawNum = pick(["invoice", "invoice #", "invoice no", "invoice number", "num"], r)
+            let num = rawNum || suggestNextInvoiceNum(autoNumList, activeCompany?.invoiceSeriesPrefix)
+            num = String(num || "").trim()
+            if (!num || existingNums.has(num.toLowerCase())) {
+              if (rawNum) {
+                skipped += 1
+                continue
+              }
+              num = suggestNextInvoiceNum(autoNumList, activeCompany?.invoiceSeriesPrefix)
+            }
+
+            const dateIso = parseFlexibleIsoDate(pick(["date", "invoice date"], r), todayISO())
+            const dueRaw = pick(["due date", "duedate"], r)
+            const dueDaysRaw = parseInt(pick(["due days", "credit days", "terms days"], r), 10)
+            const dueDate = dueRaw ? parseFlexibleIsoDate(dueRaw, addDaysISO(dateIso, 30)) : addDaysISO(dateIso, Number.isFinite(dueDaysRaw) ? dueDaysRaw : 30)
+
+            const placeRaw = pick(["place", "place of supply", "supply"], r).toLowerCase()
+            const place = placeRaw.startsWith("inter") ? "inter" : "intra"
+            const gstRate = Math.max(0, parseFloat(pick(["gst%", "gst rate", "gst_rate"], r)) || 18)
+            const totalRaw = parseMoneyInput(pick(["total", "invoice total", "amount"], r))
+            let taxable = parseMoneyInput(pick(["taxable", "taxable amount", "subtotal", "base"], r))
+            if (taxable <= 0.005 && totalRaw > 0.005) taxable = Math.round((totalRaw / (1 + gstRate / 100)) * 100) / 100
+            if (taxable <= 0.005) {
+              skipped += 1
+              continue
+            }
+            const g = computeInvoiceGst(taxable, gstRate, place)
+
+            const draft = normalizeInvoiceRow({
+              id: ++nextId,
+              num,
+              date: dateIso,
+              dueDate,
+              client,
+              gstin,
+              sac: pick(["sac", "hsn", "sac/hsn"], r) || "998314",
+              qty: String(parseFloat(pick(["qty", "quantity"], r)) || 1),
+              taxable,
+              gst_rate: gstRate,
+              cgst: g.cgst,
+              sgst: g.sgst,
+              igst: g.igst,
+              total: g.total,
+              desc: pick(["description", "desc", "item"], r),
+              subtitle: pick(["subtitle"], r),
+              place,
+              revenueCategory: pick(["revenue category", "category"], r) || (REVENUE_CATS[0] || "Revenue - B2B Services"),
+              notes: pick(["notes", "remark"], r),
+              status: "sent",
+              paidAmount: 0,
+              paidBankTotal: 0,
+              paidTdsTotal: 0,
+              paidAt: "",
+              createdAt: new Date().toISOString(),
+              clientAddress: pick(["client address", "address"], r),
+              clientPan: pick(["pan", "client pan"], r).toUpperCase(),
+            })
+            out.push(draft)
+            autoNumList.push(draft)
+            existingNums.add(num.toLowerCase())
+          }
+
+          if (!out.length) {
+            toast_("No valid invoice rows imported. Check client/date/taxable columns.", "#f43f5e")
+            return
+          }
+          setInvoices(prev => [...prev, ...out])
+          appendAudit({ action: "INVOICE_BULK_IMPORT", added: out.length, skipped, file: file.name })
+          toast_(`Invoices imported · added ${out.length}${skipped ? `, skipped ${skipped}` : ""}`, "#10b981")
+        } catch (e) {
+          toast_(String(e?.message || e), "#f43f5e")
+        }
+      }
+      reader.onerror = () => toast_("Could not read CSV file", "#f43f5e")
+      reader.readAsText(file)
+    },
+    [acctRole, invoices, activeCompany?.invoiceSeriesPrefix, appendAudit]
+  )
 
   const closeDangerModal = useCallback(() => {
     setDangerFlow(null)
@@ -5585,12 +5879,11 @@ ${buildInvoicePrintDocumentHtml({
           {h:"Date",k:"date"},
           {h:"Particulars",cell:r=><span style={{fontSize:11,opacity:r.void?0.55:1}} title={r.void?(r.voidReason?`${r.particulars}\n\nVoid reason: ${r.voidReason}`:r.particulars):r.particulars}>{r.particulars.substring(0,46)}{r.void?" (void)":""}</span>},
           {h:"Category",cell:r=>{
-            const misc = (r.category === "Misc Expense" || r.category === "Misc Income") && !r.void
-            if (misc && acctRole !== "Viewer") {
+            if (!r.void && acctRole !== "Viewer") {
               return (
                 <select
                   value={r.category}
-                  onChange={e => updateTxnCategoryFromMisc(r.id, e.target.value)}
+                  onChange={e => updateTxnCategory(r.id, e.target.value)}
                   style={{
                     fontSize: 10,
                     maxWidth: 200,
@@ -5602,7 +5895,7 @@ ${buildInvoicePrintDocumentHtml({
                     fontFamily: "inherit",
                     cursor: "pointer",
                   }}
-                  title="Correct category (was misc)"
+                  title="Change transaction category"
                 >
                   {CATS.map(c => (
                     <option key={c} value={c}>
@@ -7140,6 +7433,7 @@ ${buildInvoicePrintDocumentHtml({
                   <th style={{ padding: 6, textAlign: "left", fontSize: 9, color: SKY.text2 }}>Invoice</th>
                   <th style={{ padding: 6, textAlign: "right", fontSize: 9, color: SKY.text2 }}>Total</th>
                   <th style={{ padding: 6, textAlign: "right", fontSize: 9, color: SKY.text2 }}>Bank</th>
+                  <th style={{ padding: 6, textAlign: "right", fontSize: 9, color: SKY.text2 }}>TDS</th>
                   <th style={{ padding: 6, textAlign: "right", fontSize: 9, color: SKY.text2 }}>Balance</th>
                   <th style={{ padding: 6, textAlign: "left", fontSize: 9, color: SKY.text2 }}>Status</th>
                 </tr>
@@ -7153,6 +7447,7 @@ ${buildInvoicePrintDocumentHtml({
                       <td style={{ padding: 6, fontWeight: 600 }}>{inv.num}</td>
                       <td style={{ padding: 6, textAlign: "right", fontFamily: "monospace" }}>₹{inr(inv.total)}</td>
                       <td style={{ padding: 6, textAlign: "right", fontFamily: "monospace", color: "#64748b" }}>₹{inr(invoiceBankReceived(inv))}</td>
+                      <td style={{ padding: 6, textAlign: "right", fontFamily: "monospace", color: "#0369a1" }}>₹{inr(Number(inv.paidTdsTotal) || 0)}</td>
                       <td style={{ padding: 6, textAlign: "right", fontFamily: "monospace", color: invoiceBalance(inv) > 0 ? "#f59e0b" : "#94a3b8" }}>₹{inr(invoiceBalance(inv))}</td>
                       <td style={{ padding: 6 }}>
                         <Chip cat={st === "paid" ? "Revenue" : st === "overdue" ? "Director Payment" : "Misc Expense"} label={st} />
@@ -7534,6 +7829,7 @@ ${buildInvoicePrintDocumentHtml({
                         <th style={{ padding: 8, textAlign: "left", fontSize: 10, fontWeight: 700, color: SKY.text2 }}>Invoice</th>
                         <th style={{ padding: 8, textAlign: "right", fontSize: 10, fontWeight: 700, color: SKY.text2 }}>Total</th>
                         <th style={{ padding: 8, textAlign: "right", fontSize: 10, fontWeight: 700, color: SKY.text2 }}>Bank</th>
+                        <th style={{ padding: 8, textAlign: "right", fontSize: 10, fontWeight: 700, color: SKY.text2 }}>TDS</th>
                         <th style={{ padding: 8, textAlign: "right", fontSize: 10, fontWeight: 700, color: SKY.text2 }}>Balance</th>
                         <th style={{ padding: 8, textAlign: "left", fontSize: 10, fontWeight: 700, color: SKY.text2 }}>Status</th>
                       </tr>
@@ -7541,7 +7837,7 @@ ${buildInvoicePrintDocumentHtml({
                     <tbody>
                       {clientWiseInvoices.length === 0 ? (
                         <tr>
-                          <td colSpan={6} style={{ padding: 24, textAlign: "center", color: SKY.muted2 }}>
+                          <td colSpan={7} style={{ padding: 24, textAlign: "center", color: SKY.muted2 }}>
                             No invoices in this range for this client.
                           </td>
                         </tr>
@@ -7554,6 +7850,7 @@ ${buildInvoicePrintDocumentHtml({
                               <td style={{ padding: 8, fontWeight: 600 }}>{inv.num}</td>
                               <td style={{ padding: 8, textAlign: "right", fontFamily: "monospace" }}>₹{inr(inv.total)}</td>
                               <td style={{ padding: 8, textAlign: "right", fontFamily: "monospace", color: "#64748b" }}>₹{inr(invoiceBankReceived(inv))}</td>
+                              <td style={{ padding: 8, textAlign: "right", fontFamily: "monospace", color: "#0369a1" }}>₹{inr(Number(inv.paidTdsTotal) || 0)}</td>
                               <td style={{ padding: 8, textAlign: "right", fontFamily: "monospace", color: invoiceBalance(inv) > 0 ? "#f59e0b" : "#94a3b8" }}>₹{inr(invoiceBalance(inv))}</td>
                               <td style={{ padding: 8 }}>
                                 <Chip cat={st === "paid" ? "Revenue" : st === "overdue" ? "Director Payment" : "Misc Expense"} label={st} />
@@ -8345,9 +8642,12 @@ ${buildInvoicePrintDocumentHtml({
           }))
           .sort((a, b) => new Date(b.date) - new Date(a.date) || b.id - a.id)
         const clientTotal = clientRows.reduce((s, r) => s + r.tds, 0)
-        const paidRows = normalizeTdsPayments(tdsPaidEntries).sort((a, b) => new Date(b.date) - new Date(a.date) || b.id - a.id)
+        const allTdsRows = normalizeTdsPayments(tdsPaidEntries).sort((a, b) => new Date(b.date) - new Date(a.date) || b.id - a.id)
+        const dedByMeRows = allTdsRows.filter(r => r.kind === "deducted")
+        const paidRows = allTdsRows.filter(r => r.kind === "paid")
+        const dedByMeTotal = dedByMeRows.reduce((s, r) => s + (Number(r.amount) || 0), 0)
         const paidTotal = paidRows.reduce((s, r) => s + (Number(r.amount) || 0), 0)
-        const netPayable = Math.max(0, Math.round((clientTotal - paidTotal) * 100) / 100)
+        const netPayable = Math.max(0, Math.round((dedByMeTotal - paidTotal) * 100) / 100)
 
         const addTdsPayment = () => {
           if (acctRole === "Viewer") return
@@ -8360,36 +8660,44 @@ ${buildInvoicePrintDocumentHtml({
             id: Math.max(0, ...tdsPaidEntries.map(x => Number(x.id) || 0)) + 1,
             date: tdsPayDraft.date || todayISO(),
             amount,
+            kind: tdsPayDraft.kind === "deducted" ? "deducted" : "paid",
             section: String(tdsPayDraft.section || "194C").trim() || "194C",
             remark: String(tdsPayDraft.remark || "").trim(),
             createdAt: new Date().toISOString(),
           }
           setTdsPaidEntries(prev => normalizeTdsPayments([...prev, next]))
-          setTdsPayDraft({ date: todayISO(), amount: "", section: "194C", remark: "" })
-          appendAudit({ action: "TDS_PAID_ADD", amount, section: next.section })
-          toast_("TDS paid entry added", "#10b981")
+          setTdsPayDraft({ date: todayISO(), kind: "paid", amount: "", section: "194C", remark: "" })
+          appendAudit({ action: next.kind === "deducted" ? "TDS_DEDUCTED_ADD" : "TDS_PAID_ADD", amount, section: next.section })
+          toast_(next.kind === "deducted" ? "TDS deducted entry added" : "TDS paid entry added", "#10b981")
         }
 
         const removeTdsPayment = id => {
           if (acctRole === "Viewer") return
           setTdsPaidEntries(prev => prev.filter(x => x.id !== id))
           appendAudit({ action: "TDS_PAID_REMOVE", id })
-          toast_("TDS paid entry removed", "#f59e0b")
+          toast_("TDS entry removed", "#f59e0b")
         }
 
         return (
           <div>
             <div style={S.g4}>
-              <Stat label="TDS deducted by client" value={"₹" + inr0(clientTotal)} sub={String(clientRows.length) + " invoice(s)"} color="#0369a1" icon="⊡" />
+              <Stat label="TDS receivable from clients" value={"₹" + inr0(clientTotal)} sub={String(clientRows.length) + " invoice(s)"} color="#0369a1" icon="⊡" />
+              <Stat label="TDS deducted by me" value={"₹" + inr0(dedByMeTotal)} sub={String(dedByMeRows.length) + " entry(s)"} color="#0c4a6e" icon="▣" />
               <Stat label="TDS paid by me" value={"₹" + inr0(paidTotal)} sub={String(paidRows.length) + " payment(s)"} color="#10b981" icon="✓" />
-              <Stat label="Net TDS payable" value={"₹" + inr0(netPayable)} sub="Deducted minus paid" color={netPayable > 0.01 ? "#f59e0b" : "#10b981"} icon="⏳" />
+              <Stat label="TDS payable by me" value={"₹" + inr0(netPayable)} sub="My deduction minus my payment" color={netPayable > 0.01 ? "#f59e0b" : "#10b981"} icon="⏳" />
             </div>
 
             <div style={{ ...S.card, marginBottom: 14 }}>
-              <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 10 }}>Add TDS paid by me</div>
-              <div style={{ display: "grid", gridTemplateColumns: "160px 140px 140px 1fr auto", gap: 8, alignItems: "end" }}>
+              <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 10 }}>Add my TDS entry</div>
+              <div style={{ display: "grid", gridTemplateColumns: "160px 160px 140px 140px 1fr auto", gap: 8, alignItems: "end" }}>
                 <F label="Date">
                   <input type="date" value={tdsPayDraft.date} onChange={e => setTdsPayDraft(p => ({ ...p, date: e.target.value }))} style={IS} />
+                </F>
+                <F label="Type">
+                  <select value={tdsPayDraft.kind} onChange={e => setTdsPayDraft(p => ({ ...p, kind: e.target.value }))} style={IS}>
+                    <option value="paid">Paid by me</option>
+                    <option value="deducted">Deducted by me</option>
+                  </select>
                 </F>
                 <F label="Amount (₹)">
                   <input type="number" value={tdsPayDraft.amount} onChange={e => setTdsPayDraft(p => ({ ...p, amount: e.target.value }))} style={IS} placeholder="0" />
@@ -8422,13 +8730,14 @@ ${buildInvoicePrintDocumentHtml({
                 />
               </div>
               <div style={S.card}>
-                <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 10 }}>TDS paid by me</div>
+                <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 10 }}>My TDS entries (deducted / paid)</div>
                 <Tbl
                   cols={[
                     { h: "Date", cell: r => formatIsoNice(r.date) },
+                    { h: "Type", cell: r => <Chip cat={r.kind === "deducted" ? "Director Payment" : "Revenue"} label={r.kind === "deducted" ? "Deducted" : "Paid"} /> },
                     { h: "Section", k: "section" },
                     { h: "Remark", k: "remark" },
-                    { h: "Amount", r: true, cell: r => <span style={{ color: "#10b981", fontFamily: "monospace" }}>₹{inr(r.amount)}</span> },
+                    { h: "Amount", r: true, cell: r => <span style={{ color: r.kind === "deducted" ? "#0c4a6e" : "#10b981", fontFamily: "monospace" }}>₹{inr(r.amount)}</span> },
                     {
                       h: "Action",
                       cell: r => (
@@ -8438,8 +8747,8 @@ ${buildInvoicePrintDocumentHtml({
                       ),
                     },
                   ]}
-                  rows={paidRows}
-                  empty="No TDS payments added yet."
+                  rows={allTdsRows}
+                  empty="No TDS entries added yet."
                 />
               </div>
             </div>
@@ -8464,7 +8773,7 @@ ${buildInvoicePrintDocumentHtml({
             onBankStatementFile={handleBankStatementFile}
             onOpenInvoiceModal={openCreateInvoiceModal}
             ledgerTxns={ledger}
-            onRecategorizeTxn={updateTxnCategoryFromMisc}
+            onRecategorizeTxn={updateTxnCategory}
             assistantMemory={assistantMemory}
             onAssistantMemoryAdd={addAssistantMemoryNote}
             onRemoveAssistantNote={removeAssistantNote}
@@ -8586,6 +8895,36 @@ ${buildInvoicePrintDocumentHtml({
                   <div style={{fontSize:11.5,color:"#94a3b8",lineHeight:1.6}}>{s}</div>
                 </div>
               ))}
+            </div>
+          </div>
+          <div style={{ ...S.card, marginTop: 12, marginBottom: 12 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+              <div style={{ fontSize: 12, fontWeight: 700 }}>🧾 Bulk Upload Clients (CSV)</div>
+              <button type="button" onClick={() => {const h="client,gstin,place,pan,city,state,pin,address line1,address line2,industry,country,credit limit,notes\nAcme Pvt Ltd,27ABCDE1234F1Z5,intra,ABCDE1234F,Mumbai,Maharashtra,400001,Unit 201 Tech Park,,IT Services,India,500000,Priority client\n";const b=new Blob([h],{type:"text/csv"});const a=document.createElement("a");a.href=URL.createObjectURL(b);a.download="jm_clients_template.csv";a.click()}} style={{...S.btnO,fontSize:11}}>⬇ Client Template</button>
+            </div>
+            <div style={{ fontSize: 11, color: "#64748b", marginBottom: 8, lineHeight: 1.5 }}>
+              Required column: <strong style={{ color: SKY.text2 }}>client</strong> (or <strong style={{ color: SKY.text2 }}>name</strong>). Existing client+GSTIN rows are updated; new rows are added.
+            </div>
+            <div onClick={()=>document.getElementById("clientFi").click()} style={{border:"2px dashed #bae6fd",borderRadius:10,padding:20,textAlign:"center",cursor:acctRole==="Viewer"?"default":"pointer",opacity:acctRole==="Viewer"?0.5:1}} onMouseEnter={e=>{if(acctRole!=="Viewer"){e.currentTarget.style.borderColor="#6B7AFF";e.currentTarget.style.background="rgba(107,122,255,.04)"}}} onMouseLeave={e=>{e.currentTarget.style.borderColor="#bae6fd";e.currentTarget.style.background="transparent"}}>
+              <div style={{fontSize:22,marginBottom:6}}>👥</div>
+              <div style={{fontWeight:700,color:"#94a3b8",marginBottom:4,fontSize:12}}>Drop client CSV here</div>
+              <div style={{fontSize:11,color:"#64748b"}}>CSV only · adds/updates client directory</div>
+              <input id="clientFi" type="file" accept=".csv,text/csv" style={{display:"none"}} onChange={e=>handleClientBulkCsvFile(e.target.files?.[0])}/>
+            </div>
+          </div>
+          <div style={{ ...S.card, marginTop: 12, marginBottom: 12 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+              <div style={{ fontSize: 12, fontWeight: 700 }}>≡ Bulk Upload Invoices (CSV)</div>
+              <button type="button" onClick={() => {const h="invoice,date,due date,client,gstin,taxable,gst%,place,sac,description,revenue category\nINV-2026-0001,2026-04-08,2026-05-08,Acme Pvt Ltd,27ABCDE1234F1Z5,100000,18,intra,998314,IT consulting Apr,Revenue - B2B Services\n";const b=new Blob([h],{type:"text/csv"});const a=document.createElement("a");a.href=URL.createObjectURL(b);a.download="jm_invoices_template.csv";a.click()}} style={{...S.btnO,fontSize:11}}>⬇ Invoice Template</button>
+            </div>
+            <div style={{ fontSize: 11, color: "#64748b", marginBottom: 8, lineHeight: 1.5 }}>
+              Required: <strong style={{ color: SKY.text2 }}>client</strong> and <strong style={{ color: SKY.text2 }}>taxable</strong> (or <strong style={{ color: SKY.text2 }}>total</strong>). Duplicate invoice numbers are skipped.
+            </div>
+            <div onClick={()=>document.getElementById("invoiceFi").click()} style={{border:"2px dashed #bae6fd",borderRadius:10,padding:20,textAlign:"center",cursor:acctRole==="Viewer"?"default":"pointer",opacity:acctRole==="Viewer"?0.5:1}} onMouseEnter={e=>{if(acctRole!=="Viewer"){e.currentTarget.style.borderColor="#6B7AFF";e.currentTarget.style.background="rgba(107,122,255,.04)"}}} onMouseLeave={e=>{e.currentTarget.style.borderColor="#bae6fd";e.currentTarget.style.background="transparent"}}>
+              <div style={{fontSize:22,marginBottom:6}}>📄</div>
+              <div style={{fontWeight:700,color:"#94a3b8",marginBottom:4,fontSize:12}}>Drop invoice CSV here</div>
+              <div style={{fontSize:11,color:"#64748b"}}>CSV only · creates new invoices in register</div>
+              <input id="invoiceFi" type="file" accept=".csv,text/csv" style={{display:"none"}} onChange={e=>handleInvoiceBulkCsvFile(e.target.files?.[0])}/>
             </div>
           </div>
           <div style={S.card}>
@@ -9860,9 +10199,12 @@ ${buildInvoicePrintDocumentHtml({
       <Modal
         open={bankImportClearModal != null}
         title="Remove bank-import transactions?"
-        onClose={() => setBankImportClearModal(null)}
+        onClose={() => {
+          setBankImportClearModal(null)
+          setBankImportClearRemark("")
+        }}
         onSave={confirmRemoveBankImportTransactions}
-        saveDisabled={acctRole === "Viewer"}
+        saveDisabled={acctRole === "Viewer" || String(bankImportClearRemark || "").trim().length < 3}
         saveLabel={acctRole === "Viewer" ? "View-only" : "Yes, remove all"}
       >
         <div style={{ fontSize: 12, color: SKY.text, lineHeight: 1.6, marginBottom: 12 }}>
@@ -9870,8 +10212,16 @@ ${buildInvoicePrintDocumentHtml({
           <strong>{bankImportClearModal?.count ?? 0}</strong> transaction(s) that were created from bank statement uploads (tagged{" "}
           <code style={{ fontSize: 10 }}>import:…</code>).
         </div>
+        <F label="Remark (required)">
+          <input
+            value={bankImportClearRemark}
+            onChange={e => setBankImportClearRemark(e.target.value)}
+            placeholder="Why are you removing these imports?"
+            style={IS}
+          />
+        </F>
         <div style={{ fontSize: 11, color: SKY.muted, lineHeight: 1.55 }}>
-          Manual postings, invoice settlements, and chat-posted lines are not removed. Import history will be cleared. This cannot be undone.
+          A CSV backup is downloaded before delete. Manual postings, invoice settlements, and chat-posted lines are not removed. Import history will be cleared.
         </div>
       </Modal>
 
