@@ -773,6 +773,10 @@ function clientKeyInv(inv) {
   return `${String(inv.client || "").trim().toLowerCase()}\n${String(inv.gstin || "").trim().toUpperCase()}`
 }
 
+function clientKeyFromFields(client, gstin) {
+  return `${String(client || "").trim().toLowerCase()}\n${String(gstin || "").trim().toUpperCase()}`
+}
+
 function manualClientToDraft(m) {
   const n = normalizeManualClients([m])[0]
   return {
@@ -5518,16 +5522,57 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
     [invoiceClientPresets, manualClients, invoices]
   )
 
+  const resolveClientPrintDetails = useCallback(
+    row => {
+      if (!row) return { clientAddress: "", clientPan: "", gstin: "", place: "intra", sac: "998314", revenueCategory: REVENUE_CATS[0] || "Revenue - B2B Services" }
+      const key = clientKeyFromFields(row.client, row.gstin)
+      const preset =
+        invoiceClientPresets.find(p => p.key === key) ||
+        invoiceClientPresets.find(p => String(p.client || "").trim().toLowerCase() === String(row.client || "").trim().toLowerCase())
+      const manual = manualClients.find(m => manualClientKey(m) === key)
+      const clientAddress = String(row.clientAddress || "").trim() || (manual ? formatManualClientAddressForInvoice(manual) : String(preset?.clientAddress || ""))
+      const clientPan = String(row.clientPan || "").trim() || String(manual?.pan || "").trim() || String(preset?.clientPan || "")
+      const gstin = String(row.gstin || "").trim() || String(preset?.gstin || "")
+      return {
+        clientAddress,
+        clientPan,
+        gstin,
+        place: row.place === "inter" ? "inter" : preset?.place === "inter" ? "inter" : "intra",
+        sac: String(row.sac || "").trim() || String(preset?.sac || "998314"),
+        revenueCategory: row.revenueCategory || preset?.revenueCategory || REVENUE_CATS[0] || "Revenue - B2B Services",
+      }
+    },
+    [invoiceClientPresets, manualClients]
+  )
+
   const maybeApplyClientDueFromHistory = useCallback(() => {
     if (modal !== "inv" || invoiceModalEditId != null) return
     setNi(p => {
       const sug = suggestDueFromLastClientInvoice(invoices, p.client, p.gstin, p.date)
-      if (!sug) return p
+      const key = clientKeyFromFields(p.client, p.gstin)
+      const preset =
+        invoiceClientPresets.find(x => x.key === key) ||
+        invoiceClientPresets.find(x => String(x.client || "").trim().toLowerCase() === String(p.client || "").trim().toLowerCase())
+      const manual = manualClients.find(x => manualClientKey(x) === key)
+      const patch = {}
+      if (!String(p.clientAddress || "").trim()) {
+        const addr = manual ? formatManualClientAddressForInvoice(manual) : String(preset?.clientAddress || "")
+        if (addr) patch.clientAddress = addr
+      }
+      if (!String(p.clientPan || "").trim()) {
+        const pan = String(manual?.pan || "").trim() || String(preset?.clientPan || "")
+        if (pan) patch.clientPan = pan
+      }
+      if (!String(p.gstin || "").trim() && preset?.gstin) patch.gstin = preset.gstin
+      if (preset?.place && !p.clientPresetKey) patch.place = preset.place
+      if (preset?.sac && !String(p.sac || "").trim()) patch.sac = preset.sac
+      if (preset?.revenueCategory && !p.clientPresetKey) patch.revenueCategory = preset.revenueCategory
+      if (!sug && !Object.keys(patch).length) return p
       const expectedDue = addDaysISO(p.date, parseInt(p.dueDays, 10) || 30)
-      if (p.dueDate !== expectedDue) return p
-      return { ...p, dueDays: sug.dueDays, dueDate: sug.dueDate }
+      if (!sug || p.dueDate !== expectedDue) return { ...p, ...patch }
+      return { ...p, ...patch, dueDays: sug.dueDays, dueDate: sug.dueDate }
     })
-  }, [modal, invoiceModalEditId, invoices])
+  }, [modal, invoiceModalEditId, invoices, invoiceClientPresets, manualClients])
 
   const updateInvoiceDraftItem = useCallback((idx, patch) => {
     setNi(prev => {
@@ -5713,12 +5758,13 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
   const printInvoiceDraft = () => {
     const itemsDraft = normalizeInvoiceItemDraftList(invoiceItemsFromNi(ni), ni.gst_rate, ni.sac)
     const taxable = invoiceTaxableFromItems(itemsDraft)
-    const g = computeInvoiceGst(taxable, ni.gst_rate, ni.place)
+    const clientResolved = resolveClientPrintDetails(ni)
+    const g = computeInvoiceGst(taxable, ni.gst_rate, clientResolved.place)
     const co = activeCompany
     const lineLabel = String(itemsDraft[0]?.itemName || ni.itemName || "").trim() || "Line item"
     const lineDetail = String(itemsDraft[0]?.desc || ni.desc || "").trim()
     const gstPct = String(ni.gst_rate || "0")
-    const place = ni.place === "inter" ? "inter" : "intra"
+    const place = clientResolved.place
     const dueDate = ni.dueDate || addDaysISO(ni.date, parseInt(ni.dueDays, 10) || 30)
     const html = `<!DOCTYPE html><html><head><meta charset="utf-8"/><title>Invoice ${escapeHtml(String(ni.num))}</title>
 <style>${INVOICE_PRINT_STYLESHEET}</style></head><body>
@@ -5730,10 +5776,10 @@ ${buildInvoicePrintDocumentHtml({
       subtitle: ni.subtitle,
       place,
       client: ni.client,
-      gstin: ni.gstin,
-      clientAddress: ni.clientAddress,
-      clientPan: ni.clientPan,
-      sac: ni.sac,
+      gstin: clientResolved.gstin,
+      clientAddress: clientResolved.clientAddress,
+      clientPan: clientResolved.clientPan,
+      sac: clientResolved.sac,
       lineLabel,
       lineDetail,
       taxable,
@@ -5757,13 +5803,14 @@ ${buildInvoicePrintDocumentHtml({
   /** Print / preview a saved invoice row (list “Open” action). */
   const printSavedInvoice = inv => {
     if (!inv) return
-    const g = computeInvoiceGst(inv.taxable, inv.gst_rate, inv.place)
+    const clientResolved = resolveClientPrintDetails(inv)
+    const g = computeInvoiceGst(inv.taxable, inv.gst_rate, clientResolved.place)
     const taxable = Number(inv.taxable) || 0
     const split = splitStoredInvoiceDesc(inv.desc)
     const lineLabel = split.itemName || "Line item"
     const lineDetail = split.descExtra
     const gstPct = String(inv.gst_rate ?? "0")
-    const place = inv.place === "inter" ? "inter" : "intra"
+    const place = clientResolved.place
     const dueDate = inv.dueDate || inv.date
     const co = activeCompany
     const html = `<!DOCTYPE html><html><head><meta charset="utf-8"/><title>Invoice ${escapeHtml(String(inv.num))}</title>
@@ -5776,10 +5823,10 @@ ${buildInvoicePrintDocumentHtml({
       subtitle: inv.subtitle,
       place,
       client: inv.client,
-      gstin: inv.gstin,
-      clientAddress: inv.clientAddress,
-      clientPan: inv.clientPan,
-      sac: inv.sac,
+      gstin: clientResolved.gstin,
+      clientAddress: clientResolved.clientAddress,
+      clientPan: clientResolved.clientPan,
+      sac: clientResolved.sac,
       lineLabel,
       lineDetail,
       taxable,
@@ -11776,9 +11823,6 @@ ${buildInvoicePrintDocumentHtml({
             const g = computeInvoiceGst(taxableNum, ni.gst_rate, ni.place)
             return (
               <>
-                <div style={{ fontSize: 11, color: SKY.muted, marginBottom: 8 }}>
-                  Formula options: edit <strong style={{ color: SKY.text2 }}>Qty + Rate</strong> to auto-calc Amount, or edit <strong style={{ color: SKY.text2 }}>Qty + Amount</strong> to auto-calc Rate.
-                </div>
                 <div style={{ overflowX: "auto", borderRadius: 10, border: "1px solid #c4b5fd" }}>
                   <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11, minWidth: ni.place === "inter" ? 660 : 760 }}>
                     <thead>
@@ -11903,34 +11947,6 @@ ${buildInvoicePrintDocumentHtml({
                                 placeholder="0"
                                 style={{ ...IS, width: 96, textAlign: "right", fontWeight: 600 }}
                               />
-                              <div style={{ marginTop: 5, display: "flex", gap: 4, justifyContent: "flex-end" }}>
-                                <button
-                                  type="button"
-                                  onClick={() => updateInvoiceDraftItem(idx, { calcMode: "rate" })}
-                                  style={{
-                                    ...S.btnO,
-                                    fontSize: 9,
-                                    padding: "2px 6px",
-                                    borderColor: row.calcMode === "rate" ? "#6d28d9" : SKY.border,
-                                    color: row.calcMode === "rate" ? "#5b21b6" : SKY.muted,
-                                  }}
-                                >
-                                  Qty×Rate
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={() => updateInvoiceDraftItem(idx, { calcMode: "amount" })}
-                                  style={{
-                                    ...S.btnO,
-                                    fontSize: 9,
-                                    padding: "2px 6px",
-                                    borderColor: row.calcMode === "amount" ? "#6d28d9" : SKY.border,
-                                    color: row.calcMode === "amount" ? "#5b21b6" : SKY.muted,
-                                  }}
-                                >
-                                  Amount÷Qty
-                                </button>
-                              </div>
                             </td>
                             {ni.place === "inter" ? (
                               <td style={{ padding: 8, borderTop: "1px solid #e9d5ff", textAlign: "right", color: SKY.text }}>₹{inr(lineG.igst)}</td>
