@@ -1147,12 +1147,12 @@ body{margin:0;font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Robot
 .inv-logo{max-height:56px;max-width:240px;object-fit:contain;}
 .sub{color:#64748b;font-size:13px;margin:8px 0 16px;font-weight:500;}
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-bottom:20px;}
-.card{border:1px solid #e9d5ff;border-radius:12px;padding:16px 18px;background:linear-gradient(180deg,#faf5ff 0%,#f5f3ff 100%);box-shadow:0 1px 4px rgba(91,33,182,.08);}
+.card{border:1px solid #e9d5ff;border-radius:10px;padding:14px 16px;background:#f5f3ff;}
 .lbl{font-size:10px;text-transform:uppercase;color:#6b7280;font-weight:700;letter-spacing:.09em;margin-bottom:8px;}
 .bill-name{font-weight:700;font-size:15px;color:#312e81;}
 .bill-addr{font-size:12px;color:#334155;margin-top:8px;line-height:1.55;}
 .bill-tax{font-size:12px;margin-top:6px;color:#334155;}
-.bank-tot-grid{display:grid;grid-template-columns:1fr 300px;gap:18px;margin-top:22px;align-items:start;}
+.bank-tot-grid{display:grid;grid-template-columns:minmax(0,1fr) 360px;gap:16px;margin-top:10px;align-items:start;}
 .bank-card{margin:0;}
 .bank-box{font-size:11px;color:#334155;line-height:1.65;}
 .bank-lbl{font-size:10px;font-weight:700;color:#5b21b6;text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px;}
@@ -1167,20 +1167,20 @@ table.inv-table{width:100%;border-collapse:separate;border-spacing:0;margin-top:
 .inv-table tbody tr:last-child td{border-bottom:none;}
 .td-item{vertical-align:top;}
 .td-sub{font-size:11px;color:#64748b;margin-top:4px;line-height:1.4;}
-.tot{border:1px solid #e9d5ff;border-radius:12px;padding:16px 20px;background:linear-gradient(180deg,#ffffff 0%,#faf5ff 100%);box-shadow:0 2px 12px rgba(91,33,182,.06);}
-.totline{display:flex;justify-content:space-between;gap:24px;margin:6px 0;font-size:12px;color:#334155;}
-.totline-strong{font-weight:800;font-size:16px;color:#312e81;padding-top:10px;margin-top:8px;border-top:3px double #c4b5fd;}
-.words{margin-top:18px;font-size:12px;color:#475569;}
-.tax-table{width:100%;border-collapse:collapse;margin-top:22px;font-size:11px;border:2px solid #0f172a;}
-.tax-table th,.tax-table td{border:1px solid #0f172a;padding:8px 10px;text-align:left;}
-.tax-table thead th{background:#f8fafc;font-weight:700;color:#0f172a;}
+.tot{border:none;border-radius:0;padding:2px 0;background:transparent;box-shadow:none;}
+.totline{display:flex;justify-content:space-between;gap:20px;margin:8px 0;font-size:12px;color:#1f2937;}
+.totline-strong{font-weight:800;font-size:15px;color:#111827;padding-top:8px;margin-top:8px;border-top:2px solid #222;}
+.words{margin-top:12px;font-size:12px;color:#475569;}
+.tax-table{width:100%;border-collapse:collapse;margin-top:18px;font-size:11px;border:2px solid #111827;}
+.tax-table th,.tax-table td{border:1px solid #111827;padding:6px 10px;text-align:left;}
+.tax-table thead th{background:#f8fafc;font-weight:700;color:#111827;}
 .tax-table .num{text-align:right;}
-.tax-words{font-size:11px;margin-top:10px;font-weight:700;color:#0f172a;text-transform:uppercase;letter-spacing:.02em;}
+.tax-words{font-size:11px;margin-top:8px;font-weight:700;color:#111827;text-transform:uppercase;letter-spacing:.02em;}
 .inv-foot{margin-top:28px;padding-top:18px;border-top:1px solid #e9d5ff;font-size:12px;color:#334155;text-align:center;line-height:1.5;}
 .inv-foot strong{color:#312e81;}
 .notes{margin-top:20px;font-size:12px;color:#334155;padding:12px 14px;background:#faf5ff;border-radius:8px;border:1px solid #e9d5ff;}
 @media print{body{padding:0;}.inv-wrap{padding:12px 16px 20px;}*{print-color-adjust:exact;-webkit-print-color-adjust:exact;}}
-@media (max-width:720px){.bank-tot-grid{grid-template-columns:1fr;}}
+@media (max-width:720px){.totline-strong{font-size:28px;}}
 `
 
 /** Printed invoice: bank block (below line items, left column). */
@@ -1194,6 +1194,7 @@ function buildInvoiceBankDetailsHtml(n) {
   const legacy = String(n.bankAccountLabel || "").trim()
   if (!acctName && !bname && !acctNum && !ifsc && !typ && !legacy) return ""
   let html = `<div class="bank-box">`
+  html += `<div style="font-size:11px;color:#6b7280;margin-bottom:8px;">☐&nbsp; Hide Bank Details</div>`
   html += `<div class="bank-lbl">Bank details</div>`
   if (acctName) html += `<div><strong>Account name:</strong> ${escapeHtml(acctName)}</div>`
   if (acctNum) html += `<div><strong>Account number:</strong> ${escapeHtml(acctNum)}</div>`
@@ -1298,11 +1299,11 @@ function buildInvoicePrintDocumentHtml(opts) {
       ? items
       : [{ itemName: lineLabel, desc: lineDetail, qty, amount: taxable }]
   const gstRateStr = `${escapeHtml(gstPct)}%`
-  const rowLines = printItems.map(row => {
+  const rowLines = printItems.map((row, idx) => {
     const q = parseInvoiceQty(row?.qty)
     const amt = roundMoney2(Number(row?.amount) || 0)
     const rateEach = q > 0 ? amt / q : amt
-    const inner = `${escapeHtml(String(row?.itemName || "Line item"))}${
+    const inner = `${idx + 1}.&nbsp;&nbsp;${escapeHtml(String(row?.itemName || "Line item"))}${
       sacStr ? ` <span class="hsn-inline">(HSN/SAC: ${escapeHtml(sacStr)})</span>` : ""
     }${String(row?.desc || "").trim() ? `<div class="td-sub">${escapeHtml(String(row.desc)).replace(/\n/g, "<br/>")}</div>` : ""}`
     const lineG = computeInvoiceGst(amt, gstPct, place)
@@ -1345,22 +1346,26 @@ function buildInvoicePrintDocumentHtml(opts) {
   const taxTable = placeInter
     ? `<table class="tax-table">
   <thead>
-    <tr><th>Tax Rate</th><th class="num">IGST (Rate)</th><th class="num">IGST (Amount)</th><th class="num">Total</th></tr>
+    <tr><th>Tax Rate</th><th class="num" colspan="2">IGST</th><th class="num">Total</th></tr>
+    <tr><th></th><th class="num">Rate</th><th class="num">Amount</th><th></th></tr>
   </thead>
   <tbody>
     <tr><td>${gstRateStr}</td><td class="num">${gstRateStr}</td><td class="num">${escapeHtml(inr(g.igst))}</td><td class="num">${escapeHtml(inr(g.igst))}</td></tr>
+    <tr><td>Total</td><td class="num"></td><td class="num">${escapeHtml(inr(g.igst))}</td><td class="num">${escapeHtml(inr(g.igst))}</td></tr>
   </tbody>
 </table>
-<div class="tax-words"><strong>Total Tax In Words:</strong> ${escapeHtml(inrAmountWordsPaise(g.igst))}</div>`
+<div class="tax-words">Total Tax In Words: ${escapeHtml(inrAmountWordsPaise(g.igst))}</div>`
     : `<table class="tax-table">
   <thead>
     <tr><th>Tax Rate</th><th class="num">CGST</th><th class="num">SGST</th><th class="num">Total</th></tr>
+    <tr><th></th><th class="num">Amount</th><th class="num">Amount</th><th></th></tr>
   </thead>
   <tbody>
     <tr><td>${gstRateStr}</td><td class="num">${escapeHtml(inr(g.cgst))}</td><td class="num">${escapeHtml(inr(g.sgst))}</td><td class="num">${escapeHtml(inr(g.gst))}</td></tr>
+    <tr><td>Total</td><td class="num">${escapeHtml(inr(g.cgst))}</td><td class="num">${escapeHtml(inr(g.sgst))}</td><td class="num">${escapeHtml(inr(g.gst))}</td></tr>
   </tbody>
 </table>
-<div class="tax-words"><strong>Total Tax In Words:</strong> ${escapeHtml(inrAmountWordsPaise(g.gst))}</div>`
+<div class="tax-words">Total Tax In Words: ${escapeHtml(inrAmountWordsPaise(g.gst))}</div>`
 
   const nCo = normalizeCompanyRecord(co)
   const bankBlock = buildInvoiceBankDetailsHtml(nCo)
@@ -1398,7 +1403,6 @@ ${sub ? `<div class="sub">${escapeHtml(sub)}</div>` : ""}
   <tbody>${rowsHtml}</tbody>
 </table>
 ${bankTotGrid}
-<div class="words"><strong>Amount in words:</strong> ${escapeHtml(inrAmountWords(g.total))}</div>
 ${taxTable}
 ${buildInvoicePrintFooterHtml(co)}
 ${String(notes || "").trim() ? `<div class="notes"><strong>Notes (internal):</strong> ${escapeHtml(String(notes))}</div>` : ""}
