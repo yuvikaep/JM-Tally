@@ -350,6 +350,94 @@ function splitStoredInvoiceDesc(stored) {
   return { itemName: raw.slice(0, nl).trim(), descExtra: raw.slice(nl + 1).trim() }
 }
 
+function emptyInvoiceItemDraft() {
+  return {
+    itemName: "",
+    desc: "",
+    qty: "1",
+    unitRate: "",
+    amount: "",
+    calcMode: "rate",
+  }
+}
+
+function parseInvoiceNumber(raw, fallback = 0) {
+  const n = parseFloat(String(raw ?? "").replace(/,/g, ""))
+  if (!Number.isFinite(n)) return fallback
+  return n
+}
+
+function roundMoney2(n) {
+  return Math.round((Number(n) || 0) * 100) / 100
+}
+
+function roundNum6(n) {
+  return Math.round((Number(n) || 0) * 1e6) / 1e6
+}
+
+function normalizeInvoiceItemDraft(row, fallbackGstRate = "18", fallbackSac = "998314") {
+  const x = row && typeof row === "object" ? row : {}
+  const qtyStr = String(x.qty ?? "1")
+  const rateStr = String(x.unitRate ?? "")
+  const amountStr = String(x.amount ?? "")
+  const calcMode = x.calcMode === "amount" ? "amount" : "rate"
+  const qty = parseInvoiceQty(qtyStr)
+  const amountN = parseInvoiceNumber(amountStr, 0)
+  const rateN = parseInvoiceNumber(rateStr, 0)
+  const amountComputed = calcMode === "amount" ? amountN : qty * rateN
+  const rateComputed = calcMode === "amount" && qty > 0 ? amountN / qty : rateN
+  return {
+    itemName: String(x.itemName || ""),
+    desc: String(x.desc || ""),
+    qty: qtyStr,
+    unitRate: rateStr === "" && calcMode === "amount" ? String(roundNum6(rateComputed) || "") : rateStr,
+    amount: amountStr === "" && calcMode === "rate" ? String(roundMoney2(amountComputed) || "") : amountStr,
+    calcMode,
+    gst_rate: String(x.gst_rate ?? fallbackGstRate),
+    sac: String(x.sac ?? fallbackSac),
+  }
+}
+
+function normalizeInvoiceItemDraftList(rows, fallbackGstRate = "18", fallbackSac = "998314") {
+  const arr = Array.isArray(rows) ? rows : []
+  const out = arr.map(r => normalizeInvoiceItemDraft(r, fallbackGstRate, fallbackSac))
+  return out.length ? out : [normalizeInvoiceItemDraft(emptyInvoiceItemDraft(), fallbackGstRate, fallbackSac)]
+}
+
+function lineAmountFromItemDraft(item) {
+  const qty = parseInvoiceQty(item?.qty)
+  const rate = parseInvoiceNumber(item?.unitRate, 0)
+  const amt = parseInvoiceNumber(item?.amount, 0)
+  if ((item?.calcMode || "rate") === "amount") return roundMoney2(Math.max(0, amt))
+  return roundMoney2(Math.max(0, qty * rate))
+}
+
+function invoiceItemsFromNi(ni) {
+  if (Array.isArray(ni?.items) && ni.items.length > 0) return ni.items
+  return [
+    {
+      itemName: String(ni?.itemName || ""),
+      desc: String(ni?.desc || ""),
+      qty: String(ni?.qty ?? "1"),
+      unitRate: String(ni?.unitRate ?? ""),
+      amount: "",
+      calcMode: "rate",
+      gst_rate: String(ni?.gst_rate ?? "18"),
+      sac: String(ni?.sac ?? "998314"),
+    },
+  ]
+}
+
+function invoiceTaxableFromItems(items) {
+  return roundMoney2((items || []).reduce((s, it) => s + lineAmountFromItemDraft(it), 0))
+}
+
+function primaryInvoiceDescFromItems(items) {
+  const first = (items || [])[0]
+  if (!first) return ""
+  return combineInvoiceDesc({ itemName: first.itemName, desc: first.desc })
+}
+
 const _w1 = ["", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine", "Ten", "Eleven", "Twelve", "Thirteen", "Fourteen", "Fifteen", "Sixteen", "Seventeen", "Eighteen", "Nineteen"]
 const _w10 = ["", "", "Twenty", "Thirty", "Forty", "Fifty", "Sixty", "Seventy", "Eighty", "Ninety"]
 
@@ -455,7 +543,33 @@ function printHtmlDocument(html) {
 
 function normalizeInvoiceRow(inv) {
   if (!inv || typeof inv !== "object") return inv
-  const t = Number(inv.taxable) || 0
+  const baseItems =
+    Array.isArray(inv.items) && inv.items.length > 0
+      ? inv.items
+      : [
+          {
+            itemName: splitStoredInvoiceDesc(inv.desc).itemName,
+            desc: splitStoredInvoiceDesc(inv.desc).descExtra,
+            qty: Number(inv.qty) > 0 ? Number(inv.qty) : 1,
+            unitRate: Number(inv.qty) > 0 ? roundNum6((Number(inv.taxable) || 0) / Number(inv.qty)) : Number(inv.taxable) || 0,
+            amount: Number(inv.taxable) || 0,
+            calcMode: "rate",
+            gst_rate: String(inv.gst_rate ?? "18"),
+            sac: String(inv.sac || "998314"),
+          },
+        ]
+  const items = normalizeInvoiceItemDraftList(baseItems, String(inv.gst_rate ?? "18"), String(inv.sac || "998314")).map(it => ({
+    itemName: String(it.itemName || "").trim(),
+    desc: String(it.desc || "").trim(),
+    qty: parseInvoiceQty(it.qty),
+    unitRate: roundNum6(parseInvoiceNumber(it.unitRate, 0)),
+    amount: lineAmountFromItemDraft(it),
+    calcMode: it.calcMode === "amount" ? "amount" : "rate",
+    gst_rate: String(it.gst_rate || inv.gst_rate || "18"),
+    sac: String(it.sac || inv.sac || "998314"),
+  }))
+  const taxableFromItems = roundMoney2(items.reduce((s, it) => s + (Number(it.amount) || 0), 0))
+  const t = Number(inv.taxable) || taxableFromItems
   const g = Number(inv.gst_rate) || 0
   const place = inv.place === "inter" ? "inter" : "intra"
   let cgst = Number(inv.cgst) || 0
@@ -478,7 +592,7 @@ function normalizeInvoiceRow(inv) {
   paidBankTotal = Math.max(0, Math.min(paidBankTotal, cap))
   paidTdsTotal = Math.max(0, Math.min(paidTdsTotal, cap))
   const qRaw = Number(inv.qty)
-  const qty = Number.isFinite(qRaw) && qRaw > 0 ? qRaw : 1
+  const qty = Number.isFinite(qRaw) && qRaw > 0 ? qRaw : items.reduce((s, it) => s + parseInvoiceQty(it.qty), 0) || 1
   return {
     id: inv.id,
     num: String(inv.num || ""),
@@ -495,6 +609,7 @@ function normalizeInvoiceRow(inv) {
     igst,
     total,
     desc: String(inv.desc || ""),
+    items,
     subtitle: String(inv.subtitle || ""),
     place,
     revenueCategory: inv.revenueCategory || REVENUE_CATS[0] || "Revenue - B2B Services",
@@ -585,9 +700,8 @@ function parseInvoiceQty(raw) {
 }
 
 function lineTaxableFromNi(ni) {
-  const qty = parseInvoiceQty(ni?.qty)
-  const r = parseFloat(String(ni?.unitRate ?? "").replace(/,/g, "")) || 0
-  return Math.round(qty * r * 100) / 100
+  const items = normalizeInvoiceItemDraftList(invoiceItemsFromNi(ni), ni?.gst_rate, ni?.sac)
+  return invoiceTaxableFromItems(items)
 }
 
 /** Suggest payment terms from the most recent invoice to the same client (name + GSTIN). */
@@ -1169,46 +1283,59 @@ function buildInvoicePrintDocumentHtml(opts) {
     g,
     notes,
     qty = 1,
+    items = [],
   } = opts
   const placeInter = place === "inter"
   const placeLabel = placeInter ? "Inter-state (IGST)" : "Intra-state (CGST+SGST)"
   const currencyLabel = invoiceCurrencyLabel(co?.currency)
   const sacStr = String(sac || "").trim()
-  const itemInner = `${escapeHtml(lineLabel)}${
-    sacStr ? ` <span class="hsn-inline">(HSN/SAC: ${escapeHtml(sacStr)})</span>` : ""
-  }${lineDetail ? `<div class="td-sub">${escapeHtml(lineDetail).replace(/\n/g, "<br/>")}</div>` : ""}`
-  const rateEach = qty > 0 ? taxable / qty : taxable
+  const printItems =
+    Array.isArray(items) && items.length
+      ? items
+      : [{ itemName: lineLabel, desc: lineDetail, qty, amount: taxable }]
   const gstRateStr = `${escapeHtml(gstPct)}%`
-
+  const rowLines = printItems.map(row => {
+    const q = parseInvoiceQty(row?.qty)
+    const amt = roundMoney2(Number(row?.amount) || 0)
+    const rateEach = q > 0 ? amt / q : amt
+    const inner = `${escapeHtml(String(row?.itemName || "Line item"))}${
+      sacStr ? ` <span class="hsn-inline">(HSN/SAC: ${escapeHtml(sacStr)})</span>` : ""
+    }${String(row?.desc || "").trim() ? `<div class="td-sub">${escapeHtml(String(row.desc)).replace(/\n/g, "<br/>")}</div>` : ""}`
+    const lineG = computeInvoiceGst(amt, gstPct, place)
+    if (placeInter) {
+      return `<tr>
+    <td class="td-item">${inner}</td>
+    <td class="num">${gstRateStr}</td>
+    <td class="num">${escapeHtml(String(q))}</td>
+    <td class="num">${escapeHtml(inr(rateEach))}</td>
+    <td class="num">${escapeHtml(inr(amt))}</td>
+    <td class="num">${escapeHtml(inr(lineG.igst))}</td>
+    <td class="num" style="font-weight:700;color:#312e81;">${escapeHtml(inr(lineG.total))}</td>
+  </tr>`
+    }
+    return `<tr>
+    <td class="td-item">${inner}</td>
+    <td class="num">${gstRateStr}</td>
+    <td class="num">${escapeHtml(String(q))}</td>
+    <td class="num">${escapeHtml(inr(rateEach))}</td>
+    <td class="num">${escapeHtml(inr(amt))}</td>
+    <td class="num">${escapeHtml(inr(lineG.cgst))}</td>
+    <td class="num">${escapeHtml(inr(lineG.sgst))}</td>
+    <td class="num" style="font-weight:700;color:#312e81;">${escapeHtml(inr(lineG.total))}</td>
+  </tr>`
+  })
   let thead = ""
-  let row = ""
+  let rowsHtml = ""
   if (placeInter) {
     thead = `<tr>
     <th>Item</th><th class="num">GST Rate</th><th class="num">Quantity</th><th class="num">Rate</th><th class="num">Amount</th><th class="num">IGST</th><th class="num">Total</th>
   </tr>`
-    row = `<tr>
-    <td class="td-item">${itemInner}</td>
-    <td class="num">${gstRateStr}</td>
-    <td class="num">${escapeHtml(String(qty))}</td>
-    <td class="num">${escapeHtml(inr(rateEach))}</td>
-    <td class="num">${escapeHtml(inr(taxable))}</td>
-    <td class="num">${escapeHtml(inr(g.igst))}</td>
-    <td class="num" style="font-weight:700;color:#312e81;">${escapeHtml(inr(g.total))}</td>
-  </tr>`
+    rowsHtml = rowLines.join("")
   } else {
     thead = `<tr>
     <th>Item</th><th class="num">GST Rate</th><th class="num">Quantity</th><th class="num">Rate</th><th class="num">Amount</th><th class="num">CGST</th><th class="num">SGST</th><th class="num">Total</th>
   </tr>`
-    row = `<tr>
-    <td class="td-item">${itemInner}</td>
-    <td class="num">${gstRateStr}</td>
-    <td class="num">${escapeHtml(String(qty))}</td>
-    <td class="num">${escapeHtml(inr(rateEach))}</td>
-    <td class="num">${escapeHtml(inr(taxable))}</td>
-    <td class="num">${escapeHtml(inr(g.cgst))}</td>
-    <td class="num">${escapeHtml(inr(g.sgst))}</td>
-    <td class="num" style="font-weight:700;color:#312e81;">${escapeHtml(inr(g.total))}</td>
-  </tr>`
+    rowsHtml = rowLines.join("")
   }
 
   const taxTable = placeInter
@@ -1264,7 +1391,7 @@ ${sub ? `<div class="sub">${escapeHtml(sub)}</div>` : ""}
 </div>
 <table class="inv-table">
   <thead>${thead}</thead>
-  <tbody>${row}</tbody>
+  <tbody>${rowsHtml}</tbody>
 </table>
 ${bankTotGrid}
 <div class="words"><strong>Amount in words:</strong> ${escapeHtml(inrAmountWords(g.total))}</div>
@@ -3379,6 +3506,7 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
     sac: "998314",
     itemName: "",
     desc: "",
+    items: [emptyInvoiceItemDraft()],
     subtitle: "",
     place: "intra",
     revenueCategory: REVENUE_CATS[0] || "Revenue - B2B Services",
@@ -4906,6 +5034,7 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
     }
     setInvoiceModalEditId(null)
     const d = todayISO()
+    const first = emptyInvoiceItemDraft()
     setNi({
       num: suggestNextInvoiceNum(invoices, activeCompany?.invoiceSeriesPrefix),
       date: d,
@@ -4913,12 +5042,13 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
       dueDate: addDaysISO(d, 30),
       client: "",
       gstin: "",
-      qty: "1",
-      unitRate: "",
+      qty: first.qty,
+      unitRate: first.unitRate,
       gst_rate: "18",
       sac: "998314",
-      itemName: "",
-      desc: "",
+      itemName: first.itemName,
+      desc: first.desc,
+      items: [first],
       subtitle: "",
       place: "intra",
       revenueCategory: REVENUE_CATS[0] || "Revenue - B2B Services",
@@ -4940,9 +5070,8 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
     const dd = Number.isFinite(d0) && Number.isFinite(d1) ? Math.max(0, Math.round((d1 - d0) / 86400000)) : 30
     setInvoiceModalEditId(inv.id)
     const split = splitStoredInvoiceDesc(inv.desc)
-    const t = Number(inv.taxable) || 0
-    const q = Number(inv.qty) > 0 ? Number(inv.qty) : 1
-    const ur = q > 0 ? t / q : t
+    const itemRows = normalizeInvoiceItemDraftList(inv.items, String(inv.gst_rate ?? "18"), String(inv.sac || "998314"))
+    const first = itemRows[0] || emptyInvoiceItemDraft()
     setNi({
       num: inv.num,
       date: inv.date,
@@ -4950,12 +5079,13 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
       dueDate: inv.dueDate || inv.date,
       client: inv.client,
       gstin: inv.gstin,
-      qty: String(q),
-      unitRate: ur ? String(Number.isFinite(ur) ? Math.round(ur * 1e6) / 1e6 : ur) : "",
+      qty: String(first.qty ?? "1"),
+      unitRate: String(first.unitRate ?? ""),
       gst_rate: String(inv.gst_rate ?? "18"),
       sac: inv.sac || "998314",
-      itemName: split.itemName,
-      desc: split.descExtra,
+      itemName: String(first.itemName || split.itemName),
+      desc: String(first.desc || split.descExtra),
+      items: itemRows,
       subtitle: inv.subtitle || "",
       place: inv.place === "inter" ? "inter" : "intra",
       revenueCategory: inv.revenueCategory || REVENUE_CATS[0] || "Revenue - B2B Services",
@@ -4971,7 +5101,10 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
     if (acctRole === "Viewer") return
     const nextNum = suggestNextInvoiceNum(invoices, activeCompany?.invoiceSeriesPrefix)
     const d = todayISO()
-    const g = computeInvoiceGst(inv.taxable, inv.gst_rate, inv.place)
+    const itemRows = normalizeInvoiceItemDraftList(inv.items, String(inv.gst_rate ?? "18"), String(inv.sac || "998314"))
+    const taxable = invoiceTaxableFromItems(itemRows)
+    const qtySaved = itemRows.reduce((s, it) => s + parseInvoiceQty(it.qty), 0) || 1
+    const g = computeInvoiceGst(taxable, inv.gst_rate, inv.place)
     const copy = normalizeInvoiceRow({
       id: Math.max(0, ...invoices.map(x => x.id)) + 1,
       num: nextNum,
@@ -4980,14 +5113,15 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
       client: inv.client,
       gstin: inv.gstin,
       sac: inv.sac || "998314",
-      qty: Number(inv.qty) > 0 ? Number(inv.qty) : 1,
-      taxable: inv.taxable,
+      qty: qtySaved,
+      taxable,
       gst_rate: inv.gst_rate,
       cgst: g.cgst,
       sgst: g.sgst,
       igst: g.igst,
       total: g.total,
-      desc: inv.desc,
+      desc: primaryInvoiceDescFromItems(itemRows),
+      items: itemRows,
       place: inv.place,
       revenueCategory: inv.revenueCategory,
       notes: inv.notes || "",
@@ -5107,12 +5241,42 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
     const seen = new Set()
     const out = []
     for (const inv of invoices || []) {
-      const t = String(splitStoredInvoiceDesc(inv.desc).descExtra || "").trim()
-      if (t && !seen.has(t)) {
-        seen.add(t)
-        out.push(t)
-        if (out.length >= 24) break
+      const fromItems = Array.isArray(inv.items) ? inv.items : []
+      if (fromItems.length > 0) {
+        for (const row of fromItems) {
+          const t = String(row?.desc || "").trim()
+          if (t && !seen.has(t)) {
+            seen.add(t)
+            out.push(t)
+            if (out.length >= 24) break
+          }
+        }
+      } else {
+        const t = String(splitStoredInvoiceDesc(inv.desc).descExtra || "").trim()
+        if (t && !seen.has(t)) {
+          seen.add(t)
+          out.push(t)
+        }
       }
+      if (out.length >= 24) break
+    }
+    return out
+  }, [invoices])
+
+  const invoiceItemSuggestions = useMemo(() => {
+    const seen = new Set()
+    const out = []
+    for (const inv of invoices || []) {
+      const rows = Array.isArray(inv.items) && inv.items.length ? inv.items : [{ itemName: splitStoredInvoiceDesc(inv.desc).itemName }]
+      for (const row of rows) {
+        const t = String(row?.itemName || "").trim()
+        if (t && !seen.has(t)) {
+          seen.add(t)
+          out.push(t)
+          if (out.length >= 28) break
+        }
+      }
+      if (out.length >= 28) break
     }
     return out
   }, [invoices])
@@ -5365,12 +5529,68 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
     })
   }, [modal, invoiceModalEditId, invoices])
 
+  const updateInvoiceDraftItem = useCallback((idx, patch) => {
+    setNi(prev => {
+      const base = normalizeInvoiceItemDraftList(invoiceItemsFromNi(prev), prev.gst_rate, prev.sac)
+      if (idx < 0 || idx >= base.length) return prev
+      const cur = { ...base[idx], ...patch }
+      const qty = parseInvoiceQty(cur.qty)
+      const amountN = Math.max(0, parseInvoiceNumber(cur.amount, 0))
+      const rateN = Math.max(0, parseInvoiceNumber(cur.unitRate, 0))
+      if (cur.calcMode === "amount") {
+        cur.unitRate = qty > 0 ? String(roundNum6(amountN / qty)) : ""
+      } else {
+        cur.amount = String(roundMoney2(qty * rateN))
+      }
+      base[idx] = cur
+      const first = base[0] || emptyInvoiceItemDraft()
+      return {
+        ...prev,
+        itemName: String(first.itemName || ""),
+        desc: String(first.desc || ""),
+        qty: String(first.qty ?? "1"),
+        unitRate: String(first.unitRate ?? ""),
+        gst_rate: String(first.gst_rate ?? prev.gst_rate ?? "18"),
+        sac: String(first.sac ?? prev.sac ?? "998314"),
+        items: base,
+      }
+    })
+  }, [])
+
+  const addInvoiceDraftItem = useCallback(() => {
+    setNi(prev => {
+      const base = normalizeInvoiceItemDraftList(invoiceItemsFromNi(prev), prev.gst_rate, prev.sac)
+      const next = [...base, normalizeInvoiceItemDraft(emptyInvoiceItemDraft(), prev.gst_rate, prev.sac)]
+      return { ...prev, items: next }
+    })
+  }, [])
+
+  const removeInvoiceDraftItem = useCallback(idx => {
+    setNi(prev => {
+      const base = normalizeInvoiceItemDraftList(invoiceItemsFromNi(prev), prev.gst_rate, prev.sac)
+      if (base.length <= 1) return prev
+      const next = base.filter((_, i) => i !== idx)
+      const first = next[0] || emptyInvoiceItemDraft()
+      return {
+        ...prev,
+        itemName: String(first.itemName || ""),
+        desc: String(first.desc || ""),
+        qty: String(first.qty ?? "1"),
+        unitRate: String(first.unitRate ?? ""),
+        gst_rate: String(first.gst_rate ?? prev.gst_rate ?? "18"),
+        sac: String(first.sac ?? prev.sac ?? "998314"),
+        items: next,
+      }
+    })
+  }, [])
+
   const saveInvoiceFromModal = () => {
     if (acctRole === "Viewer") return
-    const taxable = lineTaxableFromNi(ni)
+    const itemsDraft = normalizeInvoiceItemDraftList(invoiceItemsFromNi(ni), ni.gst_rate, ni.sac)
+    const taxable = invoiceTaxableFromItems(itemsDraft)
     const g = computeInvoiceGst(taxable, ni.gst_rate, ni.place)
     const numFinal = (ni.num.trim() || suggestNextInvoiceNum(invoices, activeCompany?.invoiceSeriesPrefix)).trim()
-    const qtySaved = parseInvoiceQty(ni.qty)
+    const qtySaved = itemsDraft.reduce((s, it) => s + parseInvoiceQty(it.qty), 0) || 1
     if (!ni.client.trim()) {
       toast_("Enter client name", "#f43f5e")
       return
@@ -5411,7 +5631,17 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
         sgst: g.sgst,
         igst: g.igst,
         total: tot,
-        desc: combineInvoiceDesc(ni),
+        desc: primaryInvoiceDescFromItems(itemsDraft),
+        items: itemsDraft.map(it => ({
+          itemName: String(it.itemName || "").trim(),
+          desc: String(it.desc || "").trim(),
+          qty: parseInvoiceQty(it.qty),
+          unitRate: roundNum6(parseInvoiceNumber(it.unitRate, 0)),
+          amount: lineAmountFromItemDraft(it),
+          calcMode: it.calcMode === "amount" ? "amount" : "rate",
+          gst_rate: String(it.gst_rate || ni.gst_rate || "18"),
+          sac: String(it.sac || ni.sac || "998314"),
+        })),
         subtitle: String(ni.subtitle || "").trim(),
         place: ni.place,
         revenueCategory: ni.revenueCategory,
@@ -5448,7 +5678,17 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
       sgst: g.sgst,
       igst: g.igst,
       total: g.total,
-      desc: combineInvoiceDesc(ni),
+      desc: primaryInvoiceDescFromItems(itemsDraft),
+      items: itemsDraft.map(it => ({
+        itemName: String(it.itemName || "").trim(),
+        desc: String(it.desc || "").trim(),
+        qty: parseInvoiceQty(it.qty),
+        unitRate: roundNum6(parseInvoiceNumber(it.unitRate, 0)),
+        amount: lineAmountFromItemDraft(it),
+        calcMode: it.calcMode === "amount" ? "amount" : "rate",
+        gst_rate: String(it.gst_rate || ni.gst_rate || "18"),
+        sac: String(it.sac || ni.sac || "998314"),
+      })),
       subtitle: String(ni.subtitle || "").trim(),
       place: ni.place,
       revenueCategory: ni.revenueCategory,
@@ -5471,11 +5711,12 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
   }
 
   const printInvoiceDraft = () => {
-    const taxable = lineTaxableFromNi(ni)
+    const itemsDraft = normalizeInvoiceItemDraftList(invoiceItemsFromNi(ni), ni.gst_rate, ni.sac)
+    const taxable = invoiceTaxableFromItems(itemsDraft)
     const g = computeInvoiceGst(taxable, ni.gst_rate, ni.place)
     const co = activeCompany
-    const lineLabel = String(ni.itemName || "").trim() || "Line item"
-    const lineDetail = String(ni.desc || "").trim()
+    const lineLabel = String(itemsDraft[0]?.itemName || ni.itemName || "").trim() || "Line item"
+    const lineDetail = String(itemsDraft[0]?.desc || ni.desc || "").trim()
     const gstPct = String(ni.gst_rate || "0")
     const place = ni.place === "inter" ? "inter" : "intra"
     const dueDate = ni.dueDate || addDaysISO(ni.date, parseInt(ni.dueDays, 10) || 30)
@@ -5499,7 +5740,13 @@ ${buildInvoicePrintDocumentHtml({
       gstPct,
       g,
       notes: ni.notes,
-      qty: parseInvoiceQty(ni.qty),
+      qty: parseInvoiceQty(itemsDraft[0]?.qty),
+      items: itemsDraft.map(it => ({
+        itemName: String(it.itemName || ""),
+        desc: String(it.desc || ""),
+        qty: parseInvoiceQty(it.qty),
+        amount: lineAmountFromItemDraft(it),
+      })),
     })}
 </body></html>`
     if (!printHtmlDocument(html)) {
@@ -5540,6 +5787,16 @@ ${buildInvoicePrintDocumentHtml({
       g,
       notes: inv.notes,
       qty: Number(inv.qty) > 0 ? Number(inv.qty) : 1,
+      items: (Array.isArray(inv.items) && inv.items.length
+        ? inv.items
+        : [
+            {
+              itemName: split.itemName || "Line item",
+              desc: split.descExtra || "",
+              qty: Number(inv.qty) > 0 ? Number(inv.qty) : 1,
+              amount: Number(inv.taxable) || 0,
+            },
+          ]),
     })}
 </body></html>`
     if (!printHtmlDocument(html)) {
@@ -5668,12 +5925,8 @@ ${buildInvoicePrintDocumentHtml({
     if (invPayMode === "replace") {
       const wantedSettlement = Math.round((received + tdsFromTaxable) * 100) / 100
       const finalSettlement = Math.min(Math.max(0, wantedSettlement), tot)
-      let finalBank = received
-      let finalTds = tdsFromTaxable
-      if (wantedSettlement > finalSettlement + 0.001 && wantedSettlement > 0) {
-        finalBank = Math.round((received * finalSettlement) / wantedSettlement * 100) / 100
-        finalTds = Math.round((finalSettlement - finalBank) * 100) / 100
-      }
+      const finalTds = Math.min(Math.max(0, tdsFromTaxable), finalSettlement)
+      const finalBank = Math.round((finalSettlement - finalTds) * 100) / 100
       const paid = finalSettlement >= tot - 0.01
       nextInv = {
         ...inv0,
@@ -5697,8 +5950,10 @@ ${buildInvoicePrintDocumentHtml({
       let increment = Math.round((incBank + incTds) * 100) / 100
       if (increment > bal + 0.001 && increment > 0) {
         increment = Math.round(bal * 100) / 100
-        incBank = Math.round((incBank * bal) / (incBank + incTds) * 100) / 100
-        incTds = Math.round((increment - incBank) * 100) / 100
+        // When bank value is larger than remaining (common when user enters full invoice amount),
+        // keep TDS based on taxable % and auto-adjust bank = remaining settlement - TDS.
+        incTds = Math.min(incTds, increment)
+        incBank = Math.round((increment - incTds) * 100) / 100
       }
       const capped = Math.round((Number(inv0.paidAmount) + increment) * 100) / 100
       const paid = capped >= tot - 0.01
@@ -11516,17 +11771,21 @@ ${buildInvoicePrintDocumentHtml({
           </div>
 
           {(() => {
-            const taxableNum = lineTaxableFromNi(ni)
+            const itemRows = normalizeInvoiceItemDraftList(invoiceItemsFromNi(ni), ni.gst_rate, ni.sac)
+            const taxableNum = invoiceTaxableFromItems(itemRows)
             const g = computeInvoiceGst(taxableNum, ni.gst_rate, ni.place)
             return (
               <>
+                <div style={{ fontSize: 11, color: SKY.muted, marginBottom: 8 }}>
+                  Formula options: edit <strong style={{ color: SKY.text2 }}>Qty + Rate</strong> to auto-calc Amount, or edit <strong style={{ color: SKY.text2 }}>Qty + Amount</strong> to auto-calc Rate.
+                </div>
                 <div style={{ overflowX: "auto", borderRadius: 10, border: "1px solid #c4b5fd" }}>
-                  <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11, minWidth: ni.place === "inter" ? 640 : 720 }}>
+                  <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11, minWidth: ni.place === "inter" ? 660 : 760 }}>
                     <thead>
                       <tr style={{ background: "#312e81", color: "#fff" }}>
                         {(ni.place === "inter"
-                          ? ["Item", "GST Rate", "Qty", "Rate", "Amount", "IGST", "Total"]
-                          : ["Item", "GST Rate", "Qty", "Rate", "Amount", "CGST", "SGST", "Total"]
+                          ? ["Item", "GST Rate", "Qty", "Rate", "Amount", "IGST", "Total", ""]
+                          : ["Item", "GST Rate", "Qty", "Rate", "Amount", "CGST", "SGST", "Total", ""]
                         ).map(h => (
                           <th
                             key={h}
@@ -11546,92 +11805,181 @@ ${buildInvoicePrintDocumentHtml({
                       </tr>
                     </thead>
                     <tbody>
-                      <tr style={{ background: "#faf5ff" }}>
-                        <td style={{ padding: 8, borderTop: "1px solid #e9d5ff", verticalAlign: "top" }}>
-                          <input
-                            value={ni.itemName}
-                            onChange={e => setNi(p => ({ ...p, itemName: e.target.value }))}
-                            placeholder="Item name / SKU"
-                            style={{ ...IS, width: "100%", boxSizing: "border-box" }}
-                          />
-                          {invoiceDescSuggestions.length > 0 ? (
-                            <select
-                              key={invoiceModalEditId == null ? "inv-desc-new" : `inv-desc-${invoiceModalEditId}`}
-                              defaultValue=""
-                              onChange={e => {
-                                const v = e.target.value
-                                if (v) setNi(p => ({ ...p, desc: v }))
-                                e.target.value = ""
-                              }}
-                              style={{ ...IS, width: "100%", boxSizing: "border-box", marginTop: 6, fontSize: 10, color: SKY.muted }}
-                            >
-                              <option value="">Insert from past invoices…</option>
-                              {invoiceDescSuggestions.map(s => (
-                                <option key={s} value={s}>
-                                  {s.length > 72 ? `${s.slice(0, 72)}…` : s}
-                                </option>
-                              ))}
-                            </select>
-                          ) : null}
-                          <textarea
-                            value={ni.desc}
-                            onChange={e => setNi(p => ({ ...p, desc: e.target.value }))}
-                            placeholder="+ Description (period, PO ref…)"
-                            style={{ ...IS, resize: "vertical", minHeight: 44, width: "100%", boxSizing: "border-box", marginTop: 6, fontSize: 11 }}
-                          />
-                          <div style={{ fontSize: 10, color: SKY.muted, marginTop: 6, display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
-                            <span>HSN/SAC</span>
-                            <input
-                              value={ni.sac}
-                              onChange={e => setNi(p => ({ ...p, sac: e.target.value, clientPresetKey: "" }))}
-                              placeholder="998314"
-                              style={{ ...IS, width: 88, fontSize: 11 }}
-                            />
-                          </div>
-                        </td>
-                        <td style={{ padding: 8, borderTop: "1px solid #e9d5ff", verticalAlign: "top" }}>
-                          <select value={ni.gst_rate} onChange={e => setNi(p => ({ ...p, gst_rate: e.target.value }))} style={{ ...IS, width: 72 }}>
-                            <option value="18">18%</option>
-                            <option value="12">12%</option>
-                            <option value="5">5%</option>
-                            <option value="0">0%</option>
-                          </select>
-                        </td>
-                        <td style={{ padding: 8, borderTop: "1px solid #e9d5ff", textAlign: "right", verticalAlign: "top" }}>
-                          <input
-                            type="number"
-                            min={0}
-                            step="any"
-                            value={ni.qty}
-                            onChange={e => setNi(p => ({ ...p, qty: e.target.value }))}
-                            placeholder="1"
-                            style={{ ...IS, width: 72, textAlign: "right" }}
-                          />
-                        </td>
-                        <td style={{ padding: 8, borderTop: "1px solid #e9d5ff", textAlign: "right", verticalAlign: "top" }}>
-                          <input
-                            type="number"
-                            min={0}
-                            step="any"
-                            value={ni.unitRate}
-                            onChange={e => setNi(p => ({ ...p, unitRate: e.target.value }))}
-                            placeholder="0"
-                            style={{ ...IS, width: 88, textAlign: "right" }}
-                          />
-                        </td>
-                        <td style={{ padding: 8, borderTop: "1px solid #e9d5ff", textAlign: "right", fontWeight: 600 }}>₹{inr(taxableNum)}</td>
-                        {ni.place === "inter" ? (
-                          <td style={{ padding: 8, borderTop: "1px solid #e9d5ff", textAlign: "right", color: SKY.text }}>₹{inr(g.igst)}</td>
-                        ) : (
-                          <>
-                            <td style={{ padding: 8, borderTop: "1px solid #e9d5ff", textAlign: "right", color: SKY.text }}>₹{inr(g.cgst)}</td>
-                            <td style={{ padding: 8, borderTop: "1px solid #e9d5ff", textAlign: "right", color: SKY.text }}>₹{inr(g.sgst)}</td>
-                          </>
-                        )}
-                        <td style={{ padding: 8, borderTop: "1px solid #e9d5ff", textAlign: "right", fontWeight: 800, color: "#312e81" }}>₹{inr(g.total)}</td>
-                      </tr>
+                      {itemRows.map((row, idx) => {
+                        const amount = lineAmountFromItemDraft(row)
+                        const lineG = computeInvoiceGst(amount, ni.gst_rate, ni.place)
+                        return (
+                          <tr key={`inv-item-${idx}`} style={{ background: "#faf5ff" }}>
+                            <td style={{ padding: 8, borderTop: "1px solid #e9d5ff", verticalAlign: "top" }}>
+                              <input
+                                list="invoice-item-name-suggestions"
+                                value={row.itemName}
+                                onChange={e => updateInvoiceDraftItem(idx, { itemName: e.target.value })}
+                                placeholder="Item name / SKU"
+                                style={{ ...IS, width: "100%", boxSizing: "border-box" }}
+                              />
+                              {invoiceDescSuggestions.length > 0 ? (
+                                <select
+                                  defaultValue=""
+                                  onChange={e => {
+                                    const v = e.target.value
+                                    if (v) updateInvoiceDraftItem(idx, { desc: v })
+                                    e.target.value = ""
+                                  }}
+                                  style={{ ...IS, width: "100%", boxSizing: "border-box", marginTop: 6, fontSize: 10, color: SKY.muted }}
+                                >
+                                  <option value="">Insert description from past invoices…</option>
+                                  {invoiceDescSuggestions.map(s => (
+                                    <option key={`${s}-${idx}`} value={s}>
+                                      {s.length > 72 ? `${s.slice(0, 72)}…` : s}
+                                    </option>
+                                  ))}
+                                </select>
+                              ) : null}
+                              <textarea
+                                value={row.desc}
+                                onChange={e => updateInvoiceDraftItem(idx, { desc: e.target.value })}
+                                placeholder="+ Description (period, PO ref…)"
+                                style={{ ...IS, resize: "vertical", minHeight: 44, width: "100%", boxSizing: "border-box", marginTop: 6, fontSize: 11 }}
+                              />
+                              <div style={{ fontSize: 10, color: SKY.muted, marginTop: 6, display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                                <span>HSN/SAC</span>
+                                <input
+                                  value={row.sac}
+                                  onChange={e => updateInvoiceDraftItem(idx, { sac: e.target.value })}
+                                  placeholder="998314"
+                                  style={{ ...IS, width: 88, fontSize: 11 }}
+                                />
+                              </div>
+                            </td>
+                            <td style={{ padding: 8, borderTop: "1px solid #e9d5ff", verticalAlign: "top" }}>
+                              <select
+                                value={ni.gst_rate}
+                                onChange={e => {
+                                  const v = e.target.value
+                                  setNi(p => ({
+                                    ...p,
+                                    gst_rate: v,
+                                    items: normalizeInvoiceItemDraftList(invoiceItemsFromNi(p), v, p.sac).map(r => ({ ...r, gst_rate: v })),
+                                  }))
+                                }}
+                                style={{ ...IS, width: 72 }}
+                              >
+                                <option value="18">18%</option>
+                                <option value="12">12%</option>
+                                <option value="5">5%</option>
+                                <option value="0">0%</option>
+                              </select>
+                            </td>
+                            <td style={{ padding: 8, borderTop: "1px solid #e9d5ff", textAlign: "right", verticalAlign: "top" }}>
+                              <input
+                                type="number"
+                                min={0}
+                                step="any"
+                                value={row.qty}
+                                onChange={e => updateInvoiceDraftItem(idx, { qty: e.target.value })}
+                                placeholder="1"
+                                style={{ ...IS, width: 72, textAlign: "right" }}
+                              />
+                            </td>
+                            <td style={{ padding: 8, borderTop: "1px solid #e9d5ff", textAlign: "right", verticalAlign: "top" }}>
+                              <input
+                                type="number"
+                                min={0}
+                                step="any"
+                                value={row.unitRate}
+                                onChange={e => updateInvoiceDraftItem(idx, { unitRate: e.target.value, calcMode: "rate" })}
+                                placeholder="0"
+                                style={{ ...IS, width: 88, textAlign: "right" }}
+                              />
+                            </td>
+                            <td style={{ padding: 8, borderTop: "1px solid #e9d5ff", textAlign: "right", verticalAlign: "top" }}>
+                              <input
+                                type="number"
+                                min={0}
+                                step="0.01"
+                                value={row.amount}
+                                onChange={e => updateInvoiceDraftItem(idx, { amount: e.target.value, calcMode: "amount" })}
+                                placeholder="0"
+                                style={{ ...IS, width: 96, textAlign: "right", fontWeight: 600 }}
+                              />
+                              <div style={{ marginTop: 5, display: "flex", gap: 4, justifyContent: "flex-end" }}>
+                                <button
+                                  type="button"
+                                  onClick={() => updateInvoiceDraftItem(idx, { calcMode: "rate" })}
+                                  style={{
+                                    ...S.btnO,
+                                    fontSize: 9,
+                                    padding: "2px 6px",
+                                    borderColor: row.calcMode === "rate" ? "#6d28d9" : SKY.border,
+                                    color: row.calcMode === "rate" ? "#5b21b6" : SKY.muted,
+                                  }}
+                                >
+                                  Qty×Rate
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => updateInvoiceDraftItem(idx, { calcMode: "amount" })}
+                                  style={{
+                                    ...S.btnO,
+                                    fontSize: 9,
+                                    padding: "2px 6px",
+                                    borderColor: row.calcMode === "amount" ? "#6d28d9" : SKY.border,
+                                    color: row.calcMode === "amount" ? "#5b21b6" : SKY.muted,
+                                  }}
+                                >
+                                  Amount÷Qty
+                                </button>
+                              </div>
+                            </td>
+                            {ni.place === "inter" ? (
+                              <td style={{ padding: 8, borderTop: "1px solid #e9d5ff", textAlign: "right", color: SKY.text }}>₹{inr(lineG.igst)}</td>
+                            ) : (
+                              <>
+                                <td style={{ padding: 8, borderTop: "1px solid #e9d5ff", textAlign: "right", color: SKY.text }}>₹{inr(lineG.cgst)}</td>
+                                <td style={{ padding: 8, borderTop: "1px solid #e9d5ff", textAlign: "right", color: SKY.text }}>₹{inr(lineG.sgst)}</td>
+                              </>
+                            )}
+                            <td style={{ padding: 8, borderTop: "1px solid #e9d5ff", textAlign: "right", fontWeight: 800, color: "#312e81" }}>₹{inr(lineG.total)}</td>
+                            <td style={{ padding: 8, borderTop: "1px solid #e9d5ff", textAlign: "right", verticalAlign: "top" }}>
+                              <button
+                                type="button"
+                                onClick={() => removeInvoiceDraftItem(idx)}
+                                disabled={itemRows.length <= 1}
+                                style={{
+                                  ...S.btnO,
+                                  fontSize: 10,
+                                  padding: "4px 8px",
+                                  borderColor: "#fecaca",
+                                  color: "#b91c1c",
+                                  opacity: itemRows.length <= 1 ? 0.4 : 1,
+                                  cursor: itemRows.length <= 1 ? "not-allowed" : "pointer",
+                                }}
+                              >
+                                Remove
+                              </button>
+                            </td>
+                          </tr>
+                        )
+                      })}
                     </tbody>
                   </table>
+                </div>
+                {invoiceItemSuggestions.length > 0 ? (
+                  <datalist id="invoice-item-name-suggestions">
+                    {invoiceItemSuggestions.map(name => (
+                      <option key={name} value={name} />
+                    ))}
+                  </datalist>
+                ) : null}
+                <div style={{ marginTop: 10 }}>
+                  <button
+                    type="button"
+                    onClick={addInvoiceDraftItem}
+                    style={{ ...S.btnO, borderColor: "#a78bfa", color: "#5b21b6", fontWeight: 700 }}
+                  >
+                    + Add another item
+                  </button>
                 </div>
 
                 <div style={{ display: "grid", gridTemplateColumns: "1fr 280px", gap: 14, alignItems: "start", marginTop: 14 }}>
@@ -11803,16 +12151,18 @@ ${buildInvoicePrintDocumentHtml({
           const pct = Number.isFinite(pRaw) ? Math.max(0, Math.min(99.99, pRaw)) : 0
           const tdsFromTaxable = pct > 0 ? Math.round((taxable * pct) / 100 * 100) / 100 : 0
           const tds = invPayMode === "replace" ? tdsFromTaxable : Math.max(0, Math.round((tdsFromTaxable - baseTds) * 100) / 100)
-          const settle = Math.round((recv + tds) * 100) / 100
+          const settleWanted = Math.round((recv + tds) * 100) / 100
           const refBal = invPayMode === "replace" ? Number(t.total) || 0 : bal
+          const settle = Math.min(refBal, settleWanted)
+          const bankAdj = settleWanted > refBal + 0.01 ? Math.max(0, Math.round((settle - Math.min(tds, settle)) * 100) / 100) : recv
           const rem = Math.round((refBal - settle) * 100) / 100
           return (
             <div style={{ fontSize: 11, color: "#64748b", marginTop: 4, padding: "8px 10px", background: "#ffffff", borderRadius: 8, border: "1px solid #bae6fd", lineHeight: 1.5 }}>
-              <strong style={{ color: "#94a3b8" }}>Settlement toward invoice:</strong> ₹{inr(recv)} bank + ₹{inr(tds)} TDS ({pct.toFixed(2)}% of taxable ₹{inr(taxable)}) ={" "}
+              <strong style={{ color: "#94a3b8" }}>Settlement toward invoice:</strong> ₹{inr(bankAdj)} bank + ₹{inr(Math.min(tds, settle))} TDS ({pct.toFixed(2)}% of taxable ₹{inr(taxable)}) ={" "}
               <strong style={{ color: "#0c4a6e" }}>₹{inr(settle)}</strong>
               <br />
               {invPayMode === "replace" ? "After save, total balance due" : "After apply, balance due"} ≈ ₹{inr(Math.max(0, rem))}
-              {settle > refBal + 0.01 ? <span style={{ color: "#f59e0b" }}> · Excess is trimmed to match allowed balance.</span> : null}
+              {settleWanted > refBal + 0.01 ? <span style={{ color: "#f59e0b" }}> · Bank amount is auto-adjusted so total settlement does not exceed invoice balance.</span> : null}
             </div>
           )
         })()}
