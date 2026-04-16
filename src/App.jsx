@@ -412,6 +412,32 @@ function lineAmountFromItemDraft(item) {
   return roundMoney2(Math.max(0, qty * rate))
 }
 
+/**
+ * Clean pasted invoice description text from Excel / Docs / Sheets.
+ * - Normalizes line endings
+ * - Converts tab-separated cells into " | " segments
+ * - Collapses extra whitespace and blank lines
+ */
+function formatInvoiceDescriptionFromPaste(raw) {
+  const src = String(raw ?? "")
+    .replace(/\r\n?/g, "\n")
+    .replace(/\u00A0/g, " ")
+  const out = []
+  let prevBlank = true
+  for (const line of src.split("\n")) {
+    const clean = line.replace(/\t+/g, " | ").replace(/[ \u200B]+/g, " ").trim()
+    if (!clean) {
+      if (!prevBlank && out.length) out.push("")
+      prevBlank = true
+      continue
+    }
+    out.push(clean)
+    prevBlank = false
+  }
+  while (out.length && out[out.length - 1] === "") out.pop()
+  return out.join("\n")
+}
+
 function invoiceItemsFromNi(ni) {
   if (Array.isArray(ni?.items) && ni.items.length > 0) return ni.items
   return [
@@ -11887,6 +11913,20 @@ ${buildInvoicePrintDocumentHtml({
                               <textarea
                                 value={row.desc}
                                 onChange={e => updateInvoiceDraftItem(idx, { desc: e.target.value })}
+                                onPaste={e => {
+                                  const plain = e.clipboardData?.getData("text/plain")
+                                  if (!plain) return
+                                  const formatted = formatInvoiceDescriptionFromPaste(plain)
+                                  if (!formatted) {
+                                    e.preventDefault()
+                                    return
+                                  }
+                                  e.preventDefault()
+                                  const start = Number.isFinite(e.currentTarget.selectionStart) ? e.currentTarget.selectionStart : row.desc.length
+                                  const end = Number.isFinite(e.currentTarget.selectionEnd) ? e.currentTarget.selectionEnd : start
+                                  const nextDesc = String(row.desc || "").slice(0, start) + formatted + String(row.desc || "").slice(end)
+                                  updateInvoiceDraftItem(idx, { desc: nextDesc })
+                                }}
                                 placeholder="+ Description (period, PO ref…)"
                                 style={{ ...IS, resize: "vertical", minHeight: 44, width: "100%", boxSizing: "border-box", marginTop: 6, fontSize: 11 }}
                               />
