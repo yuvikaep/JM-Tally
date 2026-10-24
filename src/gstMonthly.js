@@ -95,9 +95,10 @@ export function gstSettlementByMonth(ledger, invoices, portal = []) {
       m.itcCredited = (m.itcCredited || 0) + (Number(p.itcCredited) || 0)
     }
   }
+  const sorted = [...mon.values()].sort((a, b) => monthSortKey(a.month) - monthSortKey(b.month))
+  if (usePortal) return settleFromPortalFifo(sorted)
   let running = 0
-  return [...mon.values()]
-    .sort((a, b) => monthSortKey(a.month) - monthSortKey(b.month))
+  return sorted
     .map(m => {
       const settled = r2(m.bank + m.itc + m.other)
       const pending = r2(m.gst - settled)
@@ -119,4 +120,51 @@ export function gstSettlementByMonth(ledger, invoices, portal = []) {
       }
     })
     .filter(m => m.gst > 0.5 || m.settled > 0.005 || m.deposited > 0.005 || m.itcCredited > 0.005)
+}
+
+/**
+ * Portal mode. Returns are filed per period (monthly or quarterly, often with backlog), so a portal
+ * row's utilisation does not belong to that row's month. Utilisation is applied oldest-first to the
+ * output GST of every period up to the last period with any utilisation ("filed through"). Filed
+ * periods show settled / pending 0; whatever does not match is reported once as a difference
+ * (app invoices vs what was paid), not pinned on a random month. Later periods are "not filed yet".
+ */
+function settleFromPortalFifo(sorted) {
+  const used = m => (m.itc || 0) + (m.other || 0)
+  const filedThrough = [...sorted].reverse().find(m => used(m) > 0.005)?.month || ""
+  const isFiled = m => filedThrough && monthSortKey(m.month) <= monthSortKey(filedThrough)
+  let pool = r2(sorted.reduce((s, m) => s + used(m), 0))
+  const rows = sorted.map(m => {
+    const gst = r2(m.gst)
+    let allocated = 0
+    if (isFiled(m)) {
+      allocated = r2(Math.min(gst, pool))
+      pool = r2(pool - allocated)
+    }
+    return {
+      ...m,
+      taxable: r2(m.taxable),
+      gst,
+      bank: r2(m.bank),
+      itc: r2(m.itc),
+      other: r2(m.other),
+      deposited: r2(m.deposited),
+      itcCredited: r2(m.itcCredited),
+      settled: allocated,
+      filed: !!isFiled(m),
+      unallocated: isFiled(m) ? r2(gst - allocated) : 0,
+      pending: isFiled(m) ? 0 : gst,
+      running: 0,
+      portal: true,
+    }
+  })
+  const shortfall = r2(rows.reduce((s, r) => s + r.unallocated, 0))
+  let running = 0
+  for (const r of rows) {
+    running = r2(running + r.pending)
+    r.running = running
+  }
+  const out = rows.filter(m => m.gst > 0.5 || used(m) > 0.005 || m.deposited > 0.005 || m.itcCredited > 0.005)
+  out.portalSummary = { filedThrough, shortfall, excess: pool }
+  return out
 }

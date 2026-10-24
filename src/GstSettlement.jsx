@@ -11,6 +11,7 @@ export function GstSettlementPanel({ ui, rows, acctRole, onAdd, onMovePayment, o
   const { S, Stat, Tbl, inr0 } = ui
   const ro = acctRole === "Viewer"
   const portal = rows.some(r => r.portal)
+  const ps = rows.portalSummary || { filedThrough: "", shortfall: 0, excess: 0 }
   const tot = k => r2(rows.reduce((s, r) => s + r[k], 0))
   const pending = tot("pending")
   const monthOptions = rows.map(r => r.month)
@@ -30,7 +31,16 @@ export function GstSettlementPanel({ ui, rows, acctRole, onAdd, onMovePayment, o
             <Stat label="ITC set-off + paid other" value={"₹" + inr0(r2(tot("itc") + tot("other")))} sub={`ITC ₹${inr0(tot("itc"))} · other ₹${inr0(tot("other"))}`} color="#10b981" />
           </>
         )}
-        <Stat label={pending >= 0 ? "Pending" : "Excess paid"} value={"₹" + inr0(Math.abs(pending))} color={pending > 0.5 ? "#f43f5e" : "#10b981"} />
+        {portal ? (
+          <Stat
+            label="Not filed yet"
+            value={"₹" + inr0(pending)}
+            sub={ps.filedThrough ? `Returns settled through ${gstMonthLabel(ps.filedThrough)}` : "No return utilisation yet"}
+            color={pending > 0.5 ? "#f59e0b" : "#10b981"}
+          />
+        ) : (
+          <Stat label={pending >= 0 ? "Pending" : "Excess paid"} value={"₹" + inr0(Math.abs(pending))} color={pending > 0.5 ? "#f43f5e" : "#10b981"} />
+        )}
       </div>
       <div style={{ ...S.card, display: "flex", gap: 12, flexWrap: "wrap", alignItems: "center", fontSize: 11.5, lineHeight: 1.5 }}>
         <div style={{ flex: "1 1 320px" }}>
@@ -59,6 +69,21 @@ export function GstSettlementPanel({ ui, rows, acctRole, onAdd, onMovePayment, o
           </button>
         )}
       </div>
+      {portal && (ps.shortfall > 0.5 || ps.excess > 0.5) && (
+        <div style={{ background: "rgba(245,158,11,.08)", border: "1px solid rgba(245,158,11,.3)", borderRadius: 9, padding: "9px 13px", marginBottom: 12, fontSize: 11.5, color: "#92400e", lineHeight: 1.55 }}>
+          {ps.shortfall > 0.5 ? (
+            <>
+              <strong>Difference ₹{inr0(ps.shortfall)}:</strong> invoices in the app carry more GST up to {gstMonthLabel(ps.filedThrough)} than was paid on the portal (ITC + cash). Usually an
+              invoice in the app that is not in GSTR-1 (or a different amount there), a missing credit note, or a cancelled invoice still in the app.
+            </>
+          ) : (
+            <>
+              <strong>Extra paid ₹{inr0(ps.excess)}:</strong> the portal shows more ITC + cash used than the GST on the app&apos;s invoices up to {gstMonthLabel(ps.filedThrough)} — usually
+              interest / late fee, or an invoice in GSTR-1 that is not in the app.
+            </>
+          )}
+        </div>
+      )}
       <Tbl
         cols={[
           { h: "Month", cell: r => <strong style={{ fontFamily: "monospace" }}>{gstMonthLabel(r.month)}</strong> },
@@ -68,8 +93,9 @@ export function GstSettlementPanel({ ui, rows, acctRole, onAdd, onMovePayment, o
             ? [
                 { h: "ITC credited", r: true, cell: r => money(r.itcCredited, "#64748b") },
                 { h: "Cash deposited", r: true, cell: r => money(r.deposited, "#64748b") },
-                { h: "ITC used", r: true, cell: r => money(r.itc, "#10b981") },
-                { h: "Cash used", r: true, cell: r => money(r.other, "#0d9488") },
+                { h: "ITC used (portal row)", r: true, cell: r => money(r.itc, "#64748b") },
+                { h: "Cash used (portal row)", r: true, cell: r => money(r.other, "#64748b") },
+                { h: "Settled", r: true, cell: r => money(r.settled, "#047857") },
               ]
             : [
                 { h: "Bank", r: true, cell: r => money(r.bank, "#0d9488") },
@@ -77,14 +103,26 @@ export function GstSettlementPanel({ ui, rows, acctRole, onAdd, onMovePayment, o
                 { h: "Cash / other", r: true, cell: r => money(r.other, "#10b981") },
               ]),
           {
-            h: "Pending",
+            h: portal ? "Status" : "Pending",
             r: true,
-            cell: r => (
+            cell: r =>
+              portal ? (
+                r.filed ? (
+                  <span style={{ fontWeight: 700, color: r.unallocated > 0.5 ? "#b45309" : "#047857" }}>
+                    Filed ✓{r.unallocated > 0.5 ? ` · diff ₹${inr0(r.unallocated)}` : ""}
+                  </span>
+                ) : (
+                  <span style={{ fontWeight: 700, color: "#b45309" }}>Not filed yet · ₹{inr0(r.pending)}</span>
+                )
+              ) : (
               <strong style={{ fontFamily: "monospace", color: r.pending > 0.5 ? "#f43f5e" : r.pending < -0.5 ? "#f59e0b" : "#10b981" }}>
                 {r.pending < -0.5 ? "−" : ""}₹{inr0(Math.abs(r.pending))}
               </strong>
-            ),
+              ),
           },
+          ...(portal
+            ? []
+            : [
           {
             h: "Running",
             r: true,
@@ -94,6 +132,7 @@ export function GstSettlementPanel({ ui, rows, acctRole, onAdd, onMovePayment, o
               </span>
             ),
           },
+              ]),
           {
             h: "",
             r: true,
@@ -116,7 +155,8 @@ export function GstSettlementPanel({ ui, rows, acctRole, onAdd, onMovePayment, o
 
       {portal ? (
         <div style={{ fontSize: 10.5, color: "#64748b", marginTop: 8, lineHeight: 1.5 }}>
-          Pending = output GST of the month (from invoices) − ITC used − cash used, as filed on the portal. Running carries excess / shortfall across months. Books: ITC credited Dr ITC
+          Returns are often filed quarterly or with backlog, so the ITC + cash a portal row used is applied to the oldest unsettled months first (Settled). Every month up to the last
+          return with utilisation is Filed; later months are Not filed yet. Deposits are shown in the month they were made, even when they paid an earlier period. Books: ITC credited Dr ITC
           Receivable / Cr ITC Claimed on Purchases · ITC used Dr GST / Cr ITC Receivable · deposit Dr Electronic Cash Ledger / Cr clearing · cash used Dr GST / Cr Electronic Cash Ledger.
           Bank GST payments clear the clearing account; the rest is booked to the source you pick above.
         </div>
