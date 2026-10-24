@@ -3453,8 +3453,12 @@ function ledgerActivityCount(snap) {
   return n
 }
 
+/** Set when the user wipes all books; newer marker on the server wins over older data on any device. */
+const WORKSPACE_RESET_KEY = "workspace_reset_v1"
+
 async function buildWorkspaceSnapshotDoc(scopedStore, email) {
   const reg = await readRegistry(scopedStore)
+  const reset = await scopedStore.get(WORKSPACE_RESET_KEY)
   const payloadsByCompanyId = {}
   for (const c of reg.companies || []) {
     if (!c?.id) continue
@@ -3468,6 +3472,7 @@ async function buildWorkspaceSnapshotDoc(scopedStore, email) {
     email,
     registry: reg,
     payloadsByCompanyId,
+    resetAt: reset?.at || null,
   }
 }
 
@@ -3489,6 +3494,7 @@ async function applyWorkspaceSnapshotToScopedStore(scopedStore, data, opts = {})
   }
   await writeRegistry(scopedStore, data.registry)
   await scopedStore.set("hisaab_epoch", typeof data.epoch === "number" ? data.epoch : STORAGE_EPOCH)
+  if (data.resetAt) await scopedStore.set(WORKSPACE_RESET_KEY, { at: data.resetAt })
   for (const c of data.registry.companies) {
     if (!c?.id) continue
     const p = data.payloadsByCompanyId[c.id]
@@ -3617,6 +3623,7 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
   const [dangerAck, setDangerAck] = useState(false)
   /** { count: number } when user asked to remove all bank-import txns — confirm in modal */
   const [bankImportClearModal, setBankImportClearModal] = useState(null)
+  const [resetBooksText, setResetBooksText] = useState(null)
   const [bankImportClearRemark, setBankImportClearRemark] = useState("")
   const [companies, setCompanies] = useState([])
   const [activeCompanyId, setActiveCompanyId] = useState("")
@@ -3661,8 +3668,11 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
               const lastSeen = meta.serverUpdatedAt ? Date.parse(meta.serverUpdatedAt) : 0
               const remoteN = ledgerActivityCount(remote.snapshot)
               const localN = ledgerActivityCount(localDoc)
+              const remoteReset = remote.snapshot.resetAt || ""
+              const localReset = localDoc.resetAt || ""
               const takeRemote =
-                (hasRemote && !hasLocal) ||
+                remoteReset > localReset ||
+                (hasRemote && !hasLocal && localReset <= remoteReset) ||
                 (hasRemote && Boolean(meta.serverUpdatedAt) && remoteT > lastSeen) ||
                 (hasRemote && hasLocal && !meta.serverUpdatedAt && remoteN > localN)
               if (takeRemote) {
@@ -3741,13 +3751,16 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
         const remote = await getWorkspace()
         const remoteT = remote?.updatedAt ? Date.parse(remote.updatedAt) : 0
         const lastSync = lastRemoteSyncRef.current ? Date.parse(lastRemoteSyncRef.current) : 0
+        const localReset = (await scopedStore.get(WORKSPACE_RESET_KEY))?.at || ""
+        const remoteReset = remote?.snapshot?.resetAt || ""
         if (
           remote?.snapshot &&
           isValidWorkspaceSnapshotShape(remote.snapshot) &&
-          lastRemoteSyncRef.current != null &&
-          !Number.isNaN(lastSync) &&
-          remoteT > lastSync &&
-          workspaceSnapshotHasLedgerData(remote.snapshot)
+          (remoteReset > localReset ||
+            (lastRemoteSyncRef.current != null &&
+              !Number.isNaN(lastSync) &&
+              remoteT > lastSync &&
+              workspaceSnapshotHasLedgerData(remote.snapshot)))
         ) {
           await applyWorkspaceSnapshotToScopedStore(scopedStore, remote.snapshot, {})
           await scopedStore.set(WORKSPACE_CLOUD_META_KEY, { serverUpdatedAt: remote.updatedAt })
@@ -3759,7 +3772,8 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
         if (
           !workspaceSnapshotHasLedgerData(localSnap) &&
           remote?.snapshot &&
-          workspaceSnapshotHasLedgerData(remote.snapshot)
+          workspaceSnapshotHasLedgerData(remote.snapshot) &&
+          localReset <= remoteReset
         ) {
           return
         }
@@ -3827,7 +3841,7 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
       const reg = await readRegistry(scopedStore)
       if (!reg?.companies?.length) {
         toast_("No workspace to export", "#f59e0b")
-        return
+        return false
       }
       const doc = await buildWorkspaceSnapshotDoc(scopedStore, authUser.email)
       const blob = new Blob([JSON.stringify(doc, null, 2)], { type: "application/json;charset=utf-8" })
@@ -3841,8 +3855,10 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
       a.click()
       URL.revokeObjectURL(url)
       toast_("Workspace backup downloaded — use Import on another device", "#10b981")
+      return true
     } catch (e) {
       toast_(String(e?.message || e), "#f43f5e")
+      return false
     }
   }, [scopedStore, authUser.email])
 
@@ -4240,6 +4256,56 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
       },
     })
   }, [activeCompanyId, txns, invoices, inventory, importHistory, acctRole, periodLockIso, automationSkills, assistantMemory, manualClients, tdsPaidEntries, pfEsicChallans, fixedAssets, scopedStore])
+
+  /**
+   * Wipe every company's books (ledger, invoices, stock, assets, clients, TDS/PF registers, audit) but keep
+   * company profiles, role and automation rules. Downloads a JSON backup first and pushes the empty
+   * workspace to the server so other devices / the next login do not bring the old data back.
+   */
+  const resetAllBooks = useCallback(async () => {
+    if (acctRole !== "Admin") {
+      toast_("Only Admin can reset books", "#f43f5e")
+      return
+    }
+    skipPersistRef.current = true
+    try {
+      await flushActiveToStorage()
+      if (!(await exportWorkspaceBackup())) {
+        skipPersistRef.current = false
+        toast_("Backup could not be downloaded — nothing was deleted", "#f43f5e")
+        return
+      }
+      const reg = await readRegistry(scopedStore)
+      const at = new Date().toISOString()
+      for (const c of reg?.companies || []) {
+        if (!c?.id) continue
+        const prev = await loadCompanyPayload(scopedStore, c.id)
+        await persistCompanyPayload(scopedStore, c.id, {
+          txns: [],
+          invoices: [],
+          inventory: [],
+          importHistory: [],
+          settings: {
+            acctRole: prev?.settings?.acctRole || "Admin",
+            periodLockIso: "",
+            automationSkills: coerceAutomationSkills(prev?.settings?.automationSkills),
+          },
+        })
+        await scopedStore.set(companyStorageKey(c.id, "audit_v1"), [])
+        await appendCompanyAudit(scopedStore, c.id, { action: "WORKSPACE_RESET", by: acctRole, particulars: "All books wiped (backup downloaded)" })
+      }
+      await scopedStore.set(WORKSPACE_RESET_KEY, { at })
+      if (getStoredToken()) {
+        const put = await putWorkspace(await buildWorkspaceSnapshotDoc(scopedStore, authUser.email))
+        if (put?.updatedAt) await scopedStore.set(WORKSPACE_CLOUD_META_KEY, { serverUpdatedAt: put.updatedAt })
+      }
+      toast_("All books wiped — reloading…", "#f59e0b")
+      window.setTimeout(() => window.location.reload(), 600)
+    } catch (e) {
+      skipPersistRef.current = false
+      toast_(`Reset failed: ${String(e?.message || e)}`, "#f43f5e")
+    }
+  }, [acctRole, scopedStore, authUser.email, flushActiveToStorage, exportWorkspaceBackup])
 
   const applyLoadedPayload = useCallback(payload => {
     const raw = (Array.isArray(payload.txns) ? payload.txns : []).map(t => ({ ...t, void: !!t.void }))
@@ -11207,6 +11273,22 @@ ${buildInvoicePrintDocumentHtml({
           </div>
         </div>
 
+        <div style={{ marginTop: 14, background: "#fff1f2", border: "1px solid rgba(244,63,94,.4)", borderRadius: 10, padding: 12 }}>
+          <div style={{ fontSize: 12, fontWeight: 700, color: "#be123c", marginBottom: 8 }}>Reset all books (start fresh)</div>
+          <div style={{ fontSize: 11, color: "#881337", lineHeight: 1.55, marginBottom: 10 }}>
+            Permanently deletes <strong>every company&apos;s</strong> transactions, invoices, clients, stock, fixed assets, TDS / PF registers, import history and audit log — on this device
+            and on the server. Company profiles, your role and automation rules are kept. A full JSON backup downloads first.
+          </div>
+          <button
+            type="button"
+            disabled={acctRole !== "Admin"}
+            onClick={() => setResetBooksText("")}
+            style={{ ...S.btnO, fontSize: 12, padding: "8px 14px", color: "#e11d48", borderColor: "rgba(244,63,94,.5)", opacity: acctRole !== "Admin" ? 0.5 : 1 }}
+          >
+            {acctRole === "Admin" ? "Reset all books…" : "Admin only"}
+          </button>
+        </div>
+
         <div style={{ marginTop: 14, background: "#ffffff", border: `1px solid ${SKY.border}`, borderRadius: 10, padding: 12 }}>
           <div style={{ fontSize: 12, fontWeight: 700, color: SKY.text2, marginBottom: 10 }}>Change password</div>
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
@@ -11584,6 +11666,26 @@ ${buildInvoicePrintDocumentHtml({
             disabled={acctRole === "Viewer"}
             placeholder="Short label, e.g. Axis Current · …099"
           />
+        </F>
+      </Modal>
+
+      <Modal
+        open={resetBooksText != null}
+        title="Reset all books?"
+        onClose={() => setResetBooksText(null)}
+        onSave={() => {
+          setResetBooksText(null)
+          void resetAllBooks()
+        }}
+        saveDisabled={acctRole !== "Admin" || resetBooksText !== "RESET"}
+        saveLabel="Delete everything"
+      >
+        <div style={{ fontSize: 12, color: SKY.text, lineHeight: 1.6, marginBottom: 12 }}>
+          This permanently deletes all transactions, invoices, clients, stock, fixed assets, TDS / PF registers, import history and the audit log for <strong>all companies</strong>, here
+          and on the server. It cannot be undone — the JSON backup that downloads first is the only way back (Settings → Import workspace).
+        </div>
+        <F label='Type RESET to confirm'>
+          <input value={resetBooksText || ""} onChange={e => setResetBooksText(e.target.value)} placeholder="RESET" style={IS} autoFocus />
         </F>
       </Modal>
 
