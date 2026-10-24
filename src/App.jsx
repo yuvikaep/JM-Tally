@@ -142,10 +142,14 @@ const CATS = [
   "Asset Sale",
   "Loan Received",
   "Loan Repayment",
+  "Office Maintenance",
+  "Staff Welfare",
+  "Software & Domain",
+  "Marketing & Branding",
+  "Other Income",
+  "Govt Incentive / Grant",
 ]
 const REVENUE_CATS = CATS.filter(c => c.startsWith("Revenue"))
-const ONE_TIME_WIPE_EMAILS = new Set(["hr@jobsmato.com"])
-const ONE_TIME_WIPE_MARK = "one_time_data_wipe_done_v1"
 const EMPLOYEE_PAYROLL_CATS = new Set(["Salary", "Payroll Salary"])
 
 /** Map Add Transaction UI (Debit/Credit) to bank journal side. */
@@ -252,6 +256,8 @@ function applyLedgerCategoryNormalization(txns) {
  */
 function syncLedgerWithInvoicePaymentState(txns, inv, opt) {
   const stripped = stripInvoiceSettlementTxns(txns, inv.id)
+  // Payment already sits in the ledger as an imported bank-statement credit — posting again would double it.
+  if (inv.settledInBankStatement) return withRecalculatedBalances(applyLedgerCategoryNormalization(stripped))
   const bank = Math.round((Number(inv.paidBankTotal ?? inv.paidAmount) || 0) * 100) / 100
   const tds = Math.round((Number(inv.paidTdsTotal) || 0) * 100) / 100
   if (bank <= 0.005 && tds <= 0.005) {
@@ -670,6 +676,7 @@ function normalizeInvoiceRow(inv) {
     paidBankTotal,
     paidTdsTotal,
     paidAt: inv.paidAt || "",
+    settledInBankStatement: !!inv.settledInBankStatement,
     createdAt: inv.createdAt || new Date().toISOString(),
     clientAddress: String(inv.clientAddress || ""),
     clientPan: String(inv.clientPan || ""),
@@ -3909,59 +3916,6 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
   )
 
   const toast_ = (msg, c="#10b981") => { setToast({msg,c}); setTimeout(()=>setToast(null),2800) }
-
-  useEffect(() => {
-    ;(async () => {
-      if (loading) return
-      const email = String(authUser?.email || "").trim().toLowerCase()
-      if (!ONE_TIME_WIPE_EMAILS.has(email)) return
-      const markKey = `${ONE_TIME_WIPE_MARK}:${email}`
-      const alreadyDone = await scopedStore.get(markKey)
-      if (alreadyDone) return
-
-      skipPersistRef.current = true
-      try {
-        const reg = await readRegistry(scopedStore)
-        const companiesToWipe = Array.isArray(reg?.companies) ? reg.companies : []
-        for (const c of companiesToWipe) {
-          if (c?.id) await removeCompanyData(scopedStore, c.id)
-        }
-
-        const freshId = newCompanyId()
-        const freshReg = {
-          version: 1,
-          companies: [{ id: freshId, name: "My company", legalName: "", bankAccountLabel: "" }],
-          activeCompanyId: freshId,
-        }
-        await writeRegistry(scopedStore, freshReg)
-        await scopedStore.set("hisaab_epoch", STORAGE_EPOCH)
-        await persistCompanyPayload(scopedStore, freshId, {
-          txns: [],
-          invoices: [],
-          inventory: [],
-          importHistory: [],
-          settings: { acctRole: "Admin", periodLockIso: "" },
-        })
-        await scopedStore.set(markKey, { at: new Date().toISOString() })
-
-        setCompanies(freshReg.companies.map(c => normalizeCompanyRecord(c)).filter(Boolean))
-        setActiveCompanyId(freshId)
-        setTxns(withRecalculatedBalances(applyLedgerCategoryNormalization([])))
-        setInvoices([])
-        setInventory([])
-        setImportHistory([])
-        setAssistantMemory([])
-        setManualClients([])
-        setPfEsicChallans([])
-        setFixedAssets([])
-        toast_("One-time data wipe completed for this user", "#f59e0b")
-      } catch (e) {
-        toast_(String(e?.message || e), "#f43f5e")
-      } finally {
-        skipPersistRef.current = false
-      }
-    })()
-  }, [loading, authUser?.email, scopedStore])
 
   useEffect(() => {
     if (!quickAddOpen) return
