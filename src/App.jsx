@@ -40,7 +40,7 @@ import {
 import { parseGstPortalSummary, normalizeGstPortal, syncGstPortal, gstPortalBalances, isGstPortalTxn } from "./gstPortal.js"
 import { GstSettlementPanel } from "./GstSettlement.jsx"
 import { gstSettlementByMonth, gstMonthLabel, gstInvoices, invoiceOutputGst } from "./gstMonthly.js"
-import { syncInvoiceAccrual, isAccrualTxn } from "./invoiceAccrual.js"
+import { syncInvoiceAccrual, isAccrualTxn, matchInvoicePaymentDates } from "./invoiceAccrual.js"
 import {
   normalizeFixedAssets,
   syncAssetSystemTxns,
@@ -255,6 +255,9 @@ const normalizeTxnCategories = arr =>
     }
     return u
   })
+
+/** Receipts booked against invoices only make sense with invoice-based books (revenue comes from invoices). */
+const ledgerUsesCustomerReceipts = txns => (txns || []).some(t => !t.void && t.category === CUSTOMER_RECEIPT)
 
 /** After category rules, rebuild journal lines so TB / P&L stay consistent */
 function applyLedgerCategoryNormalization(txns) {
@@ -3635,6 +3638,8 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
   const [fixedAssets, setFixedAssets] = useState([])
   /** Invoice-based (accrual) books: invoices post AR / revenue / GST; bank receipts clear AR. */
   const [accrualBooks, setAccrualBooks] = useState(false)
+  /** Settings as last loaded — persisted underneath our own keys so values this build does not know are never dropped. */
+  const loadedSettingsRef = useRef({})
   /** GST portal month-wise ledger summary + where outside-bank deposits came from. */
   const [gstPortal, setGstPortal] = useState([])
   const [gstFundingSource, setGstFundingSource] = useState("")
@@ -3746,7 +3751,9 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
         setTdsPaidEntries(normalizeTdsPayments(st?.tdsPaidEntries))
         setPfEsicChallans(normalizePfEsicChallans(st?.pfEsicChallans))
         setFixedAssets(normalizeFixedAssets(st?.fixedAssets))
-        setAccrualBooks(!!st?.accrualBooks)
+        loadedSettingsRef.current = st && typeof st === "object" ? st : {}
+        // Older builds rewrote settings without this key; receipts booked against invoices mean it was on.
+        setAccrualBooks(typeof st?.accrualBooks === "boolean" ? st.accrualBooks : ledgerUsesCustomerReceipts(raw))
         setGstPortal(normalizeGstPortal(st?.gstPortal))
         setGstFundingSource(String(st?.gstFundingSource || ""))
       } finally {
@@ -3763,6 +3770,7 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
       inventory,
       importHistory,
       settings: {
+        ...loadedSettingsRef.current,
         acctRole,
         periodLockIso,
         automationSkills,
@@ -4255,6 +4263,7 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
       inventory,
       importHistory,
       settings: {
+        ...loadedSettingsRef.current,
         acctRole,
         periodLockIso,
         automationSkills,
@@ -4338,7 +4347,8 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
     setTdsPaidEntries(normalizeTdsPayments(st?.tdsPaidEntries))
     setPfEsicChallans(normalizePfEsicChallans(st?.pfEsicChallans))
     setFixedAssets(normalizeFixedAssets(st?.fixedAssets))
-    setAccrualBooks(!!st?.accrualBooks)
+    loadedSettingsRef.current = st && typeof st === "object" ? st : {}
+    setAccrualBooks(typeof st?.accrualBooks === "boolean" ? st.accrualBooks : ledgerUsesCustomerReceipts(raw))
     setGstPortal(normalizeGstPortal(st?.gstPortal))
     setGstFundingSource(String(st?.gstFundingSource || ""))
   }, [])
@@ -4684,6 +4694,16 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
     },
     [acctRole, txns, invoices, appendAudit]
   )
+
+  /** Paid invoices: take the payment date from the matching bank receipt (exports often carry the export date). */
+  const fixInvoicePaymentDates = useCallback(() => {
+    if (acctRole !== "Admin") return
+    const r = matchInvoicePaymentDates(invoices, txns, CUSTOMER_RECEIPT)
+    if (!confirm(`Set payment dates of ${r.exact + r.approx + r.fallback} paid invoice(s) from bank receipts?\n\n• ${r.exact} matched exactly (client + amount)\n• ${r.approx} matched by client, amount within 15%\n• ${r.fallback} not found — due date used`)) return
+    setInvoices(r.invoices.map(normalizeInvoiceRow))
+    appendAudit({ action: "INVOICE_PAYMENT_DATES_FROM_BANK", by: acctRole, exact: r.exact, approx: r.approx, fallback: r.fallback })
+    toast_(`Payment dates updated — ${r.exact} exact, ${r.approx} close, ${r.fallback} due date`, "#10b981")
+  }, [acctRole, invoices, txns, appendAudit])
 
   const gstSettlementRows = useMemo(() => gstSettlementByMonth(ledger, invoices, gstPortal), [ledger, invoices, gstPortal])
   const gstPortalBal = useMemo(() => gstPortalBalances(gstPortal, ledger), [gstPortal, ledger])
@@ -9923,6 +9943,19 @@ ${buildInvoicePrintDocumentHtml({
       </div>
         {rTab === "pl" && (
           <div>
+            {!accrualBooks && ledgerUsesCustomerReceipts(ledger) && (
+              <div style={{ ...S.card, background: "#fff1f2", border: "1px solid rgba(244,63,94,.45)", fontSize: 12, color: "#9f1239", lineHeight: 1.55 }}>
+                <strong>Revenue is missing from this P&amp;L.</strong> Bank receipts are booked as “{CUSTOMER_RECEIPT}” (they only clear receivables), but invoice-based books are off, so
+                invoices are not posting revenue either.{" "}
+                {acctRole === "Admin" ? (
+                  <button type="button" onClick={() => switchAccrualBooks(true)} style={{ ...S.btn, fontSize: 11, padding: "4px 10px", marginLeft: 6 }}>
+                    Turn on invoice-based books
+                  </button>
+                ) : (
+                  "Ask an Admin to turn on invoice-based books in Settings."
+                )}
+              </div>
+            )}
         <div style={S.g2}>
               <div style={{ ...S.card, maxHeight: 360, overflowY: "auto" }}>
                 <div style={{ fontSize: 12, fontWeight: 700, color: "#10b981", marginBottom: 12 }}>📈 Income (by account)</div>
@@ -11419,6 +11452,11 @@ ${buildInvoicePrintDocumentHtml({
           >
             {acctRole !== "Admin" ? "Admin only" : accrualBooks ? "Switch back to cash basis" : "Switch to invoice-based (accrual) books"}
           </button>
+          {acctRole === "Admin" && invoices.some(i => (Number(i.paidBankTotal) || 0) > 0.005) && (
+            <button type="button" onClick={fixInvoicePaymentDates} style={{ ...S.btnO, fontSize: 12, padding: "8px 14px", marginLeft: 8, color: "#047857", borderColor: "rgba(16,185,129,.5)" }}>
+              Fix invoice payment dates from bank receipts
+            </button>
+          )}
         </div>
 
         <div style={{ marginTop: 14, background: "#fff1f2", border: "1px solid rgba(244,63,94,.4)", borderRadius: 10, padding: 12 }}>
