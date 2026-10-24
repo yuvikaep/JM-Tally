@@ -26,13 +26,23 @@ import {
   stripInvoiceSettlementTxns,
   BANK_ACCOUNT,
   balanceSheetFromJournal,
-  isBalanceSheetCategory,
+  isSystemJournalTxn,
+  CUSTOMER_RECEIPT,
+  GST_PAID_3B,
+  CUSTOMER_TDS,
+  GST_SETOFF_ITC,
+  GST_PAID_OTHER,
+  GST_OTHER_SOURCES,
+  gstAdjustmentLines,
+  isGstAdjustmentTxn,
 } from "./accountingEngine.js"
+import { GstSettlementPanel } from "./GstSettlement.jsx"
+import { gstSettlementByMonth, gstMonthLabel } from "./gstMonthly.js"
+import { syncInvoiceAccrual, isAccrualTxn } from "./invoiceAccrual.js"
 import {
   normalizeFixedAssets,
   syncAssetSystemTxns,
   depreciationTxnForFy,
-  isFixedAssetSystemTxn,
   blockByKey,
   fyBounds,
 } from "./fixedAssets.js"
@@ -148,6 +158,8 @@ const CATS = [
   "Marketing & Branding",
   "Other Income",
   "Govt Incentive / Grant",
+  CUSTOMER_RECEIPT,
+  GST_PAID_3B,
 ]
 const REVENUE_CATS = CATS.filter(c => c.startsWith("Revenue"))
 const EMPLOYEE_PAYROLL_CATS = new Set(["Salary", "Payroll Salary"])
@@ -219,7 +231,7 @@ const normalizeTxnCategories = arr =>
     const mapped = LEGACY_CATEGORY_MAP[t.category]
     let u = mapped ? { ...t, category: mapped } : { ...t }
     // A category the user picked by hand is final — narration heuristics must not undo it.
-    if (u.catByUser || isFixedAssetSystemTxn(u)) return u
+    if (u.catByUser || isSystemJournalTxn(u)) return u
     u = u.category === "Salary - Field Staff" ? { ...u, category: "Salary" } : u
     if (u.drCr === "DR" && IT_SOLUTIONS_VENDOR_RE.test(u.particulars || ""))
       u = { ...u, category: "Vendor - IT Solutions" }
@@ -246,7 +258,7 @@ function applyLedgerCategoryNormalization(txns) {
   if (!Array.isArray(txns)) return []
   const n = normalizeTxnCategories(txns.map(t => ({ ...t })))
   // Asset register / depreciation rows carry their own non-bank journal — never rebuild it from category.
-  return n.map(t => (isFixedAssetSystemTxn(t) ? t : enrichTxnJournal({ ...t, journalLines: undefined })))
+  return n.map(t => (isSystemJournalTxn(t) ? t : enrichTxnJournal({ ...t, journalLines: undefined })))
 }
 
 /**
@@ -270,6 +282,7 @@ function syncLedgerWithInvoicePaymentState(txns, inv, opt) {
     incBank: bank,
     incTds: tds,
     dateDdMmYyyy,
+    accrual: !!(opt && opt.accrual),
   })
   if (res.error) {
     return withRecalculatedBalances(applyLedgerCategoryNormalization(stripped))
@@ -3617,6 +3630,8 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
   const [tdsPayDraft, setTdsPayDraft] = useState({ date: todayISO(), kind: "paid", amount: "", section: "194C", remark: "" })
   const [pfEsicChallans, setPfEsicChallans] = useState([])
   const [fixedAssets, setFixedAssets] = useState([])
+  /** Invoice-based (accrual) books: invoices post AR / revenue / GST; bank receipts clear AR. */
+  const [accrualBooks, setAccrualBooks] = useState(false)
   const [pfEsicDraft, setPfEsicDraft] = useState({ type: "PF", period: "", date: todayISO(), amount: "", challanNo: "", fileName: "" })
   const [invListFilter, setInvListFilter] = useState("all")
   /** When set, invoice modal saves over this row instead of creating */
@@ -3631,6 +3646,8 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
   /** { count: number } when user asked to remove all bank-import txns — confirm in modal */
   const [bankImportClearModal, setBankImportClearModal] = useState(null)
   const [resetBooksText, setResetBooksText] = useState(null)
+  /** GST month settlement form: { month, kind: "itc" | "other", amount, source, date, remark } */
+  const [gstAdjDraft, setGstAdjDraft] = useState(null)
   const [bankImportClearRemark, setBankImportClearRemark] = useState("")
   const [companies, setCompanies] = useState([])
   const [activeCompanyId, setActiveCompanyId] = useState("")
@@ -3722,6 +3739,7 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
         setTdsPaidEntries(normalizeTdsPayments(st?.tdsPaidEntries))
         setPfEsicChallans(normalizePfEsicChallans(st?.pfEsicChallans))
         setFixedAssets(normalizeFixedAssets(st?.fixedAssets))
+        setAccrualBooks(!!st?.accrualBooks)
       } finally {
         setLoading(false)
       }
@@ -3744,9 +3762,10 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
         tdsPaidEntries: normalizeTdsPayments(tdsPaidEntries),
         pfEsicChallans: normalizePfEsicChallans(pfEsicChallans),
         fixedAssets,
+        accrualBooks,
       },
     })
-  }, [txns, invoices, inventory, importHistory, acctRole, periodLockIso, automationSkills, assistantMemory, manualClients, tdsPaidEntries, pfEsicChallans, fixedAssets, activeCompanyId, loading, scopedStore])
+  }, [txns, invoices, inventory, importHistory, acctRole, periodLockIso, automationSkills, assistantMemory, manualClients, tdsPaidEntries, pfEsicChallans, fixedAssets, accrualBooks, activeCompanyId, loading, scopedStore])
 
   /** Debounced upload of full workspace to API so every device sees the same books (when online). */
   useEffect(() => {
@@ -3809,6 +3828,7 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
     tdsPaidEntries,
     pfEsicChallans,
     fixedAssets,
+    accrualBooks,
     companies,
     scopedStore,
     authUser.email,
@@ -3987,7 +4007,7 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
   )
 
   const ledger = useMemo(() => (txns == null ? [] : txns), [txns])
-  const ledgerTxnVisible = useMemo(() => ledger.filter(t => !isClientInvoiceTdsTxn(t)), [ledger])
+  const ledgerTxnVisible = useMemo(() => ledger.filter(t => !isClientInvoiceTdsTxn(t) && !isAccrualTxn(t) && !isGstAdjustmentTxn(t)), [ledger])
 
   const stats = useMemo(() => {
     if (!txns) return { cr: 0, dr: 0, balance: 0, flowNet: 0, count: 0 }
@@ -4046,8 +4066,9 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
   }, [reportLedger])
 
   const monthlyFlow = useMemo(() => aggregateMonthlyCashflow(reportLedger), [reportLedger])
-  const crByCat = useMemo(() => aggregateByCategory(reportLedger, "CR"), [reportLedger])
-  const drByCat = useMemo(() => aggregateByCategory(reportLedger, "DR"), [reportLedger])
+  const catLedger = useMemo(() => reportLedger.filter(t => t.category !== CUSTOMER_TDS && !isGstAdjustmentTxn(t)), [reportLedger])
+  const crByCat = useMemo(() => aggregateByCategory(catLedger, "CR"), [catLedger])
+  const drByCat = useMemo(() => aggregateByCategory(catLedger, "DR"), [catLedger])
   const tbReport = useMemo(() => trialBalanceFromJournal(reportLedger), [reportLedger])
   const outputGstFromRev = useMemo(() => estimatedTotalOutputGst(reportLedger), [reportLedger])
   const outputGstFullBook = useMemo(() => estimatedTotalOutputGst(ledger), [ledger])
@@ -4073,7 +4094,7 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
     const cr = S(t => t.drCr === "CR") - assetSale - loanIn
     const dr = S(t => t.drCr === "DR") - assetBuy - loanOut
     const cap = S(t => t.drCr === "CR" && String(t.category || "").startsWith("Capital"))
-    const revSvc = S(t => t.drCr === "CR" && String(t.category || "").startsWith("Revenue"))
+    const revSvc = S(t => t.drCr === "CR" && (String(t.category || "").startsWith("Revenue") || t.category === CUSTOMER_RECEIPT))
     const salRem = S(t => t.drCr === "DR" && (EMPLOYEE_PAYROLL_CATS.has(String(t.category || "")) || t.category === "Director Payment"))
     const vendor = S(
       t => t.drCr === "DR" && (String(t.category || "").startsWith("Vendor") || String(t.category || "").startsWith("Recruitment"))
@@ -4207,9 +4228,10 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
         tdsPaidEntries: normalizeTdsPayments(tdsPaidEntries),
         pfEsicChallans: normalizePfEsicChallans(pfEsicChallans),
         fixedAssets,
+        accrualBooks,
       },
     })
-  }, [activeCompanyId, txns, invoices, inventory, importHistory, acctRole, periodLockIso, automationSkills, assistantMemory, manualClients, tdsPaidEntries, pfEsicChallans, fixedAssets, scopedStore])
+  }, [activeCompanyId, txns, invoices, inventory, importHistory, acctRole, periodLockIso, automationSkills, assistantMemory, manualClients, tdsPaidEntries, pfEsicChallans, fixedAssets, accrualBooks, scopedStore])
 
   /**
    * Wipe every company's books (ledger, invoices, stock, assets, clients, TDS/PF registers, audit) but keep
@@ -4279,6 +4301,7 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
     setTdsPaidEntries(normalizeTdsPayments(st?.tdsPaidEntries))
     setPfEsicChallans(normalizePfEsicChallans(st?.pfEsicChallans))
     setFixedAssets(normalizeFixedAssets(st?.fixedAssets))
+    setAccrualBooks(!!st?.accrualBooks)
   }, [])
 
   const switchCompany = useCallback(
@@ -4544,7 +4567,7 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
         toast_("Voided rows cannot be recategorised", "#f59e0b")
         return
       }
-      if (isFixedAssetSystemTxn(t)) {
+      if (isSystemJournalTxn(t)) {
         toast_("This entry is managed from Fixed Assets — edit the asset there", "#f59e0b")
         return
       }
@@ -4580,6 +4603,114 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
   )
 
   const stockItems = useMemo(() => normalizeInventory(inventory), [inventory])
+
+  // Keep invoice journals (AR / revenue / GST / customer TDS) in step with the invoice register.
+  useEffect(() => {
+    if (loading || txns == null) return
+    const next = syncInvoiceAccrual(txns, invoices, accrualBooks)
+    if (next !== txns) setTxns(withRecalculatedBalances(next))
+  }, [loading, txns, invoices, accrualBooks])
+
+  /**
+   * Switch books between cash basis (bank credits are revenue, GST payments are expense) and
+   * invoice-based accrual (invoices book revenue + GST, bank credits clear receivables).
+   */
+  const switchAccrualBooks = useCallback(
+    on => {
+      if (acctRole !== "Admin") {
+        toast_("Only Admin can change the accounting basis", "#f43f5e")
+        return
+      }
+      const msg = on
+        ? "Switch to invoice-based (accrual) books?\n\n• Every invoice posts Dr Receivable / Cr Revenue + GST Payable\n• Bank credits now in Revenue-* become “Customer Receipt (against invoice)”\n• GST payments reduce GST Payable instead of being an expense\n\nOnly do this when all your sales invoices are in the app."
+        : "Switch back to cash-basis books? Invoice journals are removed and customer receipts become revenue again."
+      if (!confirm(msg)) return
+      const from = on ? t => !isSystemJournalTxn(t) && t.drCr === "CR" && String(t.category || "").startsWith("Revenue") : t => t.category === CUSTOMER_RECEIPT
+      const gstFrom = on ? "GST Payment (Output Tax)" : GST_PAID_3B
+      const gstTo = on ? GST_PAID_3B : "GST Payment (Output Tax)"
+      let receipts = 0
+      const next = (txns || []).map(t => {
+        if (isGstAdjustmentTxn(t)) return { ...t, journalLines: gstAdjustmentLines({ kind: t.category === GST_SETOFF_ITC ? "itc" : "other", source: t.gstSource, amount: t.amount, accrual: on }) }
+        if (t.void || isSystemJournalTxn(t)) return t
+        if (from(t)) {
+          receipts++
+          return enrichTxnJournal({ ...t, category: on ? CUSTOMER_RECEIPT : "Revenue - B2B Services", journalLines: undefined })
+        }
+        if (t.drCr === "DR" && t.category === gstFrom) return enrichTxnJournal({ ...t, category: gstTo, journalLines: undefined })
+        return t
+      })
+      setTxns(withRecalculatedBalances(syncInvoiceAccrual(next, invoices, on)))
+      setAccrualBooks(on)
+      appendAudit({ action: on ? "ACCRUAL_BOOKS_ON" : "ACCRUAL_BOOKS_OFF", by: acctRole, receipts })
+      toast_(on ? `Invoice-based books on — ${receipts} bank receipt(s) now clear receivables` : "Back to cash-basis books", "#10b981")
+    },
+    [acctRole, txns, invoices, appendAudit]
+  )
+
+  const gstSettlementRows = useMemo(() => gstSettlementByMonth(ledger), [ledger])
+
+  const saveGstAdjustment = useCallback(() => {
+    const d = gstAdjDraft
+    if (!d || acctRole === "Viewer") return
+    const amount = Math.round((parseMoneyInput(d.amount) || 0) * 100) / 100
+    if (amount <= 0.005) {
+      toast_("Enter an amount", "#f43f5e")
+      return
+    }
+    const date = isoToDdMmYyyy(d.date || todayISO())
+    if (periodLockIso && isPeriodLocked(date, periodLockIso)) {
+      toast_("Date falls in a locked period", "#f43f5e")
+      return
+    }
+    const id = Math.max(0, ...(txns || []).map(t => Number(t.id) || 0)) + 1
+    const remark = String(d.remark || "").trim()
+    const how = d.kind === "itc" ? "ITC set-off" : `Paid — ${GST_OTHER_SOURCES[d.source]?.label || "Cash"}`
+    const row = {
+      id,
+      date,
+      particulars: `GST ${gstMonthLabel(d.month)} — ${how}${remark ? ` · ${remark}` : ""}`,
+      amount,
+      drCr: "DR",
+      category: d.kind === "itc" ? GST_SETOFF_ITC : GST_PAID_OTHER,
+      fy: inferFY(date),
+      excludeFromBankRunning: true,
+      gstPeriod: d.month,
+      gstSource: d.kind === "itc" ? "" : d.source,
+      gstRemark: remark,
+      journalLines: gstAdjustmentLines({ kind: d.kind, source: d.source, amount, accrual: accrualBooks }),
+      void: false,
+      audit: { createdAt: new Date().toISOString(), createdBy: acctRole, ref: `gst:${id}` },
+    }
+    setTxns(withRecalculatedBalances([...(txns || []), row]))
+    appendAudit({ action: "GST_SETTLEMENT_ADD", by: acctRole, month: d.month, kind: d.kind, amount, particulars: row.particulars })
+    toast_(`${how} ₹${inr0(amount)} recorded for ${gstMonthLabel(d.month)}`, "#10b981")
+    setGstAdjDraft(null)
+  }, [gstAdjDraft, acctRole, txns, periodLockIso, accrualBooks, appendAudit])
+
+  const moveGstPayment = useCallback(
+    (id, month) => {
+      if (acctRole === "Viewer") return
+      setTxns(prev => prev.map(t => (t.id === id ? { ...t, gstPeriod: month } : t)))
+      appendAudit({ action: "GST_PAYMENT_PERIOD", by: acctRole, txnId: id, month })
+    },
+    [acctRole, appendAudit]
+  )
+
+  const deleteGstAdjustment = useCallback(
+    id => {
+      if (acctRole === "Viewer") return
+      const t = (txns || []).find(x => x.id === id)
+      if (!t || !isGstAdjustmentTxn(t)) return
+      if (periodLockIso && isPeriodLocked(t.date, periodLockIso)) {
+        toast_("This entry is in a locked period", "#f43f5e")
+        return
+      }
+      if (!confirm(`Remove “${t.particulars}” (₹${inr0(t.amount)})?`)) return
+      setTxns(withRecalculatedBalances(txns.filter(x => x.id !== id)))
+      appendAudit({ action: "GST_SETTLEMENT_REMOVE", by: acctRole, txnId: id, amount: t.amount })
+    },
+    [acctRole, txns, periodLockIso, appendAudit]
+  )
 
   const saveFixedAsset = useCallback(
     draft => {
@@ -5258,7 +5389,7 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
         closeDangerModal()
         return
       }
-      setTxns(prev => syncLedgerWithInvoicePaymentState(prev, { ...inv, paidAmount: 0, paidBankTotal: 0, paidTdsTotal: 0 }, { createdBy: acctRole }))
+      setTxns(prev => syncLedgerWithInvoicePaymentState(prev, { ...inv, paidAmount: 0, paidBankTotal: 0, paidTdsTotal: 0 }, { createdBy: acctRole, accrual: accrualBooks }))
       setInvoices(list => list.filter(i => i.id !== id))
       appendAudit({
         action: "INVOICE_DELETE",
@@ -5269,7 +5400,7 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
       toast_("Invoice removed · ledger settlement lines for this invoice cleared", "#f59e0b")
     }
     closeDangerModal()
-  }, [acctRole, dangerFlow, dangerRemark, dangerAck, invoices, txns, appendAudit, closeDangerModal])
+  }, [acctRole, dangerFlow, dangerRemark, dangerAck, invoices, txns, appendAudit, closeDangerModal, accrualBooks])
 
   const openCreateInvoiceModal = () => {
     if (acctRole === "Viewer") {
@@ -5939,7 +6070,7 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
         paidAt: prev.paidAt,
         status: prevPaid >= cap - 0.01 ? "paid" : prev.status || "sent",
       })
-      setTxns(prevTx => syncLedgerWithInvoicePaymentState(prevTx, next, { createdBy: acctRole }))
+      setTxns(prevTx => syncLedgerWithInvoicePaymentState(prevTx, next, { createdBy: acctRole, accrual: accrualBooks }))
       setInvoices(list => list.map(x => (x.id === invoiceModalEditId ? next : x)))
       appendAudit({ action: "INVOICE_UPDATE", invoiceId: next.id, num: next.num, total: next.total })
       toast_("Updated · " + next.num + " · ₹" + inr(next.total), "#10b981")
@@ -6139,11 +6270,11 @@ ${buildInvoicePrintDocumentHtml({
         status: "sent",
       }
       setInvoices(list => list.map(inv => (inv.id === id ? nextInv : inv)))
-      setTxns(prev => syncLedgerWithInvoicePaymentState(prev, nextInv, { createdBy: acctRole }))
+      setTxns(prev => syncLedgerWithInvoicePaymentState(prev, nextInv, { createdBy: acctRole, accrual: accrualBooks }))
       appendAudit({ action: "INVOICE_MARK_UNPAID", invoiceId: id })
       toast_("Invoice marked unpaid · settlement entries cleared", "#f59e0b")
     },
-    [acctRole, invoices, appendAudit]
+    [acctRole, invoices, appendAudit, accrualBooks]
   )
 
   const exportInvoicesCsv = (list = invoices) => {
@@ -6225,7 +6356,7 @@ ${buildInvoicePrintDocumentHtml({
       }
       bankDelta = Math.round((Number(nextInv.paidBankTotal) - invoiceBankReceived(inv0)) * 100) / 100
       tdsDelta = Math.round((Number(nextInv.paidTdsTotal) - (Number(inv0.paidTdsTotal) || 0)) * 100) / 100
-      setTxns(prev => syncLedgerWithInvoicePaymentState(prev, nextInv, { createdBy: acctRole }))
+      setTxns(prev => syncLedgerWithInvoicePaymentState(prev, nextInv, { createdBy: acctRole, accrual: accrualBooks }))
     } else {
       const bal = invoiceBalance(inv0)
       const pb0 = Number(inv0.paidBankTotal)
@@ -6258,6 +6389,7 @@ ${buildInvoicePrintDocumentHtml({
         incBank,
         incTds,
         dateDdMmYyyy,
+        accrual: accrualBooks,
       })
       if (res.error) {
         toast_(res.error, "#f43f5e")
@@ -6294,7 +6426,7 @@ ${buildInvoicePrintDocumentHtml({
     setInvPayMode("add")
     setInvPayAmt("")
     setInvPayTdsPct("")
-  }, [acctRole, invPayId, invPayMode, invPayAmt, invPayTdsPct, invoices, txns, periodLockIso, appendAudit])
+  }, [acctRole, invPayId, invPayMode, invPayAmt, invPayTdsPct, invoices, txns, periodLockIso, appendAudit, accrualBooks])
 
   const filtered = useMemo(()=>{
     if(!txns) return []
@@ -6981,7 +7113,7 @@ ${buildInvoicePrintDocumentHtml({
           {h:"Date",k:"date"},
           {h:"Particulars",cell:r=><span style={{fontSize:11,opacity:r.void?0.55:1}} title={r.void?(r.voidReason?`${r.particulars}\n\nVoid reason: ${r.voidReason}`:r.particulars):r.particulars}>{r.particulars.substring(0,46)}{r.void?" (void)":""}</span>},
           {h:"Category",cell:r=>{
-            if (!r.void && acctRole !== "Viewer" && !isFixedAssetSystemTxn(r)) {
+            if (!r.void && acctRole !== "Viewer" && !isSystemJournalTxn(r)) {
               return (
                 <select
                   value={r.category}
@@ -9383,38 +9515,8 @@ ${buildInvoicePrintDocumentHtml({
   }
 
   const GST = () => {
-    const GST_PAY = "GST Payment (Output Tax)"
-    const mon = {}
-    reportLedger.forEach(t => {
-      const p = t.date.split("/")
-      const k = `${p[1]}/${p[2]}`
-      if (!mon[k]) mon[k] = { cr: 0, gstPaid: 0, label: k }
-      if (t.drCr === "CR") mon[k].cr += t.amount
-      if (t.drCr === "DR" && t.category === GST_PAY) mon[k].gstPaid += t.amount
-    })
-    const sortMonthKeys = (a, b) => {
-      const [ma, ya] = String(a).split("/").map(Number)
-      const [mb, yb] = String(b).split("/").map(Number)
-      return ya !== yb ? ya - yb : ma - mb
-    }
-    const rows = Object.entries(mon)
-      .sort(([a], [b]) => sortMonthKeys(a, b))
-      .filter(([, d]) => d.cr > 100 || d.gstPaid > 0.01)
-      .map(([k, d]) => {
-        const taxable = Math.round(d.cr / 1.18)
-        const gst = Math.round(d.cr - taxable)
-        const netAfterPay = Math.max(0, Math.round((gst - d.gstPaid) * 100) / 100)
-        const filed = gst <= 1 || netAfterPay <= 0.5
-        return {
-          month: d.label,
-          rev: d.cr,
-          taxable,
-          gst,
-          gstPaid: d.gstPaid,
-          net: netAfterPay,
-          filed,
-        }
-      })
+    const GST_PAY = accrualBooks ? GST_PAID_3B : "GST Payment (Output Tax)"
+    const isGstPay = t => t.drCr === "DR" && (t.category === "GST Payment (Output Tax)" || t.category === GST_PAID_3B)
     const itVendorDr = reportLedger.filter(t => t.drCr === "DR" && t.category === "Vendor - IT Solutions")
     const itcItVendor = itVendorDr.reduce((s, t) => s + gst18InclusiveSplit(t.amount).gst, 0)
     const bankDr = reportLedger.filter(t => t.drCr === "DR" && t.category === "Bank Charges")
@@ -9423,7 +9525,7 @@ ${buildInvoicePrintDocumentHtml({
     const itcCgstTot = Math.round((totalItc / 2) * 100) / 100
     const itcSgstTot = Math.round((totalItc - itcCgstTot) * 100) / 100
     const outputGstEst = outputGstFromRev
-    const gstPaymentDr = reportLedger.filter(t => t.drCr === "DR" && t.category === GST_PAY)
+    const gstPaymentDr = reportLedger.filter(isGstPay)
     const totalGstPaid = Math.round(gstPaymentDr.reduce((s, t) => s + (Number(t.amount) || 0), 0) * 100) / 100
     const netAfterItc = Math.max(0, Math.round((outputGstEst - totalItc) * 100) / 100)
     const netPayGst = Math.max(0, Math.round((netAfterItc - totalGstPaid) * 100) / 100)
@@ -9490,51 +9592,15 @@ ${buildInvoicePrintDocumentHtml({
           ))}
         </div>
         {gTab === "mon" && (
-          <Tbl
-            cols={[
-              {
-                h: "Month",
-                cell: r => (
-                  <span style={{ fontFamily: "monospace", fontWeight: 700 }}>{r.month}</span>
-                ),
-              },
-              {
-                h: "Receipt (₹)",
-                r: true,
-                cell: r => (
-                  <span style={{ color: "#10b981", fontFamily: "monospace" }}>₹{inr0(r.rev)}</span>
-                ),
-              },
-              { h: "Taxable (est.)", r: true, cell: r => "₹" + inr0(r.taxable) },
-              {
-                h: "Output GST",
-                r: true,
-                cell: r => (
-                  <span style={{ color: "#6B7AFF", fontFamily: "monospace" }}>₹{inr0(r.gst)}</span>
-                ),
-              },
-              {
-                h: "GST paid",
-                r: true,
-                cell: r => (
-                  <span style={{ color: "#0d9488", fontFamily: "monospace" }}>₹{inr0(r.gstPaid)}</span>
-                ),
-              },
-              {
-                h: "Net (month)",
-                r: true,
-                cell: r => (
-                  <span style={{ color: "#f43f5e", fontFamily: "monospace", fontWeight: 700 }}>₹{inr0(r.net)}</span>
-                ),
-              },
-              {
-                h: "Status",
-                cell: r => (
-                  <Chip cat={r.filed ? "Revenue" : "Bank Charges"} label={r.filed ? "Covered" : "Open"} />
-                ),
-              },
-            ]}
-            rows={rows}
+          <GstSettlementPanel
+            ui={pageUi}
+            rows={gstSettlementRows}
+            acctRole={acctRole}
+            onAdd={(month, kind, pending) =>
+              setGstAdjDraft({ month, kind, amount: pending > 0 ? String(pending) : "", source: "cash", date: todayISO(), remark: "" })
+            }
+            onMovePayment={moveGstPayment}
+            onDelete={deleteGstAdjustment}
           />
         )}
         {gTab==="g1"&&<div style={S.card}><div style={{fontSize:12,fontWeight:700,marginBottom:12}}>GSTR-1 — Outward Supply Filing Guide</div><div style={S.g4}><Stat label="SAC Code" value="998314" sub="IT Services"/><Stat label="GST Rate" value="18%" sub="CGST+SGST"/><Stat label="Deadline" value="11th" sub="of each month"/><Stat label="Frequency" value="Monthly" sub="or QRMP &lt;₹5Cr"/></div><div style={{background:"rgba(107,122,255,.08)",border:"1px solid rgba(107,122,255,.2)",borderRadius:9,padding:"9px 13px",fontSize:11.5,color:"#0369a1"}}>Classify **B2B** NEFT/IMPS credits using the revenue categories in your ledger (e.g. B2B services @ 18%). Collect counterparty **GSTINs** and tax invoices before filing.</div><div style={{background:"rgba(107,122,255,.08)",border:"1px solid rgba(107,122,255,.2)",borderRadius:9,padding:"9px 13px",marginTop:12,fontSize:11.5,color:"#0369a1"}}><strong>Inward (purchases):</strong> Record vendor invoices (e.g. SAC **998313 / 998314** for IT services) as expenses; reconcile **ITC** in **GSTR-2B** with bank payments to those vendors.</div></div>}
@@ -9680,8 +9746,17 @@ ${buildInvoicePrintDocumentHtml({
   }
 
   const Rep = () => {
-    const plCr = crByCat.filter(([n]) => !isBalanceSheetCategory(n))
-    const plDr = drByCat.filter(([n]) => !isBalanceSheetCategory(n))
+    // P&L straight from the double-entry accounts, so it always ties to the Trial Balance and Balance Sheet.
+    const plAcc = coaRowsWithBalances(reportLedger)
+    const plRows = [...plAcc.merged, ...plAcc.orphans]
+    const plCr = plRows
+      .filter(r => r.type === "Income" && Math.abs(r.credit - r.debit) > 0.005)
+      .map(r => [r.name, Math.round((r.credit - r.debit) * 100) / 100])
+      .sort((a, b) => b[1] - a[1])
+    const plDr = plRows
+      .filter(r => r.type === "Expense" && Math.abs(r.debit - r.credit) > 0.005)
+      .map(r => [r.name, Math.round((r.debit - r.credit) * 100) / 100])
+      .sort((a, b) => b[1] - a[1])
     const plTotalCr = plCr.reduce((s, [, v]) => s + v, 0)
     const plTotalDr = plDr.reduce((s, [, v]) => s + v, 0)
     const plNet = Math.round((plTotalCr - plTotalDr) * 100) / 100
@@ -9708,7 +9783,7 @@ ${buildInvoicePrintDocumentHtml({
     const monRows = monthlyFlow.length ? monthlyFlow : [{ m: "—", cr: 0, dr: 0 }]
     const cfRows = [
       ["OPERATING ACTIVITIES", true],
-      ["Revenue-* receipts (detail)", "+" + "₹" + inr0(b.revSvc), false, "#10b981"],
+      ["Customer receipts & revenue (CR)", "+" + "₹" + inr0(b.revSvc), false, "#10b981"],
       ["Other receipts (excl. capital)", "+" + "₹" + inr0(b.otherCr), false, "#10b981"],
       ["Salary & director (DR)", "-" + "₹" + inr0(b.salRem), false, "#f43f5e"],
       ["Vendor & recruitment (DR)", "-" + "₹" + inr0(b.vendor), false, "#f43f5e"],
@@ -9758,7 +9833,7 @@ ${buildInvoicePrintDocumentHtml({
           <div>
         <div style={S.g2}>
               <div style={{ ...S.card, maxHeight: 360, overflowY: "auto" }}>
-                <div style={{ fontSize: 12, fontWeight: 700, color: "#10b981", marginBottom: 12 }}>📈 Credits (by category)</div>
+                <div style={{ fontSize: 12, fontWeight: 700, color: "#10b981", marginBottom: 12 }}>📈 Income (by account)</div>
                 {plCr.length === 0 ? (
                   <div style={{ color: "#64748b", fontSize: 11 }}>No credit entries.</div>
                 ) : (
@@ -9770,12 +9845,12 @@ ${buildInvoicePrintDocumentHtml({
                   ))
                 )}
                 <div style={{ display: "flex", justifyContent: "space-between", padding: "7px 0", fontSize: 13, fontWeight: 800 }}>
-                  <span>Total credits</span>
+                  <span>Total income</span>
                   <span style={{ color: "#10b981", fontFamily: "monospace" }}>₹{inr0(plTotalCr)}</span>
         </div>
               </div>
               <div style={{ ...S.card, maxHeight: 360, overflowY: "auto" }}>
-                <div style={{ fontSize: 12, fontWeight: 700, color: "#f43f5e", marginBottom: 12 }}>📉 Debits (by category)</div>
+                <div style={{ fontSize: 12, fontWeight: 700, color: "#f43f5e", marginBottom: 12 }}>📉 Expenses (by account)</div>
                 {plDr.length === 0 ? (
                   <div style={{ color: "#64748b", fontSize: 11 }}>No debit entries.</div>
                 ) : (
@@ -9787,7 +9862,7 @@ ${buildInvoicePrintDocumentHtml({
                   ))
                 )}
                 <div style={{ display: "flex", justifyContent: "space-between", padding: "7px 0", fontSize: 13, fontWeight: 800 }}>
-                  <span>Total debits</span>
+                  <span>Total expenses</span>
                   <span style={{ color: "#f43f5e", fontFamily: "monospace" }}>₹{inr0(plTotalDr)}</span>
                 </div>
               </div>
@@ -11227,6 +11302,33 @@ ${buildInvoicePrintDocumentHtml({
           </div>
         </div>
 
+        <div style={{ marginTop: 14, background: "#f0fdf4", border: "1px solid rgba(16,185,129,.4)", borderRadius: 10, padding: 12 }}>
+          <div style={{ fontSize: 12, fontWeight: 700, color: "#047857", marginBottom: 8 }}>
+            Accounting basis: {accrualBooks ? "Invoice-based (accrual) ✓" : "Cash basis (bank-driven)"}
+          </div>
+          <div style={{ fontSize: 11, color: "#065f46", lineHeight: 1.55, marginBottom: 10 }}>
+            {accrualBooks ? (
+              <>
+                Every invoice posts <strong>Dr Accounts Receivable / Cr Revenue + GST Payable</strong>; customer TDS moves to TDS Receivable; bank receipts in “{CUSTOMER_RECEIPT}” clear the
+                receivable; GST paid reduces GST Payable. Revenue in P&amp;L is invoice taxable value (without GST).
+              </>
+            ) : (
+              <>
+                Revenue = bank credits (GST included) and GST paid is an expense. Switch to invoice-based books once all sales invoices are in the app — receivables, GST payable and TDS
+                receivable then come straight from invoices.
+              </>
+            )}
+          </div>
+          <button
+            type="button"
+            disabled={acctRole !== "Admin"}
+            onClick={() => switchAccrualBooks(!accrualBooks)}
+            style={{ ...S.btnO, fontSize: 12, padding: "8px 14px", color: "#047857", borderColor: "rgba(16,185,129,.5)", opacity: acctRole !== "Admin" ? 0.5 : 1 }}
+          >
+            {acctRole !== "Admin" ? "Admin only" : accrualBooks ? "Switch back to cash basis" : "Switch to invoice-based (accrual) books"}
+          </button>
+        </div>
+
         <div style={{ marginTop: 14, background: "#fff1f2", border: "1px solid rgba(244,63,94,.4)", borderRadius: 10, padding: 12 }}>
           <div style={{ fontSize: 12, fontWeight: 700, color: "#be123c", marginBottom: 8 }}>Reset all books (start fresh)</div>
           <div style={{ fontSize: 11, color: "#881337", lineHeight: 1.55, marginBottom: 10 }}>
@@ -11621,6 +11723,54 @@ ${buildInvoicePrintDocumentHtml({
             placeholder="Short label, e.g. Axis Current · …099"
           />
         </F>
+      </Modal>
+
+      <Modal
+        open={gstAdjDraft != null}
+        title={gstAdjDraft ? `${gstAdjDraft.kind === "itc" ? "ITC set-off" : "GST paid (not from this bank)"} — ${gstMonthLabel(gstAdjDraft.month)}` : ""}
+        onClose={() => setGstAdjDraft(null)}
+        onSave={saveGstAdjustment}
+        saveDisabled={acctRole === "Viewer" || !(parseMoneyInput(gstAdjDraft?.amount) > 0)}
+        saveLabel="Record"
+      >
+        {gstAdjDraft && (
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0 11px" }}>
+            <F label="Amount (₹)">
+              <input value={gstAdjDraft.amount} onChange={e => setGstAdjDraft(d => ({ ...d, amount: e.target.value }))} style={IS} autoFocus />
+            </F>
+            <F label="Date">
+              <input type="date" value={gstAdjDraft.date} onChange={e => setGstAdjDraft(d => ({ ...d, date: e.target.value }))} style={IS} />
+            </F>
+            {gstAdjDraft.kind !== "itc" && (
+              <div style={{ gridColumn: "1/-1" }}>
+                <F label="Paid from">
+                  <select value={gstAdjDraft.source} onChange={e => setGstAdjDraft(d => ({ ...d, source: e.target.value }))} style={IS}>
+                    {Object.entries(GST_OTHER_SOURCES).map(([k, v]) => (
+                      <option key={k} value={k}>
+                        {v.label}
+                      </option>
+                    ))}
+                  </select>
+                </F>
+              </div>
+            )}
+            <div style={{ gridColumn: "1/-1" }}>
+              <F label="Remark">
+                <input
+                  value={gstAdjDraft.remark}
+                  onChange={e => setGstAdjDraft(d => ({ ...d, remark: e.target.value }))}
+                  placeholder={gstAdjDraft.kind === "itc" ? "e.g. ITC as per GSTR-2B" : "e.g. Paid via UPI by director, challan CPIN…"}
+                  style={IS}
+                />
+              </F>
+            </div>
+            <div style={{ gridColumn: "1/-1", fontSize: 10.5, color: SKY.muted, lineHeight: 1.5 }}>
+              {gstAdjDraft.kind === "itc"
+                ? "Books: Dr GST / Cr ITC Claimed on Purchases (your purchases were booked including GST)."
+                : `Books: Dr GST / Cr ${(GST_OTHER_SOURCES[gstAdjDraft.source] || GST_OTHER_SOURCES.cash).account}. Does not touch the bank balance.`}
+            </div>
+          </div>
+        )}
       </Modal>
 
       <Modal

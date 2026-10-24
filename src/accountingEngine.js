@@ -59,6 +59,7 @@ export const CHART_OF_ACCOUNTS = {
     { code: "2070", name: "GST Output Payable (CGST)", type: "Liability", normal: "Credit" },
     { code: "2071", name: "GST Output Payable (SGST)", type: "Liability", normal: "Credit" },
     { code: "2072", name: "GST Output Payable (IGST)", type: "Liability", normal: "Credit" },
+    { code: "2075", name: "GST Payable – Net (GSTR-3B)", type: "Liability", normal: "Credit" },
     { code: "2080", name: "GST – RCM Payable (if applicable)", type: "Liability", normal: "Credit" },
     { code: "2100", name: "Short-term Borrowings / CC / OD", type: "Liability", normal: "Credit" },
     { code: "2110", name: "Loans Payable – Term Loan", type: "Liability", normal: "Credit" },
@@ -145,6 +146,7 @@ export const CHART_OF_ACCOUNTS = {
     { code: "5400", name: "Income Tax Expense", type: "Expense", normal: "Debit" },
     { code: "5410", name: "GST Expense / Penalties (non-claimable)", type: "Expense", normal: "Debit" },
     { code: "5415", name: "GST Payment – Output Tax (GSTR-3B)", type: "Expense", normal: "Debit" },
+    { code: "5416", name: "ITC Claimed on Purchases (contra-expense)", type: "Expense", normal: "Credit" },
     { code: "5500", name: "Depreciation Expense", type: "Expense", normal: "Debit" },
     { code: "5600", name: "Miscellaneous Expense", type: "Expense", normal: "Debit" },
     { code: "5610", name: "Bad Debts / Write-offs", type: "Expense", normal: "Debit" },
@@ -216,7 +218,61 @@ const FIXED_ASSET_CATEGORY_ACCOUNTS = {
 /** Categories that move assets / liabilities / capital — not income or expense, so kept out of P&L. */
 export function isBalanceSheetCategory(category) {
   const c = String(category || "")
-  return c.startsWith("Capital") || c.startsWith("Loan ") || c.startsWith("Fixed Asset") || c === "Asset Sale"
+  return (
+    c.startsWith("Capital") ||
+    c.startsWith("Loan ") ||
+    c.startsWith("Fixed Asset") ||
+    c === "Asset Sale" ||
+    c === CUSTOMER_RECEIPT ||
+    c === GST_PAID_3B ||
+    c === CUSTOMER_TDS ||
+    c === GST_SETOFF_ITC ||
+    c === GST_PAID_OTHER
+  )
+}
+
+/** Accrual (invoice-based) books: invoices raise receivables, bank receipts clear them, GST is a liability. */
+export const CUSTOMER_RECEIPT = "Customer Receipt (against invoice)"
+export const GST_PAID_3B = "GST Paid (GSTR-3B)"
+export const CUSTOMER_TDS = "TDS by Customer"
+export const GST_PAYABLE_NET = "GST Payable – Net (GSTR-3B)"
+
+/** Rows the app posts itself (invoice accrual, fixed assets, depreciation) — never re-derived from category. */
+export const isSystemJournalTxn = t => /^(fa:|depr:|accr:|gst:)/.test(String(t?.audit?.ref || ""))
+
+/** GST settled for a month without a bank payment: ITC set-off, or paid in cash / by director / other bank. */
+export const GST_SETOFF_ITC = "GST Set-off (ITC)"
+export const GST_PAID_OTHER = "GST Paid (other source)"
+export const GST_OTHER_SOURCES = {
+  cash: { label: "Cash", account: "Cash on Hand" },
+  director: { label: "Paid by director / personal account", account: "Loans – Director (Cr)" },
+  otherBank: { label: "Other bank account", account: "Bank – Current A/c (Other)" },
+}
+export const isGstAdjustmentTxn = t => String(t?.audit?.ref || "").startsWith("gst:")
+
+/** Month a GST payment / adjustment belongs to ("MM/YYYY"); bank payments default to the month before payment (GSTR-3B is paid by the 20th). */
+export function gstPeriodOf(t) {
+  if (t?.gstPeriod) return t.gstPeriod
+  const p = String(t?.date || "").split("/")
+  if (p.length !== 3) return ""
+  let m = Number(p[1]) - 1
+  let y = Number(p[2])
+  if (m < 1) {
+    m = 12
+    y -= 1
+  }
+  return `${String(m).padStart(2, "0")}/${y}`
+}
+
+/** Journal for a GST set-off / non-bank payment row. Liability side follows the books' basis. */
+export function gstAdjustmentLines({ kind, source, amount, accrual }) {
+  const a = Math.round((Number(amount) || 0) * 100) / 100
+  const dr = accrual ? GST_PAYABLE_NET : "GST Payment – Output Tax (GSTR-3B)"
+  const cr = kind === "itc" ? "ITC Claimed on Purchases (contra-expense)" : (GST_OTHER_SOURCES[source] || GST_OTHER_SOURCES.cash).account
+  return [
+    { account: dr, debit: a, credit: 0 },
+    { account: cr, debit: 0, credit: a },
+  ]
 }
 
 /** Non-bank rows whose second leg is not the bank (e.g. depreciation credits the contra-asset). */
@@ -225,6 +281,8 @@ const NON_BANK_CONTRA = { Depreciation: "Accumulated Depreciation" }
 export function categoryToNominalAccount(category) {
   if (!category) return "Miscellaneous Expense"
   if (FIXED_ASSET_CATEGORY_ACCOUNTS[category]) return FIXED_ASSET_CATEGORY_ACCOUNTS[category]
+  if (category === CUSTOMER_RECEIPT) return "Accounts Receivable – Trade"
+  if (category === GST_PAID_3B) return GST_PAYABLE_NET
   if (category === "Depreciation") return "Depreciation Expense"
   if (category === "Asset Disposal") return "Loss on Sale of Assets"
   if (category === "Asset Sale") return "Scrap / Sale of Assets (Income)"
@@ -297,10 +355,10 @@ export function buildInvoiceTdsJournalLines(amount, revenueCategory) {
  * Ledger rows to mirror an invoice settlement (bank inflow + optional TDS).
  * Bank receipt affects running bank balance; TDS row uses `excludeFromBankRunning`.
  */
-export function draftInvoiceSettlementTxns({ prevTxns, inv, incBank, incTds, dateDdMmYyyy, stamp = Date.now() }) {
+export function draftInvoiceSettlementTxns({ prevTxns, inv, incBank, incTds, dateDdMmYyyy, stamp = Date.now(), accrual = false }) {
   const catRaw = inv?.revenueCategory
-  const cat =
-    catRaw && String(catRaw).startsWith("Revenue") ? catRaw : "Revenue - B2B Services"
+  // Accrual books: the invoice already booked revenue, so the receipt only clears the receivable.
+  const cat = accrual ? CUSTOMER_RECEIPT : catRaw && String(catRaw).startsWith("Revenue") ? catRaw : "Revenue - B2B Services"
   const b = Math.round((Number(incBank) || 0) * 100) / 100
   const td = Math.round((Number(incTds) || 0) * 100) / 100
   let id = Math.max(0, ...(prevTxns || []).map(t => Number(t.id) || 0))
@@ -577,13 +635,23 @@ export function trialBalanceFromJournal(txns) {
   return { rows, tDr, tCr }
 }
 
-/** Output GST (est.) from Revenue-* credits @ 18% inclusive CGST+SGST. */
+/**
+ * Output GST: exact from posted invoice journals (accrual books); estimated @18% inclusive on any
+ * other Revenue-* bank credits.
+ */
 export function estimatedTotalOutputGst(txns) {
-  const revCr = (txns || [])
-    .filter(t => !t.void && t.drCr === "CR" && String(t.category || "").startsWith("Revenue"))
-    .reduce((s, t) => s + (Number(t.amount) || 0), 0)
-  const taxable = Math.round((revCr / 1.18) * 100) / 100
-  return Math.round((revCr - taxable) * 100) / 100
+  let exact = 0
+  let revCr = 0
+  for (const t of txns || []) {
+    if (t.void || t.drCr !== "CR" || !String(t.category || "").startsWith("Revenue")) continue
+    if (isSystemJournalTxn(t)) {
+      for (const l of t.journalLines || []) if (l.account === GST_PAYABLE_NET) exact += (Number(l.credit) || 0) - (Number(l.debit) || 0)
+    } else {
+      revCr += Number(t.amount) || 0
+    }
+  }
+  const est = revCr - Math.round((revCr / 1.18) * 100) / 100
+  return Math.round((exact + est) * 100) / 100
 }
 
 const CAL_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
