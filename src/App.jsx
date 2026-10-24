@@ -4126,6 +4126,8 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
     return { cr, dr, cap, revSvc, salRem, vendor, misc, bankCh, otherDr, otherCr, assetBuy, assetSale, loanIn, loanOut }
   }, [reportLedger])
 
+  const stockItems = useMemo(() => normalizeInventory(inventory), [inventory])
+
   /** Balance sheet date = end of the selected report period (or today), current period = that date's FY. */
   const bsAsOfIso = useMemo(() => {
     if (repToIso) return repToIso
@@ -4622,7 +4624,6 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
     [txns, acctRole, periodLockIso, appendAudit]
   )
 
-  const stockItems = useMemo(() => normalizeInventory(inventory), [inventory])
 
   // Keep invoice journals (AR / revenue / GST / customer TDS) in step with the invoice register.
   useEffect(() => {
