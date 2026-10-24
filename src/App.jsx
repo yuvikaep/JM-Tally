@@ -4106,7 +4106,8 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
   }, [invoices, repFy, repMonthKey, repFromIso, repToIso])
   /** Output GST by head: exact from invoices when the company raises invoices, else estimated from bank revenue credits. */
   const outputGstSplit = useMemo(() => {
-    if (gstInvoices(invoices).length) return invoiceOutputGst(reportInvoices)
+    // reportInvoices carry dd/mm/yyyy dates for the period filter; GST maths needs the original ISO date back.
+    if (gstInvoices(invoices).length) return invoiceOutputGst(reportInvoices.map(r => ({ ...r, date: r.invDateIso })))
     const est = estimatedTotalOutputGst(reportLedger)
     const cgst = Math.round(est / 2)
     return { taxable: 0, igst: 0, cgst, sgst: Math.round((est - cgst) * 100) / 100, total: est, estimated: true }
@@ -9636,6 +9637,26 @@ ${buildInvoicePrintDocumentHtml({
     const netIgst = Math.max(0, Math.round((outIgst - paidIgst) * 100) / 100)
     const netCgst = Math.max(0, Math.round((outCgst - itcCgstTot - paidCgst) * 100) / 100)
     const netSgst = Math.max(0, Math.round((outSgst - itcSgstTot - paidSgst) * 100) / 100)
+    // GST portal ledgers, when pasted, replace every estimate above (ITC from vendor payments, bank-only payments).
+    const hasPortal = gstPortal.length > 0
+    const r2m = v => Math.round(v * 100) / 100
+    const portalItcIn = r2m(gstPortal.reduce((a, p) => a + p.itcCredited, 0))
+    const portalItcUsed = r2m(gstPortal.reduce((a, p) => a + p.itcUtilized, 0))
+    const portalCashUsed = r2m(gstPortal.reduce((a, p) => a + p.cashUtilized, 0))
+    const ps = gstSettlementRows.portalSummary || { filedThrough: "", shortfall: 0, excess: 0 }
+    const notFiledYet = r2m(gstSettlementRows.reduce((a, r) => a + (r.filed ? 0 : r.pending || 0), 0))
+    const split3 = v => {
+      const i = r2m(v * share(outIgst))
+      const c = r2m(v * share(outCgst))
+      return { i, c, s: r2m(v - i - c) }
+    }
+    const itcHead = split3(portalItcUsed)
+    const cashHead = split3(portalCashUsed)
+    let itcRun = 0
+    const portalItcRows = gstPortal.map(p => {
+      itcRun = r2m(itcRun + p.itcCredited - p.itcUtilized)
+      return { m: gstMonthLabel(p.month), cin: p.itcCredited, used: p.itcUtilized, bal: itcRun }
+    })
     return (
       <div>
         <div
@@ -9652,20 +9673,36 @@ ${buildInvoicePrintDocumentHtml({
             sub={outputGstSplit.estimated ? "From bank revenue @ 18%" : `IGST ₹${inr0(outIgst)} · CGST ₹${inr0(outCgst)} · SGST ₹${inr0(outSgst)}`}
             color="#6B7AFF"
           />
-          <Stat label="Input ITC (est.)" value={"₹" + inr0(totalItc)} sub={"IT ₹" + inr0(itcItVendor) + " · Bank ₹" + inr0(itcBank)} color="#10b981" />
-          <Stat
-            label="GST paid (ledger)"
-            value={"₹" + inr0(totalGstPaid)}
-            sub={gstPaymentDr.length ? `${gstPaymentDr.length} debit · ${GST_PAY}` : "Post via chat or txn"}
-            color="#0d9488"
-          />
-          <Stat
-            label="Net after ITC & paid"
-            value={"₹" + inr0(netPayGst)}
-            sub={totalGstPaid > 0 ? "Books snapshot — not filed return" : "Reduce when you record GST payments"}
-            color="#f43f5e"
-          />
-          <Stat label="IT expense entries" value={String(itVendorDr.length)} sub="Used only for ITC estimate" color="#5563E8" />
+          {hasPortal ? (
+            <>
+              <Stat label="ITC (portal)" value={"₹" + inr0(portalItcIn)} sub={`Used ₹${inr0(portalItcUsed)} · balance ₹${inr0(gstPortalBal.itcBalance)}`} color="#10b981" />
+              <Stat label="GST paid (portal)" value={"₹" + inr0(r2m(portalItcUsed + portalCashUsed))} sub={`ITC ₹${inr0(portalItcUsed)} + cash ₹${inr0(portalCashUsed)}`} color="#0d9488" />
+              <Stat
+                label="Not filed yet"
+                value={"₹" + inr0(notFiledYet)}
+                sub={ps.filedThrough ? `Filed through ${gstMonthLabel(ps.filedThrough)}${ps.shortfall > 0.5 ? ` · diff ₹${inr0(ps.shortfall)}` : ""}` : "—"}
+                color="#f59e0b"
+              />
+              <Stat label="Cash ledger balance" value={"₹" + inr0(gstPortalBal.cashBalance)} sub="Electronic Cash Ledger (portal)" color="#5563E8" />
+            </>
+          ) : (
+            <>
+              <Stat label="Input ITC (est.)" value={"₹" + inr0(totalItc)} sub={"IT ₹" + inr0(itcItVendor) + " · Bank ₹" + inr0(itcBank)} color="#10b981" />
+              <Stat
+                label="GST paid (ledger)"
+                value={"₹" + inr0(totalGstPaid)}
+                sub={gstPaymentDr.length ? `${gstPaymentDr.length} debit · ${GST_PAY}` : "Post via chat or txn"}
+                color="#0d9488"
+              />
+              <Stat
+                label="Net after ITC & paid"
+                value={"₹" + inr0(netPayGst)}
+                sub={totalGstPaid > 0 ? "Books snapshot — not filed return" : "Reduce when you record GST payments"}
+                color="#f43f5e"
+              />
+              <Stat label="IT expense entries" value={String(itVendorDr.length)} sub="Used only for ITC estimate" color="#5563E8" />
+            </>
+          )}
         </div>
         <div
           style={{
@@ -9679,7 +9716,17 @@ ${buildInvoicePrintDocumentHtml({
             lineHeight: 1.55,
           }}
         >
-          <strong>How this ties to Transactions:</strong> Debits with category <strong>{GST_PAY}</strong> count as <strong>tax deposited from bank</strong> and reduce <strong>Net after ITC & paid</strong>. Monthly rows show GST paid in that calendar month. ITC splits are indicative @ 18% inclusive — reconcile with GSTR-2B / invoices.
+          {hasPortal ? (
+            <>
+              <strong>Source:</strong> output GST from your invoices; ITC and payments from your GST portal Electronic Credit / Cash Ledger (paste under Monthly → Update portal
+              ledger). Bank GST payments are deposits into the cash ledger.
+            </>
+          ) : (
+            <>
+              <strong>How this ties to Transactions:</strong> Debits with category <strong>{GST_PAY}</strong> count as <strong>tax deposited from bank</strong> and reduce{" "}
+              <strong>Net after ITC & paid</strong>. ITC splits are indicative @ 18% inclusive — paste your GST portal ledgers under Monthly for exact figures.
+            </>
+          )}
         </div>
         <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 10 }}>
           {[["mon", "Monthly"], ["g1", "GSTR-1"], ["g3b", "GSTR-3B"], ["itc", "ITC"]].map(([k, l]) => (
@@ -9729,20 +9776,39 @@ ${buildInvoicePrintDocumentHtml({
               ]}
               rows={[
                 { h: "3.1(a)", d: outputGstSplit.estimated ? "Outward taxable (est.)" : "Outward taxable (as per invoices)", i: "₹" + inr0(outIgst), c: "₹" + inr0(outCgst), s: "₹" + inr0(outSgst) },
-                { h: "4.", d: "ITC (Vendor IT + Bank chg., est.)", i: "₹0", c: "₹" + inr0(itcCgstTot), s: "₹" + inr0(itcSgstTot) },
-                {
-                  h: "5.",
-                  d: "GST paid from bank (ledger " + GST_PAY + ")",
-                  i: "₹" + inr0(paidIgst),
-                  c: "₹" + inr0(paidCgst),
-                  s: "₹" + inr0(paidSgst),
-                },
-                { h: "6.", d: "Balance (est.) after ITC & payments", i: "₹" + inr0(netIgst), c: "₹" + inr0(netCgst), s: "₹" + inr0(netSgst) },
+                hasPortal
+                  ? { h: "4.", d: "ITC utilised (GST portal)", i: "₹" + inr0(itcHead.i), c: "₹" + inr0(itcHead.c), s: "₹" + inr0(itcHead.s) }
+                  : { h: "4.", d: "ITC (Vendor IT + Bank chg., est.)", i: "₹0", c: "₹" + inr0(itcCgstTot), s: "₹" + inr0(itcSgstTot) },
+                hasPortal
+                  ? { h: "5.", d: "Cash utilised (GST portal)", i: "₹" + inr0(cashHead.i), c: "₹" + inr0(cashHead.c), s: "₹" + inr0(cashHead.s) }
+                  : { h: "5.", d: "GST paid from bank (ledger " + GST_PAY + ")", i: "₹" + inr0(paidIgst), c: "₹" + inr0(paidCgst), s: "₹" + inr0(paidSgst) },
+                hasPortal
+                  ? {
+                      h: "6.",
+                      d: `Not filed yet${ps.shortfall > 0.5 ? ` (+ difference ₹${inr0(ps.shortfall)})` : ""} — head split indicative`,
+                      ...(() => {
+                        const n = split3(r2m(notFiledYet + ps.shortfall))
+                        return { i: "₹" + inr0(n.i), c: "₹" + inr0(n.c), s: "₹" + inr0(n.s) }
+                      })(),
+                    }
+                  : { h: "6.", d: "Balance (est.) after ITC & payments", i: "₹" + inr0(netIgst), c: "₹" + inr0(netCgst), s: "₹" + inr0(netSgst) },
               ]}
             />
           </div>
         )}
-        {gTab==="itc"&&<>
+        {gTab==="itc"&&hasPortal&&(
+          <Tbl
+            cols={[
+              { h: "Month", k: "m" },
+              { h: "ITC credited", r: true, cell: r => "₹" + inr0(r.cin) },
+              { h: "ITC utilised", r: true, cell: r => "₹" + inr0(r.used) },
+              { h: "ITC balance", r: true, cell: r => <strong>₹{inr0(r.bal)}</strong> },
+            ]}
+            rows={portalItcRows}
+            empty="No ITC in the portal ledger."
+          />
+        )}
+        {gTab==="itc"&&!hasPortal&&<>
           <div style={{background:"rgba(107,122,255,.06)",border:"1px solid rgba(107,122,255,.25)",borderRadius:9,padding:"10px 13px",marginBottom:12,fontSize:11.5,color:"#BFDBFE"}}>
             Debits whose narration matches <strong>IT SOLUTIONS</strong> are categorised as <strong>Vendor - IT Solutions</strong> (expense). Below splits use <strong>18% inclusive</strong> GST for ITC planning — replace with figures from actual invoices.
           </div>
