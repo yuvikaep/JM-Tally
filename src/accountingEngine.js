@@ -30,6 +30,7 @@ export const CHART_OF_ACCOUNTS = {
     { code: "1300", name: "Fixed Assets – Plant & Machinery", type: "Asset", normal: "Debit" },
     { code: "1310", name: "Fixed Assets – Computer & IT Equipment", type: "Asset", normal: "Debit" },
     { code: "1320", name: "Fixed Assets – Furniture & Fixtures", type: "Asset", normal: "Debit" },
+    { code: "1325", name: "Fixed Assets – Office Equipment", type: "Asset", normal: "Debit" },
     { code: "1390", name: "Accumulated Depreciation", type: "Asset", normal: "Credit" },
     { code: "1400", name: "Intangible Assets – Software / Licences", type: "Asset", normal: "Debit" },
     { code: "1410", name: "Security Deposits (Asset)", type: "Asset", normal: "Debit" },
@@ -203,8 +204,32 @@ export function coaRowsWithBalances(txns) {
 }
 
 /** Map app category string → primary nominal ledger name (second line of journal) */
+const FIXED_ASSET_CATEGORY_ACCOUNTS = {
+  "Fixed Asset - Computers": "Fixed Assets – Computer & IT Equipment",
+  "Fixed Asset - Furniture": "Fixed Assets – Furniture & Fixtures",
+  "Fixed Asset - Office Equipment": "Fixed Assets – Office Equipment",
+  "Fixed Asset - Plant & Machinery": "Fixed Assets – Plant & Machinery",
+  "Fixed Asset - Vehicles": "Fixed Assets – Vehicles",
+  "Fixed Asset - Software": "Intangible Assets – Software / Licences",
+}
+
+/** Categories that move assets / liabilities / capital — not income or expense, so kept out of P&L. */
+export function isBalanceSheetCategory(category) {
+  const c = String(category || "")
+  return c.startsWith("Capital") || c.startsWith("Loan ") || c.startsWith("Fixed Asset") || c === "Asset Sale"
+}
+
+/** Non-bank rows whose second leg is not the bank (e.g. depreciation credits the contra-asset). */
+const NON_BANK_CONTRA = { Depreciation: "Accumulated Depreciation" }
+
 export function categoryToNominalAccount(category) {
   if (!category) return "Miscellaneous Expense"
+  if (FIXED_ASSET_CATEGORY_ACCOUNTS[category]) return FIXED_ASSET_CATEGORY_ACCOUNTS[category]
+  if (category === "Depreciation") return "Depreciation Expense"
+  if (category === "Asset Disposal") return "Loss on Sale of Assets"
+  if (category === "Asset Sale") return "Scrap / Sale of Assets (Income)"
+  if (category === "Loan Received" || category === "Loan Repayment") return "Loans Payable – Term Loan"
+  if (category === "Purchase - Stock / Goods") return "Purchase of Goods (Trading)"
   if (category.startsWith("Revenue")) return "Service Revenue"
   if (category === "Salary Income") return "Other Income"
   if (category === "Electricity Expense") return "Utilities – Electricity & Water"
@@ -238,7 +263,7 @@ export function enrichTxnJournal(t) {
 
 export function buildJournalLines({ amount, drCr, category }) {
   const a = Number(amount) || 0
-  const bank = BANK_ACCOUNT
+  const bank = NON_BANK_CONTRA[category] || BANK_ACCOUNT
   const nominal = categoryToNominalAccount(category)
   if (drCr === "CR") {
     return [
@@ -638,4 +663,96 @@ export function bankBalanceOnOrBeforeDate(txns, endDdMmYyyy) {
     }
   }
   return last
+}
+
+const NON_CURRENT_ASSET_CODES = new Set(["1300", "1310", "1320", "1325", "1335", "1340", "1350", "1390", "1400", "1410", "1420", "1440", "1450"])
+const NON_CURRENT_LIABILITY_CODES = new Set(["2110", "2120", "2260", "2270"])
+
+/**
+ * Balance sheet as on a date, built from the double-entry journals (cumulative, not period-only).
+ * - Profit before `fyStartMs` → retained earnings b/f; profit from then → current period.
+ * - `stock` (from the stock register): closing value is an asset; register opening stock is capital
+ *   brought in; the remaining stock change goes to profit (prior part to retained earnings).
+ * - When the bank statement's running balance differs from the booked bank figure (opening balance
+ *   never posted), the gap is shown on both sides so the statement balance is what appears.
+ */
+export function balanceSheetFromJournal(txns, { asOfMs = Infinity, fyStartMs = -Infinity, stock = null, statementBank = null } = {}) {
+  const r2 = n => Math.round((Number(n) || 0) * 100) / 100
+  const coa = new Map(flattenCOA().map(a => [a.name, a]))
+  const upto = (txns || []).filter(t => !t.void && parseDdMmYyyy(t.date) <= asOfMs)
+  const prior = upto.filter(t => parseDdMmYyyy(t.date) < fyStartMs)
+  const net = list => {
+    const m = new Map()
+    for (const r of trialBalanceFromJournal(list).rows) m.set(r.account, r2(r.debit - r.credit))
+    return m
+  }
+  const all = net(upto)
+  const profitOf = m => {
+    let p = 0
+    for (const [acc, dr] of m) {
+      const t = coa.get(acc)?.type
+      if (t === "Income" || t === "Expense") p -= dr
+    }
+    return r2(p)
+  }
+  const closingStock = Number(stock?.closing) || 0
+  const stockBroughtIn = Number(stock?.broughtIn) || 0
+  const priorStockChange = Number(stock?.priorChange) || 0
+  const bookRetained = profitOf(net(prior))
+  const retainedBf = r2(bookRetained + priorStockChange)
+  const periodProfit = r2(profitOf(all) - bookRetained + (closingStock - stockBroughtIn - priorStockChange))
+
+  const sec = () => []
+  const assets = { nonCurrent: sec(), current: sec() }
+  const liabilities = { nonCurrent: sec(), current: sec() }
+  const equity = sec()
+  let bankGap = 0
+  for (const [acc, dr] of all) {
+    if (Math.abs(dr) < 0.005) continue
+    const meta = coa.get(acc)
+    const type = meta?.type || (dr >= 0 ? "Asset" : "Liability")
+    if (type === "Income" || type === "Expense") continue
+    if (type === "Asset") {
+      let amount = dr
+      if (acc === BANK_ACCOUNT && statementBank != null && Number.isFinite(statementBank)) {
+        bankGap = r2(statementBank - dr)
+        amount = statementBank
+      }
+      ;(NON_CURRENT_ASSET_CODES.has(meta?.code) ? assets.nonCurrent : assets.current).push({ name: acc, amount, unmapped: !meta })
+    } else if (type === "Liability") {
+      ;(NON_CURRENT_LIABILITY_CODES.has(meta?.code) ? liabilities.nonCurrent : liabilities.current).push({ name: acc, amount: r2(-dr), unmapped: !meta })
+    } else {
+      equity.push({ name: acc, amount: r2(-dr) })
+    }
+  }
+  if (statementBank != null && Number.isFinite(statementBank) && !all.has(BANK_ACCOUNT) && Math.abs(statementBank) > 0.005) {
+    bankGap = r2(statementBank)
+    assets.current.push({ name: BANK_ACCOUNT, amount: statementBank })
+  }
+  if (Math.abs(stockBroughtIn) > 0.005) equity.push({ name: "Opening stock brought into books (stock register)", amount: r2(stockBroughtIn) })
+  if (closingStock > 0.005) assets.current.push({ name: "Inventory (closing stock as per stock register)", amount: r2(closingStock) })
+  if (Math.abs(bankGap) > 0.005) equity.push({ name: "Bank opening balance not booked (statement vs books)", amount: bankGap })
+  if (Math.abs(retainedBf) > 0.005) equity.push({ name: "Retained earnings (profit of earlier periods)", amount: retainedBf })
+  equity.push({ name: "Profit / (Loss) for the current period", amount: periodProfit })
+
+  const tot = rows => r2(rows.reduce((s, r) => s + r.amount, 0))
+  const totalAssets = r2(tot(assets.nonCurrent) + tot(assets.current))
+  const totalLiabilities = r2(tot(liabilities.nonCurrent) + tot(liabilities.current))
+  const totalEquity = tot(equity)
+  return {
+    assets,
+    liabilities,
+    equity,
+    totals: {
+      nonCurrentAssets: tot(assets.nonCurrent),
+      currentAssets: tot(assets.current),
+      totalAssets,
+      nonCurrentLiabilities: tot(liabilities.nonCurrent),
+      currentLiabilities: tot(liabilities.current),
+      totalLiabilities,
+      totalEquity,
+      totalLe: r2(totalLiabilities + totalEquity),
+      difference: r2(totalAssets - totalLiabilities - totalEquity),
+    },
+  }
 }

@@ -25,7 +25,19 @@ import {
   draftInvoiceSettlementTxns,
   stripInvoiceSettlementTxns,
   BANK_ACCOUNT,
+  balanceSheetFromJournal,
+  isBalanceSheetCategory,
 } from "./accountingEngine.js"
+import {
+  normalizeFixedAssets,
+  syncAssetSystemTxns,
+  depreciationTxnForFy,
+  isFixedAssetSystemTxn,
+  blockByKey,
+  fyBounds,
+} from "./fixedAssets.js"
+import { normalizeInventory, stockForBalanceSheet } from "./inventoryStock.js"
+import { FixedAssetsPage, InventoryPage } from "./AssetsInventoryPages.jsx"
 import {
   bankFileToImportMatrix,
   importBankStatementFromMatrix,
@@ -120,6 +132,16 @@ const CATS = [
   "Misc Expense",
   "Misc Income",
   "Payment Gateway",
+  "Purchase - Stock / Goods",
+  "Fixed Asset - Computers",
+  "Fixed Asset - Furniture",
+  "Fixed Asset - Office Equipment",
+  "Fixed Asset - Plant & Machinery",
+  "Fixed Asset - Vehicles",
+  "Fixed Asset - Software",
+  "Asset Sale",
+  "Loan Received",
+  "Loan Repayment",
 ]
 const REVENUE_CATS = CATS.filter(c => c.startsWith("Revenue"))
 const ONE_TIME_WIPE_EMAILS = new Set(["hr@jobsmato.com"])
@@ -193,7 +215,7 @@ const normalizeTxnCategories = arr =>
     const mapped = LEGACY_CATEGORY_MAP[t.category]
     let u = mapped ? { ...t, category: mapped } : { ...t }
     // A category the user picked by hand is final — narration heuristics must not undo it.
-    if (u.catByUser) return u
+    if (u.catByUser || isFixedAssetSystemTxn(u)) return u
     u = u.category === "Salary - Field Staff" ? { ...u, category: "Salary" } : u
     if (u.drCr === "DR" && IT_SOLUTIONS_VENDOR_RE.test(u.particulars || ""))
       u = { ...u, category: "Vendor - IT Solutions" }
@@ -219,7 +241,8 @@ const normalizeTxnCategories = arr =>
 function applyLedgerCategoryNormalization(txns) {
   if (!Array.isArray(txns)) return []
   const n = normalizeTxnCategories(txns.map(t => ({ ...t })))
-  return n.map(t => enrichTxnJournal({ ...t, journalLines: undefined }))
+  // Asset register / depreciation rows carry their own non-bank journal — never rebuild it from category.
+  return n.map(t => (isFixedAssetSystemTxn(t) ? t : enrichTxnJournal({ ...t, journalLines: undefined })))
 }
 
 /**
@@ -3580,6 +3603,7 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
   const [tdsPaidEntries, setTdsPaidEntries] = useState([])
   const [tdsPayDraft, setTdsPayDraft] = useState({ date: todayISO(), kind: "paid", amount: "", section: "194C", remark: "" })
   const [pfEsicChallans, setPfEsicChallans] = useState([])
+  const [fixedAssets, setFixedAssets] = useState([])
   const [pfEsicDraft, setPfEsicDraft] = useState({ type: "PF", period: "", date: todayISO(), amount: "", challanNo: "", fileName: "" })
   const [invListFilter, setInvListFilter] = useState("all")
   /** When set, invoice modal saves over this row instead of creating */
@@ -3680,6 +3704,7 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
         setManualClients(normalizeManualClients(st?.manualClients))
         setTdsPaidEntries(normalizeTdsPayments(st?.tdsPaidEntries))
         setPfEsicChallans(normalizePfEsicChallans(st?.pfEsicChallans))
+        setFixedAssets(normalizeFixedAssets(st?.fixedAssets))
       } finally {
         setLoading(false)
       }
@@ -3701,9 +3726,10 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
         manualClients: normalizeManualClients(manualClients),
         tdsPaidEntries: normalizeTdsPayments(tdsPaidEntries),
         pfEsicChallans: normalizePfEsicChallans(pfEsicChallans),
+        fixedAssets,
       },
     })
-  }, [txns, invoices, inventory, importHistory, acctRole, periodLockIso, automationSkills, assistantMemory, manualClients, tdsPaidEntries, pfEsicChallans, activeCompanyId, loading, scopedStore])
+  }, [txns, invoices, inventory, importHistory, acctRole, periodLockIso, automationSkills, assistantMemory, manualClients, tdsPaidEntries, pfEsicChallans, fixedAssets, activeCompanyId, loading, scopedStore])
 
   /** Debounced upload of full workspace to API so every device sees the same books (when online). */
   useEffect(() => {
@@ -3761,6 +3787,7 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
     manualClients,
     tdsPaidEntries,
     pfEsicChallans,
+    fixedAssets,
     companies,
     scopedStore,
     authUser.email,
@@ -3910,6 +3937,7 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
         setAssistantMemory([])
         setManualClients([])
         setPfEsicChallans([])
+        setFixedAssets([])
         toast_("One-time data wipe completed for this user", "#f59e0b")
       } catch (e) {
         toast_(String(e?.message || e), "#f43f5e")
@@ -4064,10 +4092,16 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
     [reportLedger]
   )
   const cfBuckets = useMemo(() => {
-    const act = reportLedger
+    // Cash flow = money through the bank only; depreciation and other non-bank journals are not cash.
+    const act = reportLedger.filter(t => !t.excludeFromBankRunning)
     const S = pred => act.filter(pred).reduce((s, t) => s + (Number(t.amount) || 0), 0)
-    const cr = S(t => t.drCr === "CR")
-    const dr = S(t => t.drCr === "DR")
+    const cat = t => String(t.category || "")
+    const assetBuy = S(t => t.drCr === "DR" && cat(t).startsWith("Fixed Asset"))
+    const assetSale = S(t => t.drCr === "CR" && cat(t) === "Asset Sale")
+    const loanIn = S(t => t.drCr === "CR" && cat(t) === "Loan Received")
+    const loanOut = S(t => t.drCr === "DR" && cat(t) === "Loan Repayment")
+    const cr = S(t => t.drCr === "CR") - assetSale - loanIn
+    const dr = S(t => t.drCr === "DR") - assetBuy - loanOut
     const cap = S(t => t.drCr === "CR" && String(t.category || "").startsWith("Capital"))
     const revSvc = S(t => t.drCr === "CR" && String(t.category || "").startsWith("Revenue"))
     const salRem = S(t => t.drCr === "DR" && (EMPLOYEE_PAYROLL_CATS.has(String(t.category || "")) || t.category === "Director Payment"))
@@ -4078,8 +4112,36 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
     const bankCh = S(t => t.drCr === "DR" && t.category === "Bank Charges")
     const otherDr = Math.round((dr - salRem - vendor - misc - bankCh) * 100) / 100
     const otherCr = Math.round((cr - revSvc - cap) * 100) / 100
-    return { cr, dr, cap, revSvc, salRem, vendor, misc, bankCh, otherDr, otherCr }
+    return { cr, dr, cap, revSvc, salRem, vendor, misc, bankCh, otherDr, otherCr, assetBuy, assetSale, loanIn, loanOut }
   }, [reportLedger])
+
+  /** Balance sheet date = end of the selected report period (or today), current period = that date's FY. */
+  const bsAsOfIso = useMemo(() => {
+    if (repToIso) return repToIso
+    if (repMonthKey) {
+      const [y, m] = repMonthKey.split("-").map(Number)
+      return `${y}-${String(m).padStart(2, "0")}-${String(new Date(y, m, 0).getDate()).padStart(2, "0")}`
+    }
+    if (repFy && fyBounds(repFy)) return `${fyBounds(repFy).y + 1}-03-31`
+    return todayISO()
+  }, [repToIso, repMonthKey, repFy])
+
+  const balanceSheet = useMemo(() => {
+    const [y, m, d] = bsAsOfIso.split("-").map(Number)
+    const fyStartY = m >= 4 ? y : y - 1
+    const fyStartIso = `${fyStartY}-04-01`
+    const asOfDdMm = `${String(d).padStart(2, "0")}/${String(m).padStart(2, "0")}/${y}`
+    return {
+      asOfDdMm,
+      fyLabel: `${fyStartY}-${String((fyStartY + 1) % 100).padStart(2, "0")}`,
+      ...balanceSheetFromJournal(ledger, {
+        asOfMs: new Date(y, m - 1, d, 23, 59, 59).getTime(),
+        fyStartMs: new Date(fyStartY, 3, 1).getTime(),
+        stock: stockForBalanceSheet(stockItems, bsAsOfIso, fyStartIso),
+        statementBank: bankBalanceOnOrBeforeDate(ledger, asOfDdMm),
+      }),
+    }
+  }, [ledger, stockItems, bsAsOfIso])
 
   const chatRevenueCats = useMemo(
     () => aggregateByCategory(ledger, "CR").filter(([n]) => String(n).startsWith("Revenue")),
@@ -4174,9 +4236,10 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
         manualClients: normalizeManualClients(manualClients),
         tdsPaidEntries: normalizeTdsPayments(tdsPaidEntries),
         pfEsicChallans: normalizePfEsicChallans(pfEsicChallans),
+        fixedAssets,
       },
     })
-  }, [activeCompanyId, txns, invoices, inventory, importHistory, acctRole, periodLockIso, automationSkills, assistantMemory, manualClients, tdsPaidEntries, pfEsicChallans, scopedStore])
+  }, [activeCompanyId, txns, invoices, inventory, importHistory, acctRole, periodLockIso, automationSkills, assistantMemory, manualClients, tdsPaidEntries, pfEsicChallans, fixedAssets, scopedStore])
 
   const applyLoadedPayload = useCallback(payload => {
     const raw = (Array.isArray(payload.txns) ? payload.txns : []).map(t => ({ ...t, void: !!t.void }))
@@ -4195,6 +4258,7 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
     setManualClients(normalizeManualClients(st?.manualClients))
     setTdsPaidEntries(normalizeTdsPayments(st?.tdsPaidEntries))
     setPfEsicChallans(normalizePfEsicChallans(st?.pfEsicChallans))
+    setFixedAssets(normalizeFixedAssets(st?.fixedAssets))
   }, [])
 
   const switchCompany = useCallback(
@@ -4460,6 +4524,10 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
         toast_("Voided rows cannot be recategorised", "#f59e0b")
         return
       }
+      if (isFixedAssetSystemTxn(t)) {
+        toast_("This entry is managed from Fixed Assets — edit the asset there", "#f59e0b")
+        return
+      }
       if (periodLockIso && isPeriodLocked(t.date, periodLockIso)) {
         toast_("This date is in a locked period — unlock or pick another row", "#f43f5e")
         return
@@ -4489,6 +4557,120 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
       toast_(`Category updated → ${newCategory}`, "#10b981")
     },
     [txns, acctRole, periodLockIso, appendAudit]
+  )
+
+  const stockItems = useMemo(() => normalizeInventory(inventory), [inventory])
+
+  const saveFixedAsset = useCallback(
+    draft => {
+      if (acctRole === "Viewer") return false
+      const id = draft.id ?? Math.max(0, ...fixedAssets.map(a => Number(a.id) || 0)) + 1
+      const [asset] = normalizeFixedAssets([{ ...draft, id }])
+      if (!asset) {
+        toast_("Enter asset name, cost and purchase date", "#f43f5e")
+        return false
+      }
+      const lockedDate = [asset.purchaseDate, asset.disposalDate].find(d => d && isPeriodLocked(d, periodLockIso))
+      if (periodLockIso && lockedDate) {
+        toast_("Purchase / disposal date is in a locked period", "#f43f5e")
+        return false
+      }
+      let next = txns || []
+      if (asset.linkedTxnId != null) {
+        const paid = next.find(t => t.id === asset.linkedTxnId)
+        if (!paid) {
+          toast_("Linked bank transaction not found", "#f43f5e")
+          return false
+        }
+        const category = blockByKey(asset.block).category
+        if (paid.category !== category) {
+          next = next.map(t => (t.id === paid.id ? enrichTxnJournal({ ...t, category, catByUser: true, journalLines: undefined }) : t))
+        }
+      }
+      next = syncAssetSystemTxns(next, id, asset, acctRole)
+      setTxns(withRecalculatedBalances(next))
+      setFixedAssets(prev => [...prev.filter(a => a.id !== id), asset].sort((a, b) => a.purchaseDate.localeCompare(b.purchaseDate) || a.id - b.id))
+      appendAudit({ action: draft.id ? "FIXED_ASSET_EDIT" : "FIXED_ASSET_ADD", by: acctRole, assetId: id, amount: asset.cost, particulars: asset.name })
+      toast_(draft.id ? "Asset updated" : "Asset added to register", "#10b981")
+      return true
+    },
+    [acctRole, fixedAssets, txns, periodLockIso, appendAudit]
+  )
+
+  const deleteFixedAsset = useCallback(
+    id => {
+      if (acctRole === "Viewer") return false
+      const a = fixedAssets.find(x => x.id === id)
+      if (!a || !confirm(`Delete "${a.name}" from the fixed asset register?\n\nIts opening / disposal ledger entries are removed. A linked bank payment keeps its Fixed Asset category — re-categorise it if needed. Re-post depreciation afterwards.`)) return false
+      setTxns(withRecalculatedBalances(syncAssetSystemTxns(txns || [], id, null, acctRole)))
+      setFixedAssets(prev => prev.filter(x => x.id !== id))
+      appendAudit({ action: "FIXED_ASSET_DELETE", by: acctRole, assetId: id, particulars: a.name })
+      toast_("Asset deleted", "#f59e0b")
+      return true
+    },
+    [acctRole, fixedAssets, txns, appendAudit]
+  )
+
+  const postDepreciation = useCallback(
+    fy => {
+      if (acctRole === "Viewer") return
+      const b = fyBounds(fy)
+      if (periodLockIso && b && isPeriodLocked(`${b.y + 1}-03-31`, periodLockIso)) {
+        toast_("31 March of this FY is in a locked period", "#f43f5e")
+        return
+      }
+      const { txns: next, amount } = depreciationTxnForFy(txns || [], fixedAssets, fy, acctRole)
+      setTxns(withRecalculatedBalances(next))
+      appendAudit({ action: "DEPRECIATION_POST", by: acctRole, fy, amount })
+      toast_(amount > 0 ? `✓ Depreciation FY ${fy} posted — ₹${inr0(amount)}` : `Depreciation entry for FY ${fy} removed (nothing to charge)`, "#10b981")
+    },
+    [acctRole, txns, fixedAssets, periodLockIso, appendAudit]
+  )
+
+  const saveStockItem = useCallback(
+    draft => {
+      if (acctRole === "Viewer") return false
+      const id = draft.id ?? `itm_${Date.now().toString(36)}`
+      const prev = stockItems.find(i => i.id === id)
+      const [item] = normalizeInventory([{ ...draft, id, movements: prev?.movements || [] }])
+      if (!item) {
+        toast_("Enter item name", "#f43f5e")
+        return false
+      }
+      setInventory([...stockItems.filter(i => i.id !== id), item])
+      appendAudit({ action: prev ? "STOCK_ITEM_EDIT" : "STOCK_ITEM_ADD", by: acctRole, particulars: item.item })
+      toast_(prev ? "Item updated" : "✓ Item added", "#10b981")
+      return true
+    },
+    [acctRole, stockItems, appendAudit]
+  )
+
+  const deleteStockItem = useCallback(
+    id => {
+      if (acctRole === "Viewer") return false
+      const it = stockItems.find(i => i.id === id)
+      if (!it || !confirm(`Delete "${it.item}" and all its stock movements?`)) return false
+      setInventory(stockItems.filter(i => i.id !== id))
+      appendAudit({ action: "STOCK_ITEM_DELETE", by: acctRole, particulars: it.item })
+      toast_("Item deleted", "#f59e0b")
+      return true
+    },
+    [acctRole, stockItems, appendAudit]
+  )
+
+  const addStockMovement = useCallback(
+    (itemId, mv) => {
+      if (acctRole === "Viewer") return false
+      if (periodLockIso && isPeriodLocked(mv.date, periodLockIso)) {
+        toast_("This date is in a locked period", "#f43f5e")
+        return false
+      }
+      setInventory(stockItems.map(i => (i.id === itemId ? { ...i, movements: [...i.movements, mv] } : i)))
+      appendAudit({ action: mv.type === "in" ? "STOCK_IN" : "STOCK_OUT", by: acctRole, qty: mv.qty, particulars: stockItems.find(i => i.id === itemId)?.item })
+      toast_(mv.type === "in" ? "Stock in recorded" : "Stock out recorded", "#10b981")
+      return true
+    },
+    [acctRole, stockItems, periodLockIso, appendAudit]
   )
 
   const addTxnBatchFromChat = useCallback(
@@ -6323,7 +6505,7 @@ ${buildInvoicePrintDocumentHtml({
     whiteSpace: "nowrap",
   }
 
-  const pages = {dash:"Dashboard",txn:"Transactions",inv:"Invoices",clients:"Clients",led:"General Ledger",coa:"Chart of Accounts",gst:"GST Compliance",tds:"TDS Deductions",pay:"Payroll & TDS",stock:"Inventory",rec:"Reconciliation",rep:"Reports & P&L",bulk:"Bulk Upload",ai:"AI Agent"}
+  const pages = {dash:"Dashboard",txn:"Transactions",inv:"Invoices",clients:"Clients",led:"General Ledger",coa:"Chart of Accounts",gst:"GST Compliance",tds:"TDS Deductions",pay:"Payroll & TDS",stock:"Inventory",fa:"Fixed Assets",rec:"Reconciliation",rep:"Reports & P&L",bulk:"Bulk Upload",ai:"AI Agent"}
 
   const overviewNavLinks = [
     ["⊞", "dash"],
@@ -6338,6 +6520,7 @@ ${buildInvoicePrintDocumentHtml({
     ["⊙", "pay"],
     ["▥", "coa"],
     ["▣", "stock"],
+    ["⌂", "fa"],
     ["⊗", "rec"],
   ]
   const intelNavLinks = [
@@ -6778,7 +6961,7 @@ ${buildInvoicePrintDocumentHtml({
           {h:"Date",k:"date"},
           {h:"Particulars",cell:r=><span style={{fontSize:11,opacity:r.void?0.55:1}} title={r.void?(r.voidReason?`${r.particulars}\n\nVoid reason: ${r.voidReason}`:r.particulars):r.particulars}>{r.particulars.substring(0,46)}{r.void?" (void)":""}</span>},
           {h:"Category",cell:r=>{
-            if (!r.void && acctRole !== "Viewer") {
+            if (!r.void && acctRole !== "Viewer" && !isFixedAssetSystemTxn(r)) {
               return (
                 <select
                   value={r.category}
@@ -9477,8 +9660,10 @@ ${buildInvoicePrintDocumentHtml({
   }
 
   const Rep = () => {
-    const plTotalCr = crByCat.reduce((s, [, v]) => s + v, 0)
-    const plTotalDr = drByCat.reduce((s, [, v]) => s + v, 0)
+    const plCr = crByCat.filter(([n]) => !isBalanceSheetCategory(n))
+    const plDr = drByCat.filter(([n]) => !isBalanceSheetCategory(n))
+    const plTotalCr = plCr.reduce((s, [, v]) => s + v, 0)
+    const plTotalDr = plDr.reduce((s, [, v]) => s + v, 0)
     const plNet = Math.round((plTotalCr - plTotalDr) * 100) / 100
     const bankCashLines = reportLedger.filter(t => !t.void && !t.excludeFromBankRunning)
     const bankCrTot = bankCashLines.filter(t => t.drCr === "CR").reduce((s, t) => s + (Number(t.amount) || 0), 0)
@@ -9490,11 +9675,10 @@ ${buildInvoicePrintDocumentHtml({
     const b = cfBuckets
     const netOpsDetail = Math.round((b.revSvc + b.otherCr - b.salRem - b.vendor - b.misc - b.bankCh - b.otherDr) * 100) / 100
     const bankBal = reportStats.balance
-    const gstLiab = outputGstFromRev
-    const retainedPlug = Math.round((bankBal - gstLiab - capitalCr) * 100) / 100
-    const assetsOther = 0
-    const assetsTot = Math.round((bankBal + assetsOther) * 100) / 100
-    const leTot = Math.round((gstLiab + capitalCr + retainedPlug) * 100) / 100
+    const investNet = Math.round((b.assetSale - b.assetBuy) * 100) / 100
+    const finNet = Math.round((b.cap + b.loanIn - b.loanOut) * 100) / 100
+    const sign = v => (v >= 0 ? "+" : "-") + "₹" + inr0(Math.abs(v))
+    const tone = v => (v >= 0 ? "#10b981" : "#f43f5e")
     const tbRows = tbReport.rows.map(r => ({
       a: r.account,
       d: r.debit > 0.005 ? "₹" + inr0(r.debit) : "—",
@@ -9518,9 +9702,15 @@ ${buildInvoicePrintDocumentHtml({
         netOpsDetail >= 0 ? "#10b981" : "#f43f5e",
         true,
       ],
+      ["INVESTING ACTIVITIES", true],
+      ["Purchase of fixed assets (DR)", "-" + "₹" + inr0(b.assetBuy), false, "#f43f5e"],
+      ["Sale of fixed assets (CR)", "+" + "₹" + inr0(b.assetSale), false, "#10b981"],
+      ["Net from investing", sign(investNet), false, tone(investNet), true],
       ["FINANCING ACTIVITIES", true],
       ["Capital infusions (CR)", "+" + "₹" + inr0(b.cap), false, "#10b981"],
-      ["Net from financing", "+" + "₹" + inr0(b.cap), false, "#10b981", true],
+      ["Loans received (CR)", "+" + "₹" + inr0(b.loanIn), false, "#10b981"],
+      ["Loan repayments (DR)", "-" + "₹" + inr0(b.loanOut), false, "#f43f5e"],
+      ["Net from financing", sign(finNet), false, tone(finNet), true],
       [
         "NET CHANGE IN CASH (CR − DR)",
         (reportStats.flowNet >= 0 ? "+" : "-") + "₹" + inr0(Math.abs(reportStats.flowNet)) + " → Closing ₹" + inr0(bankBal),
@@ -9549,10 +9739,10 @@ ${buildInvoicePrintDocumentHtml({
         <div style={S.g2}>
               <div style={{ ...S.card, maxHeight: 360, overflowY: "auto" }}>
                 <div style={{ fontSize: 12, fontWeight: 700, color: "#10b981", marginBottom: 12 }}>📈 Credits (by category)</div>
-                {crByCat.length === 0 ? (
+                {plCr.length === 0 ? (
                   <div style={{ color: "#64748b", fontSize: 11 }}>No credit entries.</div>
                 ) : (
-                  crByCat.map(([n, v]) => (
+                  plCr.map(([n, v]) => (
                     <div key={n} style={{ display: "flex", justifyContent: "space-between", padding: "3px 0", borderBottom: "1px solid #e0f2fe", fontSize: 11.5 }}>
                       <span style={{ color: "#94a3b8" }}>{n}</span>
                       <span style={{ color: "#10b981", fontFamily: "monospace", fontWeight: 700 }}>₹{inr0(v)}</span>
@@ -9566,10 +9756,10 @@ ${buildInvoicePrintDocumentHtml({
               </div>
               <div style={{ ...S.card, maxHeight: 360, overflowY: "auto" }}>
                 <div style={{ fontSize: 12, fontWeight: 700, color: "#f43f5e", marginBottom: 12 }}>📉 Debits (by category)</div>
-                {drByCat.length === 0 ? (
+                {plDr.length === 0 ? (
                   <div style={{ color: "#64748b", fontSize: 11 }}>No debit entries.</div>
                 ) : (
-                  drByCat.map(([n, v]) => (
+                  plDr.map(([n, v]) => (
                     <div key={n} style={{ display: "flex", justifyContent: "space-between", padding: "3px 0", borderBottom: "1px solid #e0f2fe", fontSize: 11.5 }}>
                       <span style={{ color: "#94a3b8" }}>{n}</span>
                       <span style={{ color: "#f43f5e", fontFamily: "monospace", fontWeight: 700 }}>₹{inr0(v)}</span>
@@ -9602,7 +9792,7 @@ ${buildInvoicePrintDocumentHtml({
                 statement / running-balance column (and opening balance, if any, in the chain).
               </div>
               <div style={{ fontSize: 11, color: "#64748b", marginBottom: 7 }}>
-                Σ all credits − Σ all debits (every line, including non-bank journal entries)
+                Σ income − Σ expenses (every line, including non-bank journal entries such as depreciation; capital, loans and fixed-asset purchases are Balance Sheet items and excluded)
               </div>
               <div style={{ fontSize: 32, fontWeight: 800, color: plNet >= 0 ? "#10b981" : "#f43f5e", fontFamily: "monospace" }}>
                 {plNet >= 0 ? "+" : "-"} ₹{inr0(Math.abs(plNet))}
@@ -9651,45 +9841,76 @@ ${buildInvoicePrintDocumentHtml({
             empty="No monthly data yet."
           />
         )}
-        {rTab === "bs" && (
-          <div style={S.g2}>
-            <div style={S.card}>
-              <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 11 }}>Assets (simplified)</div>
-              {[
-                ["Cash & Bank (closing)", "₹" + inr0(bankBal)],
-                ["Fixed assets / other (manual)", "₹" + inr0(assetsOther)],
-              ].map(([n, v]) => (
-                <div key={n} style={{ display: "flex", justifyContent: "space-between", padding: "4px 0", borderBottom: "1px solid #e0f2fe", fontSize: 11.5 }}>
-                  <span style={{ color: "#94a3b8" }}>{n}</span>
-                  <span style={{ fontFamily: "monospace", fontWeight: 700 }}>{v}</span>
+        {rTab === "bs" && (() => {
+          const bsh = balanceSheet
+          const t = bsh.totals
+          const Line = ({ n, v, strong, indent }) => (
+            <div style={{ display: "flex", justifyContent: "space-between", gap: 10, padding: strong ? "6px 0" : "4px 0", paddingLeft: indent ? 12 : 0, borderBottom: "1px solid #e0f2fe", fontSize: strong ? 12.5 : 11.5, fontWeight: strong ? 800 : 400 }}>
+              <span style={{ color: strong ? "#0c4a6e" : "#64748b" }}>{n}</span>
+              <span style={{ fontFamily: "monospace", fontWeight: 700, color: v < 0 ? "#f43f5e" : "#0c4a6e", whiteSpace: "nowrap" }}>
+                {v < 0 ? "(₹" + inr0(-v) + ")" : "₹" + inr0(v)}
+              </span>
+            </div>
+          )
+          const Head = ({ children }) => (
+            <div style={{ padding: "9px 0 3px", fontSize: 10, fontWeight: 700, color: "#64748b", textTransform: "uppercase", letterSpacing: ".5px" }}>{children}</div>
+          )
+          const rows = list => list.map(r => <Line key={r.name} n={r.name === "Accumulated Depreciation" ? "Less: Accumulated Depreciation" : r.name} v={r.amount} indent />)
+          return (
+            <div>
+              <div style={{ fontSize: 11, color: "#64748b", marginBottom: 10 }}>
+                Balance Sheet as on <strong style={{ color: "#0c4a6e" }}>{bsh.asOfDdMm}</strong> (current period FY {bsh.fyLabel}) — built from the double-entry books, cumulative from the first entry. Change
+                the date with the report period filter above.
+              </div>
+              <div style={S.g2}>
+                <div style={S.card}>
+                  <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 4 }}>Equity &amp; Liabilities</div>
+                  <Head>Shareholders’ funds / capital</Head>
+                  {rows(bsh.equity)}
+                  <Line n="Total equity" v={t.totalEquity} strong />
+                  <Head>Non-current liabilities</Head>
+                  {bsh.liabilities.nonCurrent.length ? rows(bsh.liabilities.nonCurrent) : <div style={{ fontSize: 11, color: "#94a3b8", padding: "3px 12px" }}>—</div>}
+                  <Head>Current liabilities</Head>
+                  {bsh.liabilities.current.length ? rows(bsh.liabilities.current) : <div style={{ fontSize: 11, color: "#94a3b8", padding: "3px 12px" }}>—</div>}
+                  <Line n="Total liabilities" v={t.totalLiabilities} strong />
+                  <div style={{ display: "flex", justifyContent: "space-between", padding: "9px 0 0", fontSize: 13, fontWeight: 800 }}>
+                    <span>TOTAL</span>
+                    <span style={{ color: "#6B7AFF", fontFamily: "monospace" }}>₹{inr0(t.totalLe)}</span>
+                  </div>
                 </div>
-              ))}
-              <div style={{ display: "flex", justifyContent: "space-between", padding: "7px 0", fontSize: 13, fontWeight: 800 }}>
-                <span>Total</span>
-                <span style={{ color: "#6B7AFF", fontFamily: "monospace" }}>₹{inr0(assetsTot)}</span>
+                <div style={S.card}>
+                  <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 4 }}>Assets</div>
+                  <Head>Non-current assets (fixed assets, net block)</Head>
+                  {bsh.assets.nonCurrent.length ? rows(bsh.assets.nonCurrent) : <div style={{ fontSize: 11, color: "#94a3b8", padding: "3px 12px" }}>—</div>}
+                  <Line n="Total non-current assets" v={t.nonCurrentAssets} strong />
+                  <Head>Current assets</Head>
+                  {bsh.assets.current.length ? rows(bsh.assets.current) : <div style={{ fontSize: 11, color: "#94a3b8", padding: "3px 12px" }}>—</div>}
+                  <Line n="Total current assets" v={t.currentAssets} strong />
+                  <div style={{ display: "flex", justifyContent: "space-between", padding: "9px 0 0", fontSize: 13, fontWeight: 800 }}>
+                    <span>TOTAL</span>
+                    <span style={{ color: "#6B7AFF", fontFamily: "monospace" }}>₹{inr0(t.totalAssets)}</span>
+                  </div>
+                </div>
+              </div>
+              <div
+                style={{
+                  fontSize: 11,
+                  marginTop: 4,
+                  padding: "8px 12px",
+                  borderRadius: 9,
+                  lineHeight: 1.5,
+                  background: Math.abs(t.difference) < 1 ? "rgba(16,185,129,.08)" : "rgba(244,63,94,.08)",
+                  color: Math.abs(t.difference) < 1 ? "#047857" : "#be123c",
+                }}
+              >
+                {Math.abs(t.difference) < 1
+                  ? "✓ Balanced — Assets = Equity + Liabilities."
+                  : `Difference ₹${inr0(t.difference)} — some journal entries are unbalanced; check the Trial Balance.`}{" "}
+                Fixed assets come from Fixed Assets (purchases + posted depreciation), stock from Inventory, GST / TDS from the accounts they are booked to.
               </div>
             </div>
-            <div style={S.card}>
-              <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 11 }}>Liabilities & capital (indicative)</div>
-              {[
-                ["GST output (est. @18% on Revenue-*)", "₹" + inr0(gstLiab)],
-                ["TDS payable (est.)", "—"],
-                ["Capital infused (CR)", "₹" + inr0(capitalCr)],
-                ["Retained / balancing (plug)", (retainedPlug < 0 ? "-₹" : "₹") + inr0(Math.abs(retainedPlug))],
-              ].map(([n, v]) => (
-                <div key={n} style={{ display: "flex", justifyContent: "space-between", padding: "4px 0", borderBottom: "1px solid #e0f2fe", fontSize: 11.5 }}>
-                  <span style={{ color: "#94a3b8" }}>{n}</span>
-                  <span style={{ fontFamily: "monospace", fontWeight: 700, color: String(v).startsWith("-") ? "#f43f5e" : "#0c4a6e" }}>{v}</span>
-                </div>
-              ))}
-              <div style={{ display: "flex", justifyContent: "space-between", padding: "7px 0", fontSize: 13, fontWeight: 800 }}>
-                <span>Total</span>
-                <span style={{ color: "#6B7AFF", fontFamily: "monospace" }}>₹{inr0(leTot)}</span>
-              </div>
-              <div style={{ fontSize: 10, color: "#64748b", marginTop: 8, lineHeight: 1.5 }}>Plug line ties bank closing to GST (est.) + capital; add fixed assets &amp; TDS in books for a full BS.</div>
-            </div>
-          </div>
-        )}
+          )
+        })()}
         {rTab === "cf" && (
           <div style={S.card}>
             {cfRows.map(([l, v, h, c, b], i) =>
@@ -9712,6 +9933,8 @@ ${buildInvoicePrintDocumentHtml({
       </div>
     )
   }
+
+  const pageUi = { S, Stat, Tbl, Modal, F, IS, inr, inr0 }
 
   const renderPage = () => {
     switch(page){
@@ -9874,49 +10097,33 @@ ${buildInvoicePrintDocumentHtml({
             onBulkSalaryPosted={n => toast_(`Posted ${n} salary line(s) to ledger`, "#10b981")}
           />
         )
-      case "stock": {
-        const invVal = inventory.reduce((s, r) => s + (Number(r.qty) || 0) * (Number(r.unitVal) || 0), 0)
-        const lic = inventory.filter(r => /license|zoho|jira|aws/i.test(String(r.item || ""))).length
-        const low = inventory.filter(r => r.status === "low").length
-        const rows = inventory.map(r => ({
-          item: r.item,
-          hsn: r.hsn,
-          qty: r.qty,
-          val: "₹" + inr0(r.unitVal || 0),
-          tot: "₹" + inr0((Number(r.qty) || 0) * (Number(r.unitVal) || 0)),
-          s: r.status || "ok",
-        }))
+      case "stock":
         return (
-        <div>
-            <div style={S.g4}>
-              <Stat label="Total Items" value={String(inventory.length)} />
-              <Stat label="Asset Value" value={"₹" + inr0(invVal)} />
-              <Stat label="Licenses (est.)" value={String(lic)} color="#10b981" />
-              <Stat label="Low stock" value={String(low)} color={low ? "#f59e0b" : "#94a3b8"} />
-            </div>
-            <div style={{ display: "flex", gap: 7, marginBottom: 13 }}>
-              <button type="button" onClick={() => setModal("item")} style={{ ...S.btn, fontSize: 11, padding: "5px 11px" }}>
-                + Add Item
-              </button>
-            </div>
-            <Tbl
-              cols={[
-                { h: "Item", k: "item" },
-                { h: "HSN/SAC", k: "hsn" },
-                { h: "Qty", k: "qty" },
-                { h: "Unit Value", r: true, k: "val" },
-                { h: "Total", r: true, k: "tot" },
-                {
-                  h: "Status",
-                  cell: r => <Chip cat={r.s === "ok" ? "Revenue" : "Bank Charges"} label={r.s === "low" ? "Low Stock" : "In Stock"} />,
-                },
-              ]}
-              rows={rows}
-              empty="No inventory — add items after you upload purchase data."
-            />
-        </div>
-      )
-      }
+          <InventoryPage
+            ui={pageUi}
+            items={stockItems}
+            acctRole={acctRole}
+            addOpen={modal === "item"}
+            onOpenAdd={() => setModal("item")}
+            onCloseAdd={() => setModal(m => (m === "item" ? null : m))}
+            onSaveItem={saveStockItem}
+            onDeleteItem={deleteStockItem}
+            onAddMovement={addStockMovement}
+          />
+        )
+      case "fa":
+        return (
+          <FixedAssetsPage
+            ui={pageUi}
+            assets={fixedAssets}
+            txns={ledger}
+            acctRole={acctRole}
+            periodLockIso={periodLockIso}
+            onSaveAsset={saveFixedAsset}
+            onDeleteAsset={deleteFixedAsset}
+            onPostDepreciation={postDepreciation}
+          />
+        )
       case "rec": {
         const creds = ledger.filter(t => !t.void && t.drCr === "CR")
         const n = creds.length
@@ -12249,17 +12456,7 @@ ${buildInvoicePrintDocumentHtml({
         </div>
       </Modal>
 
-      <Modal open={modal==="item"} title="Add Inventory Item" onClose={()=>setModal(null)} onSave={()=>{toast_("✓ Item added");setModal(null)}}>
-        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:11}}>
-          <div style={{gridColumn:"1/-1"}}><F label="Item Name"><input placeholder="e.g. MacBook Pro 14&quot;" style={IS}/></F></div>
-          <F label="HSN / SAC Code"><input placeholder="84713010" style={IS}/></F>
-          <F label="Category"><select style={IS}><option>Hardware</option><option>Software License</option><option>Office Asset</option></select></F>
-          <F label="Quantity"><input type="number" defaultValue="1" style={IS}/></F>
-          <F label="Unit Value (₹)"><input type="number" placeholder="0" style={IS}/></F>
-          <F label="Vendor"><input placeholder="Vendor name" style={IS}/></F>
-          <F label="Purchase Date"><input type="date" defaultValue="2026-03-20" style={IS}/></F>
-        </div>
-      </Modal>
+
     </div>
   )
 }
