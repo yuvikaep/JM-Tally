@@ -35,7 +35,9 @@ import {
   GST_OTHER_SOURCES,
   gstAdjustmentLines,
   isGstAdjustmentTxn,
+  GST_DEPOSIT,
 } from "./accountingEngine.js"
+import { parseGstPortalSummary, normalizeGstPortal, syncGstPortal, gstPortalBalances, isGstPortalTxn } from "./gstPortal.js"
 import { GstSettlementPanel } from "./GstSettlement.jsx"
 import { gstSettlementByMonth, gstMonthLabel, gstInvoices, invoiceOutputGst } from "./gstMonthly.js"
 import { syncInvoiceAccrual, isAccrualTxn } from "./invoiceAccrual.js"
@@ -160,6 +162,7 @@ const CATS = [
   "Govt Incentive / Grant",
   CUSTOMER_RECEIPT,
   GST_PAID_3B,
+  GST_DEPOSIT,
 ]
 const REVENUE_CATS = CATS.filter(c => c.startsWith("Revenue"))
 const EMPLOYEE_PAYROLL_CATS = new Set(["Salary", "Payroll Salary"])
@@ -3632,6 +3635,10 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
   const [fixedAssets, setFixedAssets] = useState([])
   /** Invoice-based (accrual) books: invoices post AR / revenue / GST; bank receipts clear AR. */
   const [accrualBooks, setAccrualBooks] = useState(false)
+  /** GST portal month-wise ledger summary + where outside-bank deposits came from. */
+  const [gstPortal, setGstPortal] = useState([])
+  const [gstFundingSource, setGstFundingSource] = useState("")
+  const [gstPortalText, setGstPortalText] = useState(null)
   const [pfEsicDraft, setPfEsicDraft] = useState({ type: "PF", period: "", date: todayISO(), amount: "", challanNo: "", fileName: "" })
   const [invListFilter, setInvListFilter] = useState("all")
   /** When set, invoice modal saves over this row instead of creating */
@@ -3740,6 +3747,8 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
         setPfEsicChallans(normalizePfEsicChallans(st?.pfEsicChallans))
         setFixedAssets(normalizeFixedAssets(st?.fixedAssets))
         setAccrualBooks(!!st?.accrualBooks)
+        setGstPortal(normalizeGstPortal(st?.gstPortal))
+        setGstFundingSource(String(st?.gstFundingSource || ""))
       } finally {
         setLoading(false)
       }
@@ -3763,9 +3772,11 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
         pfEsicChallans: normalizePfEsicChallans(pfEsicChallans),
         fixedAssets,
         accrualBooks,
+        gstPortal,
+        gstFundingSource,
       },
     })
-  }, [txns, invoices, inventory, importHistory, acctRole, periodLockIso, automationSkills, assistantMemory, manualClients, tdsPaidEntries, pfEsicChallans, fixedAssets, accrualBooks, activeCompanyId, loading, scopedStore])
+  }, [txns, invoices, inventory, importHistory, acctRole, periodLockIso, automationSkills, assistantMemory, manualClients, tdsPaidEntries, pfEsicChallans, fixedAssets, accrualBooks, gstPortal, gstFundingSource, activeCompanyId, loading, scopedStore])
 
   /** Debounced upload of full workspace to API so every device sees the same books (when online). */
   useEffect(() => {
@@ -3829,6 +3840,8 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
     pfEsicChallans,
     fixedAssets,
     accrualBooks,
+    gstPortal,
+    gstFundingSource,
     companies,
     scopedStore,
     authUser.email,
@@ -4007,7 +4020,7 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
   )
 
   const ledger = useMemo(() => (txns == null ? [] : txns), [txns])
-  const ledgerTxnVisible = useMemo(() => ledger.filter(t => !isClientInvoiceTdsTxn(t) && !isAccrualTxn(t) && !isGstAdjustmentTxn(t)), [ledger])
+  const ledgerTxnVisible = useMemo(() => ledger.filter(t => !isClientInvoiceTdsTxn(t) && !isAccrualTxn(t) && !isGstAdjustmentTxn(t) && !isGstPortalTxn(t)), [ledger])
 
   const stats = useMemo(() => {
     if (!txns) return { cr: 0, dr: 0, balance: 0, flowNet: 0, count: 0 }
@@ -4066,7 +4079,7 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
   }, [reportLedger])
 
   const monthlyFlow = useMemo(() => aggregateMonthlyCashflow(reportLedger), [reportLedger])
-  const catLedger = useMemo(() => reportLedger.filter(t => t.category !== CUSTOMER_TDS && !isGstAdjustmentTxn(t)), [reportLedger])
+  const catLedger = useMemo(() => reportLedger.filter(t => t.category !== CUSTOMER_TDS && !isGstAdjustmentTxn(t) && !isGstPortalTxn(t)), [reportLedger])
   const crByCat = useMemo(() => aggregateByCategory(catLedger, "CR"), [catLedger])
   const drByCat = useMemo(() => aggregateByCategory(catLedger, "DR"), [catLedger])
   const tbReport = useMemo(() => trialBalanceFromJournal(reportLedger), [reportLedger])
@@ -4251,9 +4264,11 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
         pfEsicChallans: normalizePfEsicChallans(pfEsicChallans),
         fixedAssets,
         accrualBooks,
+        gstPortal,
+        gstFundingSource,
       },
     })
-  }, [activeCompanyId, txns, invoices, inventory, importHistory, acctRole, periodLockIso, automationSkills, assistantMemory, manualClients, tdsPaidEntries, pfEsicChallans, fixedAssets, accrualBooks, scopedStore])
+  }, [activeCompanyId, txns, invoices, inventory, importHistory, acctRole, periodLockIso, automationSkills, assistantMemory, manualClients, tdsPaidEntries, pfEsicChallans, fixedAssets, accrualBooks, gstPortal, gstFundingSource, scopedStore])
 
   /**
    * Wipe every company's books (ledger, invoices, stock, assets, clients, TDS/PF registers, audit) but keep
@@ -4324,6 +4339,8 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
     setPfEsicChallans(normalizePfEsicChallans(st?.pfEsicChallans))
     setFixedAssets(normalizeFixedAssets(st?.fixedAssets))
     setAccrualBooks(!!st?.accrualBooks)
+    setGstPortal(normalizeGstPortal(st?.gstPortal))
+    setGstFundingSource(String(st?.gstFundingSource || ""))
   }, [])
 
   const switchCompany = useCallback(
@@ -4628,9 +4645,9 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
   // Keep invoice journals (AR / revenue / GST / customer TDS) in step with the invoice register.
   useEffect(() => {
     if (loading || txns == null) return
-    const next = syncInvoiceAccrual(txns, invoices, accrualBooks)
+    const next = syncGstPortal(syncInvoiceAccrual(txns, invoices, accrualBooks), gstPortal, { accrual: accrualBooks, fundingSource: gstFundingSource })
     if (next !== txns) setTxns(withRecalculatedBalances(next))
-  }, [loading, txns, invoices, accrualBooks])
+  }, [loading, txns, invoices, accrualBooks, gstPortal, gstFundingSource])
 
   /**
    * Switch books between cash basis (bank credits are revenue, GST payments are expense) and
@@ -4668,7 +4685,38 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
     [acctRole, txns, invoices, appendAudit]
   )
 
-  const gstSettlementRows = useMemo(() => gstSettlementByMonth(ledger, invoices), [ledger, invoices])
+  const gstSettlementRows = useMemo(() => gstSettlementByMonth(ledger, invoices, gstPortal), [ledger, invoices, gstPortal])
+  const gstPortalBal = useMemo(() => gstPortalBalances(gstPortal, ledger), [gstPortal, ledger])
+
+  /** Save (or clear) the GST portal summary; bank GST payments become cash-ledger deposits while it exists. */
+  const saveGstPortal = useCallback(() => {
+    if (acctRole === "Viewer" || gstPortalText == null) return
+    const text = gstPortalText.trim()
+    let rows = []
+    if (text) {
+      const res = parseGstPortalSummary(text)
+      if (res.error) {
+        toast_(res.error, "#f43f5e")
+        return
+      }
+      rows = res.rows
+    }
+    const on = rows.length > 0
+    let moved = 0
+    const next = (txns || []).map(t => {
+      if (t.void || isSystemJournalTxn(t)) return t
+      const isPay = t.drCr === "DR" && (on ? t.category === GST_PAID_3B || t.category === "GST Payment (Output Tax)" : t.category === GST_DEPOSIT)
+      if (!isPay) return t
+      moved++
+      const category = on ? GST_DEPOSIT : accrualBooks ? GST_PAID_3B : "GST Payment (Output Tax)"
+      return enrichTxnJournal({ ...t, category, journalLines: undefined })
+    })
+    setTxns(withRecalculatedBalances(next))
+    setGstPortal(rows)
+    setGstPortalText(null)
+    appendAudit({ action: on ? "GST_PORTAL_IMPORT" : "GST_PORTAL_CLEAR", by: acctRole, months: rows.length, bankPayments: moved })
+    toast_(on ? `GST portal ledger saved — ${rows.length} months · ${moved} bank GST payment(s) now cash-ledger deposits` : "GST portal ledger removed", "#10b981")
+  }, [acctRole, gstPortalText, txns, accrualBooks, appendAudit])
 
   const saveGstAdjustment = useCallback(() => {
     const d = gstAdjDraft
@@ -9537,7 +9585,7 @@ ${buildInvoicePrintDocumentHtml({
 
   const GST = () => {
     const GST_PAY = accrualBooks ? GST_PAID_3B : "GST Payment (Output Tax)"
-    const isGstPay = t => t.drCr === "DR" && (t.category === "GST Payment (Output Tax)" || t.category === GST_PAID_3B)
+    const isGstPay = t => t.drCr === "DR" && !isSystemJournalTxn(t) && (t.category === "GST Payment (Output Tax)" || t.category === GST_PAID_3B || t.category === GST_DEPOSIT)
     const itVendorDr = reportLedger.filter(t => t.drCr === "DR" && t.category === "Vendor - IT Solutions")
     const itcItVendor = itVendorDr.reduce((s, t) => s + gst18InclusiveSplit(t.amount).gst, 0)
     const bankDr = reportLedger.filter(t => t.drCr === "DR" && t.category === "Bank Charges")
@@ -9630,6 +9678,21 @@ ${buildInvoicePrintDocumentHtml({
             }
             onMovePayment={moveGstPayment}
             onDelete={deleteGstAdjustment}
+            portalBalances={gstPortalBal}
+            onOpenPortal={() =>
+              setGstPortalText(
+                gstPortal.length
+                  ? ["| Month | ITC credited | ITC utilized | Cash deposited | Cash utilized |", ...gstPortal.map(p => `| ${p.month} | ${p.itcCredited} | ${p.itcUtilized} | ${p.cashDeposited} | ${p.cashUtilized} |`)].join("\n")
+                  : ""
+              )
+            }
+            fundingSource={gstFundingSource}
+            fundingOptions={Object.entries(GST_OTHER_SOURCES).map(([k, v]) => [k, v.label])}
+            onFundingSource={v => {
+              if (acctRole === "Viewer") return
+              setGstFundingSource(v)
+              appendAudit({ action: "GST_DEPOSIT_FUNDING_SOURCE", by: acctRole, source: v })
+            }}
           />
         )}
         {gTab==="g1"&&<div style={S.card}><div style={{fontSize:12,fontWeight:700,marginBottom:12}}>GSTR-1 — Outward Supply Filing Guide</div><div style={S.g4}><Stat label="SAC Code" value="998314" sub="IT Services"/><Stat label="GST Rate" value="18%" sub="CGST+SGST"/><Stat label="Deadline" value="11th" sub="of each month"/><Stat label="Frequency" value="Monthly" sub="or QRMP &lt;₹5Cr"/></div><div style={{background:"rgba(107,122,255,.08)",border:"1px solid rgba(107,122,255,.2)",borderRadius:9,padding:"9px 13px",fontSize:11.5,color:"#0369a1"}}>Classify **B2B** NEFT/IMPS credits using the revenue categories in your ledger (e.g. B2B services @ 18%). Collect counterparty **GSTINs** and tax invoices before filing.</div><div style={{background:"rgba(107,122,255,.08)",border:"1px solid rgba(107,122,255,.2)",borderRadius:9,padding:"9px 13px",marginTop:12,fontSize:11.5,color:"#0369a1"}}><strong>Inward (purchases):</strong> Record vendor invoices (e.g. SAC **998313 / 998314** for IT services) as expenses; reconcile **ITC** in **GSTR-2B** with bank payments to those vendors.</div></div>}
@@ -11752,6 +11815,27 @@ ${buildInvoicePrintDocumentHtml({
             placeholder="Short label, e.g. Axis Current · …099"
           />
         </F>
+      </Modal>
+
+      <Modal
+        open={gstPortalText != null}
+        title="GST portal ledger — month-wise summary"
+        onClose={() => setGstPortalText(null)}
+        onSave={saveGstPortal}
+        saveDisabled={acctRole === "Viewer"}
+        saveLabel={String(gstPortalText || "").trim() ? "Save" : "Remove portal ledger"}
+        wide
+      >
+        <div style={{ fontSize: 11.5, color: SKY.text2, lineHeight: 1.55, marginBottom: 10 }}>
+          Paste the month-wise table built from your <strong>Electronic Credit Ledger</strong> and <strong>Electronic Cash Ledger</strong> (Markdown, Excel copy or CSV). Columns needed:{" "}
+          <strong>Month, ITC credited, ITC utilized, Cash deposited, Cash utilized</strong> — totals and other columns are ignored. Leave empty and save to remove it.
+        </div>
+        <textarea
+          value={gstPortalText || ""}
+          onChange={e => setGstPortalText(e.target.value)}
+          placeholder={"| Month | ITC credited | ITC utilized | Cash deposited | Cash utilized |\n| Apr 2026 | 74,303 | 1,17,355 | 1,83,978 | 1,00,362 |"}
+          style={{ ...IS, minHeight: 260, fontFamily: "monospace", fontSize: 11 }}
+        />
       </Modal>
 
       <Modal

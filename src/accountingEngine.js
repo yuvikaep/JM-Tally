@@ -20,6 +20,7 @@ export const CHART_OF_ACCOUNTS = {
     { code: "1035", name: "Accounts Receivable – Other", type: "Asset", normal: "Debit" },
     { code: "1040", name: "TDS Receivable", type: "Asset", normal: "Debit" },
     { code: "1045", name: "GST Input / ITC Receivable (control)", type: "Asset", normal: "Debit" },
+    { code: "1048", name: "GST Electronic Cash Ledger", type: "Asset", normal: "Debit" },
     { code: "1050", name: "GST Input (CGST)", type: "Asset", normal: "Debit" },
     { code: "1051", name: "GST Input (SGST)", type: "Asset", normal: "Debit" },
     { code: "1052", name: "GST Input (IGST)", type: "Asset", normal: "Debit" },
@@ -60,6 +61,7 @@ export const CHART_OF_ACCOUNTS = {
     { code: "2071", name: "GST Output Payable (SGST)", type: "Liability", normal: "Credit" },
     { code: "2072", name: "GST Output Payable (IGST)", type: "Liability", normal: "Credit" },
     { code: "2075", name: "GST Payable – Net (GSTR-3B)", type: "Liability", normal: "Credit" },
+    { code: "2076", name: "GST Deposits – Funding Source Pending (clearing)", type: "Liability", normal: "Credit" },
     { code: "2080", name: "GST – RCM Payable (if applicable)", type: "Liability", normal: "Credit" },
     { code: "2100", name: "Short-term Borrowings / CC / OD", type: "Liability", normal: "Credit" },
     { code: "2110", name: "Loans Payable – Term Loan", type: "Liability", normal: "Credit" },
@@ -227,7 +229,8 @@ export function isBalanceSheetCategory(category) {
     c === GST_PAID_3B ||
     c === CUSTOMER_TDS ||
     c === GST_SETOFF_ITC ||
-    c === GST_PAID_OTHER
+    c === GST_PAID_OTHER ||
+    c === GST_DEPOSIT
   )
 }
 
@@ -238,7 +241,16 @@ export const CUSTOMER_TDS = "TDS by Customer"
 export const GST_PAYABLE_NET = "GST Payable – Net (GSTR-3B)"
 
 /** Rows the app posts itself (invoice accrual, fixed assets, depreciation) — never re-derived from category. */
-export const isSystemJournalTxn = t => /^(fa:|depr:|accr:|gst:)/.test(String(t?.audit?.ref || ""))
+export const isSystemJournalTxn = t => /^(fa:|depr:|accr:|gst:|gstp:)/.test(String(t?.audit?.ref || ""))
+
+/**
+ * GST portal ledgers (Electronic Cash / Credit Ledger). Bank GST payments are deposits into the
+ * electronic cash ledger; the portal's monthly utilisation is what actually settles GST.
+ */
+export const GST_DEPOSIT = "GST Deposit (PMT-06 / cash ledger)"
+export const GST_CASH_LEDGER = "GST Electronic Cash Ledger"
+export const GST_DEPOSIT_CLEARING = "GST Deposits – Funding Source Pending (clearing)"
+export const ITC_RECEIVABLE = "GST Input / ITC Receivable (control)"
 
 /** GST settled for a month without a bank payment: ITC set-off, or paid in cash / by director / other bank. */
 export const GST_SETOFF_ITC = "GST Set-off (ITC)"
@@ -283,6 +295,7 @@ export function categoryToNominalAccount(category) {
   if (FIXED_ASSET_CATEGORY_ACCOUNTS[category]) return FIXED_ASSET_CATEGORY_ACCOUNTS[category]
   if (category === CUSTOMER_RECEIPT) return "Accounts Receivable – Trade"
   if (category === GST_PAID_3B) return GST_PAYABLE_NET
+  if (category === GST_DEPOSIT) return GST_DEPOSIT_CLEARING
   if (category === "Depreciation") return "Depreciation Expense"
   if (category === "Asset Disposal") return "Loss on Sale of Assets"
   if (category === "Asset Sale") return "Scrap / Sale of Assets (Income)"

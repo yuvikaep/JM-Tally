@@ -40,7 +40,10 @@ export function invoiceOutputGst(invoices) {
  * @param invoices  invoice register; when it has issued invoices, output GST comes only from them
  *                  (exact, by invoice month) and bank credits are not used to estimate it
  */
-export function gstSettlementByMonth(ledger, invoices) {
+export function gstSettlementByMonth(ledger, invoices, portal = []) {
+  // With portal ledgers, the portal's monthly utilisation (ITC + cash) is what settled GST; bank
+  // payments and manual set-offs are then only deposits / history and must not count again.
+  const usePortal = Array.isArray(portal) && portal.length > 0
   const mon = new Map()
   const at = k => {
     if (!mon.has(k)) mon.set(k, { month: k, taxable: 0, gst: 0, bank: 0, itc: 0, other: 0, items: [] })
@@ -70,6 +73,8 @@ export function gstSettlementByMonth(ledger, invoices) {
         m.taxable += tx
         m.gst += t.amount - tx
       }
+    } else if (usePortal) {
+      continue
     } else if (isGstBankPayment(t)) {
       const m = at(gstPeriodOf(t))
       m.bank += t.amount
@@ -81,11 +86,37 @@ export function gstSettlementByMonth(ledger, invoices) {
       m.items.push(t)
     }
   }
+  if (usePortal) {
+    for (const p of portal) {
+      const m = at(p.month)
+      m.itc += Number(p.itcUtilized) || 0
+      m.other += Number(p.cashUtilized) || 0
+      m.deposited = (m.deposited || 0) + (Number(p.cashDeposited) || 0)
+      m.itcCredited = (m.itcCredited || 0) + (Number(p.itcCredited) || 0)
+    }
+  }
+  let running = 0
   return [...mon.values()]
+    .sort((a, b) => monthSortKey(a.month) - monthSortKey(b.month))
     .map(m => {
       const settled = r2(m.bank + m.itc + m.other)
-      return { ...m, taxable: r2(m.taxable), gst: r2(m.gst), bank: r2(m.bank), itc: r2(m.itc), other: r2(m.other), settled, pending: r2(m.gst - settled) }
+      const pending = r2(m.gst - settled)
+      running = r2(running + pending)
+      return {
+        ...m,
+        taxable: r2(m.taxable),
+        gst: r2(m.gst),
+        bank: r2(m.bank),
+        itc: r2(m.itc),
+        other: r2(m.other),
+        deposited: r2(m.deposited),
+        itcCredited: r2(m.itcCredited),
+        settled,
+        pending,
+        // Carried balance: an excess in one month offsets shortfalls in others (like the GST cash ledger).
+        running,
+        portal: usePortal,
+      }
     })
-    .filter(m => m.gst > 0.5 || m.settled > 0.005)
-    .sort((a, b) => monthSortKey(a.month) - monthSortKey(b.month))
+    .filter(m => m.gst > 0.5 || m.settled > 0.005 || m.deposited > 0.005 || m.itcCredited > 0.005)
 }
