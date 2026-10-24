@@ -20,20 +20,45 @@ export const gstMonthLabel = k => {
 export const isGstBankPayment = t =>
   !t.void && t.drCr === "DR" && !isSystemJournalTxn(t) && (t.category === "GST Payment (Output Tax)" || t.category === "GST Paid (GSTR-3B)")
 
+/** Issued invoices — the legal source of output GST (liability arises on the invoice date). */
+export const gstInvoices = invoices => (invoices || []).filter(i => i && i.status !== "draft" && Number(i.total) > 0.005 && /^\d{4}-\d{2}-\d{2}$/.test(String(i.date || "")))
+
+/** Output GST of the invoices, split by tax head. */
+export function invoiceOutputGst(invoices) {
+  const o = { taxable: 0, igst: 0, cgst: 0, sgst: 0 }
+  for (const i of gstInvoices(invoices)) {
+    o.taxable += Number(i.taxable) || 0
+    o.igst += Number(i.igst) || 0
+    o.cgst += Number(i.cgst) || 0
+    o.sgst += Number(i.sgst) || 0
+  }
+  return { taxable: r2(o.taxable), igst: r2(o.igst), cgst: r2(o.cgst), sgst: r2(o.sgst), total: r2(o.igst + o.cgst + o.sgst) }
+}
+
 /**
- * @param ledger  all non-void txns (full books — settlement is matched across report periods)
+ * @param ledger    all non-void txns (full books — settlement is matched across report periods)
+ * @param invoices  invoice register; when it has issued invoices, output GST comes only from them
+ *                  (exact, by invoice month) and bank credits are not used to estimate it
  */
-export function gstSettlementByMonth(ledger) {
+export function gstSettlementByMonth(ledger, invoices) {
   const mon = new Map()
   const at = k => {
     if (!mon.has(k)) mon.set(k, { month: k, taxable: 0, gst: 0, bank: 0, itc: 0, other: 0, items: [] })
     return mon.get(k)
+  }
+  const issued = gstInvoices(invoices)
+  for (const i of issued) {
+    const [y, mo] = i.date.split("-")
+    const m = at(`${mo}/${y}`)
+    m.taxable += Number(i.taxable) || 0
+    m.gst += (Number(i.igst) || 0) + (Number(i.cgst) || 0) + (Number(i.sgst) || 0)
   }
   for (const t of ledger || []) {
     if (t.void) continue
     const p = String(t.date || "").split("/")
     if (p.length !== 3) continue
     if (t.drCr === "CR" && String(t.category || "").startsWith("Revenue")) {
+      if (issued.length) continue
       const m = at(`${p[1]}/${p[2]}`)
       if (isSystemJournalTxn(t)) {
         for (const l of t.journalLines || []) {

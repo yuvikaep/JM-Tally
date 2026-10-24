@@ -37,7 +37,7 @@ import {
   isGstAdjustmentTxn,
 } from "./accountingEngine.js"
 import { GstSettlementPanel } from "./GstSettlement.jsx"
-import { gstSettlementByMonth, gstMonthLabel } from "./gstMonthly.js"
+import { gstSettlementByMonth, gstMonthLabel, gstInvoices, invoiceOutputGst } from "./gstMonthly.js"
 import { syncInvoiceAccrual, isAccrualTxn } from "./invoiceAccrual.js"
 import {
   normalizeFixedAssets,
@@ -4070,7 +4070,27 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
   const crByCat = useMemo(() => aggregateByCategory(catLedger, "CR"), [catLedger])
   const drByCat = useMemo(() => aggregateByCategory(catLedger, "DR"), [catLedger])
   const tbReport = useMemo(() => trialBalanceFromJournal(reportLedger), [reportLedger])
-  const outputGstFromRev = useMemo(() => estimatedTotalOutputGst(reportLedger), [reportLedger])
+  /** Invoices of the selected report period (same FY / month / date filters as the ledger). */
+  const reportInvoices = useMemo(() => {
+    const rows = gstInvoices(invoices).map(inv => {
+      const date = isoToDdMmYyyy(inv.date)
+      return { ...inv, date, fy: inferFY(date), invDateIso: inv.date }
+    })
+    return filterTxnsForReport(rows, {
+      fy: repFy || undefined,
+      monthKey: repMonthKey || undefined,
+      fromIso: repFromIso || undefined,
+      toIso: repToIso || undefined,
+    })
+  }, [invoices, repFy, repMonthKey, repFromIso, repToIso])
+  /** Output GST by head: exact from invoices when the company raises invoices, else estimated from bank revenue credits. */
+  const outputGstSplit = useMemo(() => {
+    if (gstInvoices(invoices).length) return invoiceOutputGst(reportInvoices)
+    const est = estimatedTotalOutputGst(reportLedger)
+    const cgst = Math.round(est / 2)
+    return { taxable: 0, igst: 0, cgst, sgst: Math.round((est - cgst) * 100) / 100, total: est, estimated: true }
+  }, [invoices, reportInvoices, reportLedger])
+  const outputGstFromRev = outputGstSplit.total
   const outputGstFullBook = useMemo(() => estimatedTotalOutputGst(ledger), [ledger])
   const revenueCats = useMemo(() => crByCat.filter(([n]) => String(n).startsWith("Revenue")), [crByCat])
   const revCatTotal = useMemo(() => revenueCats.reduce((s, [, v]) => s + v, 0), [revenueCats])
@@ -4647,7 +4667,7 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
     [acctRole, txns, invoices, appendAudit]
   )
 
-  const gstSettlementRows = useMemo(() => gstSettlementByMonth(ledger), [ledger])
+  const gstSettlementRows = useMemo(() => gstSettlementByMonth(ledger, invoices), [ledger, invoices])
 
   const saveGstAdjustment = useCallback(() => {
     const d = gstAdjDraft
@@ -9538,10 +9558,13 @@ ${buildInvoicePrintDocumentHtml({
       return { date:t.date, v:"Bank", d:t.particulars.length>44?t.particulars.slice(0,42)+"…":t.particulars, a:"₹"+inr0(t.amount), tx:"₹"+inr0(taxable), g:"₹"+inr0(gst), cg:"₹"+inr0(cgst), sg:"₹"+inr0(sgst), sac:"—" }
     })
     const itcRows = [...itcRowsIt,...itcRowsBank].sort((a,b)=>{ const pa=a.date.split("/"),pb=b.date.split("/"); return new Date(+pa[2],+pa[1]-1,+pa[0])-new Date(+pb[2],+pb[1]-1,+pb[0]) })
-    const outCgst = Math.round(outputGstEst / 2)
-    const outSgst = outputGstEst - outCgst
-    const paidCgst = Math.round((totalGstPaid / 2) * 100) / 100
-    const paidSgst = Math.round((totalGstPaid - paidCgst) * 100) / 100
+    const { igst: outIgst, cgst: outCgst, sgst: outSgst } = outputGstSplit
+    // Payments carry no tax-head split in the bank narration — allocate in proportion to output tax.
+    const share = v => (outputGstEst > 0.005 ? v / outputGstEst : 0)
+    const paidIgst = Math.round(totalGstPaid * share(outIgst) * 100) / 100
+    const paidCgst = Math.round(totalGstPaid * share(outCgst) * 100) / 100
+    const paidSgst = Math.round((totalGstPaid - paidIgst - paidCgst) * 100) / 100
+    const netIgst = Math.max(0, Math.round((outIgst - paidIgst) * 100) / 100)
     const netCgst = Math.max(0, Math.round((outCgst - itcCgstTot - paidCgst) * 100) / 100)
     const netSgst = Math.max(0, Math.round((outSgst - itcSgstTot - paidSgst) * 100) / 100)
     return (
@@ -9554,7 +9577,12 @@ ${buildInvoicePrintDocumentHtml({
             marginBottom: 13,
           }}
         >
-          <Stat label="Output GST (est.)" value={"₹" + inr0(outputGstEst)} sub="From Revenue @ 18%" color="#6B7AFF" />
+          <Stat
+            label={outputGstSplit.estimated ? "Output GST (est.)" : "Output GST (invoices)"}
+            value={"₹" + inr0(outputGstEst)}
+            sub={outputGstSplit.estimated ? "From bank revenue @ 18%" : `IGST ₹${inr0(outIgst)} · CGST ₹${inr0(outCgst)} · SGST ₹${inr0(outSgst)}`}
+            color="#6B7AFF"
+          />
           <Stat label="Input ITC (est.)" value={"₹" + inr0(totalItc)} sub={"IT ₹" + inr0(itcItVendor) + " · Bank ₹" + inr0(itcBank)} color="#10b981" />
           <Stat
             label="GST paid (ledger)"
@@ -9616,16 +9644,16 @@ ${buildInvoicePrintDocumentHtml({
                 { h: "SGST", r: true, k: "s" },
               ]}
               rows={[
-                { h: "3.1(a)", d: "Outward taxable (est.)", i: "₹0", c: "₹" + inr0(outCgst), s: "₹" + inr0(outSgst) },
+                { h: "3.1(a)", d: outputGstSplit.estimated ? "Outward taxable (est.)" : "Outward taxable (as per invoices)", i: "₹" + inr0(outIgst), c: "₹" + inr0(outCgst), s: "₹" + inr0(outSgst) },
                 { h: "4.", d: "ITC (Vendor IT + Bank chg., est.)", i: "₹0", c: "₹" + inr0(itcCgstTot), s: "₹" + inr0(itcSgstTot) },
                 {
                   h: "5.",
                   d: "GST paid from bank (ledger " + GST_PAY + ")",
-                  i: "₹0",
+                  i: "₹" + inr0(paidIgst),
                   c: "₹" + inr0(paidCgst),
                   s: "₹" + inr0(paidSgst),
                 },
-                { h: "6.", d: "Balance (est.) after ITC & payments", i: "₹0", c: "₹" + inr0(netCgst), s: "₹" + inr0(netSgst) },
+                { h: "6.", d: "Balance (est.) after ITC & payments", i: "₹" + inr0(netIgst), c: "₹" + inr0(netCgst), s: "₹" + inr0(netSgst) },
               ]}
             />
           </div>
