@@ -1,0 +1,33 @@
+name: Deploy
+
+# Every push to main deploys JM Tally to its server (tally.jobsmato.com).
+#
+# Runs on the self-hosted runner "jm-tally" on that server, which calls
+# /home/jobsmato/tally/deploy.sh: pull main, rebuild the app container,
+# health-check it, and roll back to the previous image automatically if the
+# health check fails. The database container is never touched by a deploy.
+#
+# Only `push` to main and manual runs trigger this. Never add a
+# `pull_request` trigger here: this repo is public, and a pull request from a
+# fork would then run its own code on the production server.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# One deploy at a time; a push during a deploy waits instead of racing it.
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, jm-tally]
+    timeout-minutes: 20
+    steps:
+      - name: Deploy to server
+        run: bash /home/jobsmato/tally/deploy.sh
