@@ -192,6 +192,8 @@ const normalizeTxnCategories = arr =>
   arr.map(t => {
     const mapped = LEGACY_CATEGORY_MAP[t.category]
     let u = mapped ? { ...t, category: mapped } : { ...t }
+    // A category the user picked by hand is final — narration heuristics must not undo it.
+    if (u.catByUser) return u
     u = u.category === "Salary - Field Staff" ? { ...u, category: "Salary" } : u
     if (u.drCr === "DR" && IT_SOLUTIONS_VENDOR_RE.test(u.particulars || ""))
       u = { ...u, category: "Vendor - IT Solutions" }
@@ -4474,7 +4476,7 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
         toast_(v.errors[0] || "Journal would be unbalanced for this category", "#f43f5e")
         return
       }
-      const patched = enrichTxnJournal({ ...t, category: newCategory, journalLines: undefined })
+      const patched = enrichTxnJournal({ ...t, category: newCategory, catByUser: true, journalLines: undefined })
       setTxns(withRecalculatedBalances(txns.map(x => (x.id === id ? patched : x))))
       appendAudit({
         action: "RECATEGORY",
@@ -4687,7 +4689,8 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
           )
           return
         }
-        let merged = [...txns, ...res.newTxns]
+        const { txns: ruled } = applyCategorizationSkills(res.newTxns, automationSkills, { allowedCategories: CATS })
+        let merged = [...txns, ...ruled]
         merged = applyLedgerCategoryNormalization(merged)
         setTxns(withRecalculatedBalances(merged))
         appendAudit({
@@ -4697,7 +4700,12 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
           count: res.newTxns.length,
           stats: res.stats,
         })
-        toast_(`✓ ${res.newTxns.length} imported`, "#10b981")
+        toast_(
+          res.stats.learned
+            ? `✓ ${res.newTxns.length} imported · ${res.stats.learned} categorised from your past entries`
+            : `✓ ${res.newTxns.length} imported`,
+          "#10b981"
+        )
         setImportHistory(h =>
           h.map(row => (row.rid === rid ? { ...row, p: res.period, t: res.newTxns.length, status: "Done" } : row))
         )
@@ -4706,7 +4714,7 @@ function BooksApp({ authUser, onLogout, onChangePassword }) {
         setImportHistory(h => h.map(row => (row.rid === rid ? { ...row, status: "Failed", t: 0 } : row)))
       }
     },
-    [txns, acctRole, periodLockIso, appendAudit]
+    [txns, acctRole, periodLockIso, automationSkills, appendAudit]
   )
 
   const requestRemoveBankImportTransactions = useCallback(() => {

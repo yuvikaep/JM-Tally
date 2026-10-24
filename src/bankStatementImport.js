@@ -79,6 +79,78 @@ export function inferDebitCategoryFromBankText(particulars, bankRemark) {
   return null
 }
 
+/** Bank boilerplate that says nothing about the payee — ignored when matching past narrations. */
+const NARRATION_STOPWORDS = new Set([
+  "upi", "neft", "imps", "rtgs", "nach", "ach", "inb", "mob", "ib", "ft", "trf", "transfer", "txn", "ref", "utr",
+  "payment", "paid", "pay", "to", "from", "by", "for", "the", "and", "via", "remarks", "dr", "cr", "debit", "credit",
+  "p2a", "p2m", "collect", "request", "sent", "received", "bank", "ltd", "limited", "pvt", "private", "india",
+  "ybl", "okaxis", "okhdfcbank", "okicici", "oksbi", "paytm", "axl", "ibl", "apl",
+])
+
+/** Payee-ish words from a narration: lower-case, no ref numbers / IFSC / boilerplate. */
+function narrationTokens(text) {
+  const out = new Set()
+  for (const raw of String(text || "").toLowerCase().split(/[^a-z0-9]+/)) {
+    if (raw.length < 3 || /\d/.test(raw) || NARRATION_STOPWORDS.has(raw)) continue
+    out.add(raw)
+  }
+  return out
+}
+
+const isMiscCategory = c => !c || c === "Misc Expense" || c === "Misc Income"
+
+/**
+ * Index the categories already on the ledger by payee words, so a new statement row
+ * whose narration looks like one the user already categorised gets the same category.
+ * Rows the user re-categorised by hand (`catByUser`) outweigh auto-guessed ones.
+ */
+export function buildCategoryMemory(txns) {
+  const byKey = new Map()
+  for (const t of txns || []) {
+    if (!t || t.void || isMiscCategory(t.category)) continue
+    if (t.drCr !== "DR" && t.drCr !== "CR") continue
+    const tokens = narrationTokens(combineNarrationAndRemarks(t.particulars, t.bankRemark))
+    if (!tokens.size) continue
+    const key = `${t.drCr}|${[...tokens].sort().join(" ")}`
+    let e = byKey.get(key)
+    if (!e) {
+      e = { drCr: t.drCr, tokens, votes: new Map() }
+      byKey.set(key, e)
+    }
+    const v = e.votes.get(t.category) || { w: 0, last: 0 }
+    v.w += t.catByUser ? 5 : 1
+    v.last = Math.max(v.last, parseDdMmYyyy(t.date) || 0)
+    e.votes.set(t.category, v)
+  }
+  return [...byKey.values()].map(e => {
+    let best = null
+    for (const [category, v] of e.votes) {
+      if (!best || v.w > best.w || (v.w === best.w && v.last > best.last)) best = { category, ...v }
+    }
+    return { drCr: e.drCr, tokens: e.tokens, category: best.category }
+  })
+}
+
+/** Category of the closest past narration (same Dr/Cr side), or null when nothing is close enough. */
+export function recallCategory(memory, text, drCr) {
+  if (!memory?.length) return null
+  const tokens = narrationTokens(text)
+  if (!tokens.size) return null
+  let best = null
+  for (const e of memory) {
+    if (e.drCr !== drCr) continue
+    let shared = 0
+    for (const tok of tokens) if (e.tokens.has(tok)) shared++
+    if (!shared) continue
+    const score = shared / (tokens.size + e.tokens.size - shared)
+    // Exact payee match, or a strong overlap of at least two payee words.
+    if (score < 1 && (score < 0.6 || shared < 2)) continue
+    if (!best || score > best.score) best = { score, category: e.category }
+    if (score === 1) break
+  }
+  return best?.category ?? null
+}
+
 function guessCategory(particulars, drCr) {
   const n = String(particulars || "")
   if (drCr === "CR") {
@@ -436,7 +508,7 @@ export function isTxnFromBankFileImport(t) {
  * Used for import preview JSON and by `importBankStatementFromMatrix`.
  * @returns {{ ok: true, drafts: object[], bodyRowCount: number } | { ok: false, error: string, headerHint?: string, newTxns: [], stats: object }}
  */
-export function bankMatrixToDraftRows(matrix) {
+export function bankMatrixToDraftRows(matrix, memory = null) {
   if (!matrix?.length) return { ok: false, error: "File is empty.", newTxns: [], stats: {} }
 
   const previewRows = () =>
@@ -507,7 +579,16 @@ export function bankMatrixToDraftRows(matrix) {
 
     let category =
       m.category >= 0 ? String(row[m.category] ?? "").trim() : ""
-    if (!category) category = guessCategory(forCategory || particulars, flow.drCr)
+    let learned = false
+    if (!category) {
+      const recalled = recallCategory(memory, forCategory || particulars, flow.drCr)
+      if (recalled) {
+        category = recalled
+        learned = true
+      } else {
+        category = guessCategory(forCategory || particulars, flow.drCr)
+      }
+    }
 
     let balance = null
     if (m.balance >= 0) {
@@ -523,6 +604,7 @@ export function bankMatrixToDraftRows(matrix) {
       drCr: flow.drCr,
       category,
       balance,
+      learned,
     })
   }
 
@@ -548,7 +630,7 @@ export function importBankStatementFromMatrix(matrix, ctx) {
   const { txns, periodLockIso, acctRole, fileName } = ctx
   if (acctRole === "Viewer") return { error: "Viewer role cannot import.", newTxns: [], stats: {} }
 
-  const parsed = bankMatrixToDraftRows(matrix)
+  const parsed = bankMatrixToDraftRows(matrix, buildCategoryMemory(txns))
   if (!parsed.ok) {
     return { error: parsed.error, newTxns: [], stats: parsed.stats || {}, headerHint: parsed.headerHint }
   }
@@ -557,7 +639,7 @@ export function importBankStatementFromMatrix(matrix, ctx) {
   const active = [...txns.filter(t => !t.void)]
   const baseId = Math.max(0, ...txns.map(t => Number(t.id) || 0))
   const newTxns = []
-  const stats = { ok: 0, dup: 0, lock: 0, bad: 0 }
+  const stats = { ok: 0, dup: 0, lock: 0, bad: 0, learned: 0 }
 
   for (const d of drafts) {
     if (periodLockIso && isPeriodLocked(d.date, periodLockIso)) {
@@ -596,6 +678,7 @@ export function importBankStatementFromMatrix(matrix, ctx) {
     newTxns.push(t)
     active.push(t)
     stats.ok++
+    if (d.learned) stats.learned++
   }
 
   const dates = newTxns.map(t => parseDdMmYyyy(t.date)).filter(Boolean)

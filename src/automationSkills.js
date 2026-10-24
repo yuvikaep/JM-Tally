@@ -137,7 +137,7 @@ export function applyCategorizationSkills(txns, skills, { allowedCategories }) {
 
   let changed = 0
   const out = txns.map(t => {
-    if (t.void) return t
+    if (t.void || t.catByUser) return t
     const hay = `${t.particulars || ""} ${t.bankRemark || ""}`.toLowerCase()
     for (const s of rules) {
       const needle = String(s.match).toLowerCase().trim()
